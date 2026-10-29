@@ -1,0 +1,82 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="color-scheme" content="dark">
+  <title>Chuen Lung — Phase 2ER Camera-derived Enclosure</title>
+  <link rel="stylesheet" href="/vendor/index.css">
+  <link rel="stylesheet" href="./style.css">
+</head>
+<body>
+  <header class="topbar">
+    <div><div class="eyebrow">CHUEN LUNG EXHIBITION · PHASE 2ER</div><h1>Camera-derived visitor enclosure</h1></div>
+    <div class="headlinks"><span id="serverStatus" class="pill">Checking preserved model…</span><a href="#navigation">Navigation</a><a href="#boundary">Enclosure map</a><a href="#ghostReview">Ghost review</a><a href="#acceptance">Acceptance</a></div>
+  </header>
+  <main class="workspace">
+    <section class="scene panel">
+      <div class="scenehead"><div><div class="eyebrow">PRESERVED ROI-OFF BASELINE · READ ONLY</div><h2>Spirula · 20,000 iterations</h2><div id="modelStatus" class="status">Verifying the original PLY bytes…</div></div><span id="modelHash" class="hash">SHA-256: checking…</span></div>
+      <div id="viewerHost" tabindex="0" aria-label="3D exhibition viewer. Click here, then use WASD, E/Q, and mouse drag."><div class="loading">Loading preserved baseline model…</div><canvas id="selectionOverlay" aria-label="Draw a polygon over the hanging-text ghost region"></canvas></div>
+      <div class="scenefoot"><span id="graphics">Renderer: initializing</span><span id="cameraPosition" class="mono">Camera: —</span></div>
+      <div id="decision" class="decision" role="status">Loading the model and shared camera-pose boundary policy.</div>
+    </section>
+
+    <aside class="panel controls">
+      <section id="navigation">
+        <div class="eyebrow">FREE XYZ · ONE CLOSED HORIZONTAL ENCLOSURE</div><h2>Explore the gallery</h2>
+        <label for="mode">Camera mode</label>
+        <select id="mode"><option value="visitor-explore">Visitor Explore</option><option value="guided-tour">Guided Tour</option><option value="artwork-orbit">Artwork Orbit</option><option value="debug">Debug Fly · unrestricted developer mode</option></select>
+        <p id="modeNote" class="note">W/A/S/D move parallel to the floor; E/Space ascend; Q/Ctrl descend; drag to look. Shift moves faster. Furniture and artwork never block Visitor Explore.</p>
+        <div class="row"><label for="speed">Speed</label><input id="speed" type="range" min="0.5" max="6" step="0.25" value="2.5"><output id="speedLabel">2.5</output></div>
+        <label for="station">Trusted starting / viewing station</label><select id="station"></select><button id="goStation">Go to selected station</button>
+        <div class="row"><button id="saveBookmark">Save bookmark</button><button id="restoreBookmark">Restore bookmark</button><button id="returnExplore">Return to Visitor Explore</button></div>
+        <label for="tour">Guided route</label><select id="tour"></select><button id="playTour">Play route</button>
+        <label for="artwork">Artwork Orbit focus</label><select id="artwork"></select><button id="orbitArtwork">Orbit selected artwork</button>
+        <p class="hint">Click the 3D scene to focus keyboard navigation. Mouse-look uses ordinary pointer drag without pointer lock or pointer capture. Debug Fly is separate; returning restores a valid interior pose.</p>
+      </section>
+
+      <section id="boundary">
+        <div class="eyebrow">CAMERA-POSE FOOTPRINT · STRUCTURAL WALLS REFERENCE ONLY</div><h2>Closed horizontal enclosure</h2>
+        <div id="boundarySummary" class="summary">Loading camera distribution…</div>
+        <label for="candidateSelect">Footprint candidate and outward margin</label><select id="candidateSelect"></select>
+        <canvas id="boundaryMap" aria-label="Floor-aligned map of trusted camera stations, footprint candidates, Phase 2EQ wall references, and the selected boundary"></canvas>
+        <div class="legend"><span><i class="selected-boundary"></i>selected closed boundary / drag vertices</span><span><i class="camera-dot"></i>trusted camera station · dot size indicates local density</span><span><i class="principal-dot"></i>principal station</span><span><i class="wall-active"></i>Phase 2EQ wall reference</span><span><i class="candidate-dot"></i>AABB / OBB / alpha alternatives</span></div>
+        <div class="toggle-grid"><label><input id="showCameras" type="checkbox" checked> Cameras</label><label><input id="showWalls" type="checkbox" checked> Old wall references</label><label><input id="showCandidates" type="checkbox" checked> Candidate layers</label><label><input id="showNeighborGraph" type="checkbox"> 3-nearest graph</label></div>
+        <div class="editor-row"><label for="cameraClearance">Horizontal camera clearance (units)</label><input id="cameraClearance" type="number" min="0" max="0.5" step="0.01"></div>
+        <div id="vertexSummary" class="small">Drag vertices on the map for a separate manual adjustment.</div>
+        <div class="row"><button id="resetVertices">Reset candidate vertices</button><button id="saveBoundary">Save manual JSON</button></div>
+        <div class="row"><button id="revertBoundary">Revert manual adjustment</button><button id="exportBoundary">Export current boundary</button></div>
+        <div id="boundarySaveStatus" class="small">The Phase 2EQ floor and ceiling constraints are retained. The old finite wall candidates do not independently collide.</div>
+      </section>
+
+      <section id="ghostReview">
+        <div class="eyebrow">OBLIQUE VIEW · SCREEN SELECTION · NO PLY EDITS</div><h2>Hanging-text ghost localization</h2>
+        <div class="row"><label for="diagnosticScene">Test scene</label><select id="diagnosticScene"><option value="hanging-text">Hanging white text · side-view review</option><option value="attention-003">Fine-line drawing · attention-003</option><option value="photo-wall">Photographic wall · protected</option><option value="central-table">Central table · protected</option></select></div>
+        <div class="button-grid"><button data-preset="front">Front</button><button data-preset="left20">Left 20°</button><button data-preset="right20">Right 20°</button><button data-preset="left40">Left 40°</button><button data-preset="right40">Right 40°</button><button data-preset="elevated">Elevated</button><button data-preset="lower">Lower</button></div>
+        <div id="diagnosticPose" class="summary">Select a side view, then mark the visible ghost.</div>
+        <div class="row"><button id="captureDiagnostic">Export current camera pose</button></div>
+        <div class="row"><button id="annotationToggle">Mark ghost region</button><button id="annotationClear">Clear current mark</button></div>
+        <label for="annotationLabel">View / selection label</label><input id="annotationLabel" type="text" value="left40 ghost candidate" maxlength="100">
+        <div class="row"><button id="annotationSave">Save camera + polygon</button><button id="annotationExport">Export annotations</button></div>
+        <div id="annotationStatus" class="summary">No reviewer selections saved yet. Mark a region in two or more oblique views for multi-view candidate matching.</div>
+        <div id="annotationList" class="annotation-list"></div>
+        <div id="sourcePhoto" class="source-photo"><span class="small">Original IMG_0716 reference appears here when available.</span></div>
+        <p class="small">Screen polygons identify projected regions only; they do not identify unique splats or depth. After saving one or more selections, run <code>python3 scripts/localize_ghost_candidates.py</code> from the Phase 2ER folder to project candidate Gaussian centers. Occlusion and depth ambiguity remain explicit; removal is not available in this tool.</p>
+      </section>
+
+      <section id="acceptance">
+        <div class="eyebrow">AUTOMATION IS NOT HUMAN ACCEPTANCE</div><h2>Visitor review checklist</h2>
+        <div id="acceptanceChecklist"></div>
+        <div class="row"><button id="exportAcceptance">Export checklist</button><button id="resetAcceptance">Reset</button></div>
+        <p class="small">Human review remains NOT TESTED until a person records a result.</p>
+      </section>
+      <section>
+        <div class="eyebrow">RUNTIME DIAGNOSTICS</div><h2>Active policy and model</h2>
+        <div id="runtimeSummary" class="summary">Loading…</div>
+        <button id="exportCamera">Export camera + enclosure metadata</button>
+      </section>
+    </aside>
+  </main>
+  <script type="module" src="./app.js"></script>
+</body>
+</html>

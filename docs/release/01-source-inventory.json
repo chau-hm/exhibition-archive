@@ -1,0 +1,405 @@
+{
+  "schema_version": "exhibition-archive.migration-inventory.v1",
+  "created_at_utc": "2026-10-29T15:01:00Z",
+  "migration": "Phase 3C.1",
+  "baseline": {
+    "new_repository": "/Users/homan/repo/exhibition-archive",
+    "initial_branch": "main",
+    "initial_status": "No commits; no product files; origin/main missing; remote left unchanged",
+    "historical_product_git_status": "all product files untracked in parent historical repository; no product commit to migrate",
+    "product_version": "0.1.0",
+    "previous_rc": "0.1.0-rc.1",
+    "canonical_skill_tree_sha256": "bcb07484697821a61d60f367ea9882e225fc52c1baa80b414e3dde92003f01a9",
+    "previous_skill_package_sha256": "dc349da93cbffb4ff23ef942512bcf45e36075957355751f289b1ebfaaf0ef77"
+  },
+  "migrated_files": [
+    {
+      "source_path": "src/exhibition_archive/__init__.py",
+      "destination_path": "src/exhibition_archive/__init__.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "f4bf557d5bf1375e54a41410e51788ce97be8276a6513e5f7d2fa47f5424e4c0",
+      "size_bytes": 77,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/adapters.py",
+      "destination_path": "src/exhibition_archive/adapters.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "26e90f7c6944c0a5a9edb113588bcc7135816e211d9f66dd2124fd1eb21f614a",
+      "size_bytes": 7686,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/backends.py",
+      "destination_path": "src/exhibition_archive/backends.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "84ef92910bffb8a4de5523cbf2cad6ebe6c6d01c591cdb2e624e1da51133b91d",
+      "size_bytes": 67496,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/cli.py",
+      "destination_path": "src/exhibition_archive/cli.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "39970ee429dda297e000e221afa642e25a94c8e2d9bc8ec517e18922e9a72b41",
+      "size_bytes": 44330,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/model_registry.py",
+      "destination_path": "src/exhibition_archive/model_registry.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "32453cf0ebefbb737b0cb27e356f285cda8db742c74c6cfde32e11a5fc0c20d5",
+      "size_bytes": 4172,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/navigation.py",
+      "destination_path": "src/exhibition_archive/navigation.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "84b1eb2b937f0c4b65daa347a51cdb8e8996a54f338eccdb027c9d6a90de7f2f",
+      "size_bytes": 100047,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/navigation_review.py",
+      "destination_path": "src/exhibition_archive/navigation_review.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "6fa02e51104bf7ea611e491c0a40cf3014b9e47cbd847bdf8dc08b27f69f6da9",
+      "size_bytes": 17420,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/publisher.py",
+      "destination_path": "src/exhibition_archive/publisher.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "fc93ccadf1de1a503f5048a1278661ccf4583442f7eabbc08f1f5b51f56ed261",
+      "size_bytes": 46268,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/release_gate.py",
+      "destination_path": "src/exhibition_archive/release_gate.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "248dc7aac20ab261d3e8d4b24b36f92cea8e09a672c9721f83374a0240fdbae1",
+      "size_bytes": 2608,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/review_hub.py",
+      "destination_path": "src/exhibition_archive/review_hub.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "15600cf2433ab6f7486ef9fe05275c928e745b25c3973c00122a5d0c35869f93",
+      "size_bytes": 15073,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/smoke.py",
+      "destination_path": "src/exhibition_archive/smoke.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "3015c6f3a0b441cd42e86acd57db52b81c7c23c1c2f54a193fd4f9d0e8f79d13",
+      "size_bytes": 52154,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/state.py",
+      "destination_path": "src/exhibition_archive/state.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "91bc67bac6b5bff99e94f81ed14120d2f2dd8872c4667596383c4f0f36e4c2ad",
+      "size_bytes": 10899,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "src/exhibition_archive/workflow.py",
+      "destination_path": "src/exhibition_archive/workflow.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "25e2a474edc586b3a995f9fabd4cdf10c4d060f75e0167073994a34b9bd16e73",
+      "size_bytes": 109097,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "bin/exhibition-archive",
+      "destination_path": "bin/exhibition-archive",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "5b17c5b5087308fb8555ce71df7e1f9dd0d9bb16d8f67f4589ace6ae6e282d68",
+      "size_bytes": 165,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "templates/viewer/app.js",
+      "destination_path": "templates/viewer/app.js",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "4410eef448be2e769a9a6eb87382486a5d1226ad87113cb16fe1267f510a1878",
+      "size_bytes": 61925,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "templates/viewer/index.html",
+      "destination_path": "templates/viewer/index.html",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "12b716e3b8f586f448ed3d206ebc8f0ed95e21601d67db7cccbc0b8224d38a85",
+      "size_bytes": 8587,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "templates/viewer/style.css",
+      "destination_path": "templates/viewer/style.css",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "a473d37df0c50e8a8d812eb0a3436901b89aae5b4d97631eb4db4c8540d836e2",
+      "size_bytes": 7347,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "templates/viewer/vendor/index.css",
+      "destination_path": "templates/viewer/vendor/index.css",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "92e50eab13d86bb6bd32ee62e0b60a42d25cd2047e49cc67d53d49e20d71c1da",
+      "size_bytes": 31516,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "templates/viewer/vendor/index.js",
+      "destination_path": "templates/viewer/vendor/index.js",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "1c73943badde1748d8afd7caa0c582d06b448b30f0a671861a17a73fba396cf9",
+      "size_bytes": 3476472,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "dashboard/index.html",
+      "destination_path": "dashboard/index.html",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "2e8cf5ef1e5799803aae297d5488fa09e93f0a73e6f6c2292baba1bc02a118bb",
+      "size_bytes": 5544,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "tests/generate_independent_fixture.py",
+      "destination_path": "tests/generate_independent_fixture.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "5648804f44888acaeac2e8c620fcd040cd372f7d337b5be846e22cb25f0eb6e9",
+      "size_bytes": 8374,
+      "copy_status": "copied; product-root and default evidence-output paths rebased"
+    },
+    {
+      "source_path": "tests/run_fresh_backend_tests.py",
+      "destination_path": "tests/run_fresh_backend_tests.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "efdb1b52990d403067912090301783d053004ca81629842b3703ca4b22adcd15",
+      "size_bytes": 35611,
+      "copy_status": "copied; product-root and default evidence-output paths rebased"
+    },
+    {
+      "source_path": "tests/run_portability_test.py",
+      "destination_path": "tests/run_portability_test.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "3fb2ce006b395b7c31419207bb69e4cceba53079f9904bba24e67a008a9d2d59",
+      "size_bytes": 8916,
+      "copy_status": "copied; product-root and default evidence-output paths rebased"
+    },
+    {
+      "source_path": "tests/test_authorization.py",
+      "destination_path": "tests/test_authorization.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "bab2a38ba0783d7c63310c75bf67e58d58fa58a9cefd83cef5680105e6c5128b",
+      "size_bytes": 9949,
+      "copy_status": "copied; product-root and default evidence-output paths rebased"
+    },
+    {
+      "source_path": "tests/test_navigation.py",
+      "destination_path": "tests/test_navigation.py",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "49d794dc8cd5e02470590bc245a00413951046c69154eb6271e95bb47f51b24b",
+      "size_bytes": 24051,
+      "copy_status": "copied; product-root and default evidence-output paths rebased"
+    },
+    {
+      "source_path": "skills/exhibition-archive/SKILL.md",
+      "destination_path": "skills/exhibition-archive/SKILL.md",
+      "classification": "MIGRATE_DOCUMENTATION",
+      "sha256_before_copy": "26c3412dd36ed92ba7fc4e2f0054e84eb74f5921bd752d0d7d132e4238f39c68",
+      "size_bytes": 6221,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "skills/exhibition-archive/references/human-review.md",
+      "destination_path": "skills/exhibition-archive/references/human-review.md",
+      "classification": "MIGRATE_DOCUMENTATION",
+      "sha256_before_copy": "c235a274776d7d8b8e3c6f0c3a34818b3aa615040b666403b7f9be930dfcc760",
+      "size_bytes": 1385,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "skills/exhibition-archive/references/quality-gates.md",
+      "destination_path": "skills/exhibition-archive/references/quality-gates.md",
+      "classification": "MIGRATE_DOCUMENTATION",
+      "sha256_before_copy": "cca1a6366780f840dc35977f7f6166fcdd05da59c2f4cc16c73af793d6549122",
+      "size_bytes": 2110,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "skills/exhibition-archive/references/troubleshooting.md",
+      "destination_path": "skills/exhibition-archive/references/troubleshooting.md",
+      "classification": "MIGRATE_DOCUMENTATION",
+      "sha256_before_copy": "e7ff05c38a7dda475a6e6a177fb3c4205d01a9e3428d731d2c2ceffe24a1e84c",
+      "size_bytes": 1860,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "skills/exhibition-archive/references/workflow.md",
+      "destination_path": "skills/exhibition-archive/references/workflow.md",
+      "classification": "MIGRATE_DOCUMENTATION",
+      "sha256_before_copy": "0eeda01a8565b5a48d0bab18f9ec4e7f0e431659f0f8e14ece9d3846b974d5c0",
+      "size_bytes": 3879,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "config/project-manifest.schema.json",
+      "destination_path": "config/project-manifest.schema.json",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "bd0815dbb96be54a0d88dbfc8db6a171bf5dec627ab715cf03fba49032967109",
+      "size_bytes": 9653,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "config/fresh-run.project.example.json",
+      "destination_path": "examples/fresh-run.project.example.json",
+      "classification": "MIGRATE_TEST_FIXTURE",
+      "sha256_before_copy": "3aa4ee2bd70c4fcdd7bb16b4d4c5e6db7cdf682d8486937e664aed14eadbb142",
+      "size_bytes": 2226,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "pyproject.toml",
+      "destination_path": "pyproject.toml",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "a7a043f82595e6208613041569fc78e5aae7d00269a90bd192b0efedcac4ce97",
+      "size_bytes": 426,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "uv.lock",
+      "destination_path": "uv.lock",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "sha256_before_copy": "c5bcff6d6debaa534cc63d112f12cca88eb62eb5b25ed3a00c1947d13d5005bb",
+      "size_bytes": 139,
+      "copy_status": "byte-for-byte"
+    },
+    {
+      "source_path": "README.md",
+      "destination_path": "README.md",
+      "classification": "MIGRATE_DOCUMENTATION",
+      "sha256_before_copy": "b773c5f14c051dfa7c9d5aad35ccc49d139cf385963295b6f66c765c7222c38c",
+      "size_bytes": 17283,
+      "copy_status": "replaced by generic standalone onboarding; historical Chuen Lung command guide intentionally not copied"
+    },
+    {
+      "source_path": ".agents/skills/exhibition-archive",
+      "destination_path": ".agents/skills/exhibition-archive",
+      "classification": "MIGRATE_PRODUCT_SOURCE",
+      "symlink_target": "../../skills/exhibition-archive",
+      "copy_status": "recreated as repository discovery link to canonical skills source"
+    }
+  ],
+  "excluded_or_external": [
+    {
+      "source_path": "config/chuen-lung.project.json",
+      "classification": "EXCLUDE_PRIVATE_DATA",
+      "reason": "venue-specific paths and accepted asset identities; use as an external read-only regression input only",
+      "sha256_recorded": false
+    },
+    {
+      "source_path": "projects/<private-project>/**",
+      "classification": "EXCLUDE_PRIVATE_DATA",
+      "reason": "project manifest, workflow SQLite state, locks, review logs/data, and generated workspace output",
+      "sha256_recorded": false
+    },
+    {
+      "source_path": ".venv/** and tests/**/__pycache__/**",
+      "classification": "EXCLUDE_GENERATED_ARTIFACT",
+      "reason": "local Python environment and bytecode cache"
+    },
+    {
+      "source_path": "docs/future-codex-skill-spec.md",
+      "classification": "REQUIRES_REVIEW",
+      "reason": "superseded MVP draft; it says backend adapters are unimplemented although the current Engine has adapters and authorization"
+    },
+    {
+      "source_path": "analysis/phase3c-skill-release/**",
+      "classification": "REFERENCE_EXTERNALLY",
+      "reason": "historical test reports, browser evidence, and RC artifacts remain in the research repository"
+    },
+    {
+      "source_path": "large exhibition photos, COLMAP, PLY, checkpoints, review DBs, published websites, runtime logs",
+      "classification": "EXCLUDE_GENERATED_ARTIFACT",
+      "reason": "not reusable product source; preserved externally and not copied"
+    },
+    {
+      "source_path": "LICENSE",
+      "classification": "REQUIRES_REVIEW",
+      "reason": "no license exists; no license was invented"
+    },
+    {
+      "source_path": "templates/viewer/review.html",
+      "classification": "EXCLUDE_PRIVATE_DATA",
+      "reason": "legacy Phase 2ER evidence dashboard includes Chuen Lung PLY identity and historical evidence paths; not used by the Engine"
+    },
+    {
+      "source_path": "templates/viewer/server.mjs",
+      "classification": "EXCLUDE_PRIVATE_DATA",
+      "reason": "legacy local server reads the old research tree and source photos; not used by the Engine"
+    }
+  ],
+  "prior_validation_provenance": [
+    {
+      "evidence": "phase3c-skill-release/regression/fresh-backend/",
+      "result": "synthetic fake-backend integration PASS; no real SfM or training"
+    },
+    {
+      "evidence": "phase3c-skill-release/regression/portability/",
+      "result": "independent synthetic fixture portability and package-resume PASS"
+    },
+    {
+      "evidence": "phase3c-skill-release/browser-validation/release-viewer-final/browser-static-results.json",
+      "result": "VERIFIED_BY_BROWSER; 11/11 required viewer cases passed"
+    },
+    {
+      "evidence": "phase3c-skill-release/authorization/",
+      "result": "27 authorization/navigation unit checks passed"
+    },
+    {
+      "evidence": "phase3c-skill-release/regression/chuen-lung-protection.json",
+      "result": "six protected groups unchanged; accepted PLY identity and 292-photo hashes match"
+    },
+    {
+      "evidence": "phase3c-skill-release/release/release-verification.json",
+      "result": "full-hash package integrity passed; public rights remain NEEDS_REVIEW"
+    }
+  ],
+  "notes": [
+    "Inventory paths are source-relative; no private project files are hashed or copied.",
+    "The new repository has no selected license, no commit, and no new RC tag.",
+    "The historical repo and accepted exhibition data remain authoritative for historical provenance."
+  ],
+  "new_product_files": [
+    {
+      "path": "tests/test_cli.py",
+      "classification": "IMPLEMENTATION_AND_TEST",
+      "reason": "Added portable --version smoke test for the migrated CLI launcher",
+      "sha256": "b439fbec60cf549daf2024536b8c8d06d18668fbdc3fa5b026c8e062378a32a0",
+      "size_bytes": 653
+    }
+  ],
+  "changes_after_initial_inventory": [
+    {
+      "path": "src/exhibition_archive/cli.py",
+      "classification": "IMPLEMENTED_AND_TESTED",
+      "reason": "Adds --version and prefixes one-use authorization IDs with ea_ so argparse accepts them safely"
+    },
+    {
+      "path": "tests/run_fresh_backend_tests.py",
+      "classification": "IMPLEMENTED_AND_TESTED",
+      "reason": "Rebased the evidence root and uses the unambiguous --authorization-id=VALUE form"
+    }
+  ]
+}

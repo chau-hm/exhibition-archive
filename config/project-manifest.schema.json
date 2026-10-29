@@ -1,0 +1,173 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "urn:exhibition-archive:project-manifest:v1",
+  "title": "Exhibition Archive Engine project manifest",
+  "description": "Portable project definition. Relative paths resolve from the initialized project workspace.",
+  "type": "object",
+  "required": ["schema_version", "project_id", "source", "output_directory"],
+  "properties": {
+    "schema_version": {"const": "exhibition-archive.project.v1"},
+    "project_id": {"type": "string", "pattern": "^[a-zA-Z0-9][a-zA-Z0-9._-]{1,127}$"},
+    "created_at_utc": {"type": "string", "format": "date-time"},
+    "source": {
+      "type": "object",
+      "required": ["photo_directory"],
+      "properties": {
+        "photo_directory": {"type": "string", "minLength": 1},
+        "read_only": {"const": true},
+        "originals_modified": {"const": false},
+        "derived_image_directories": {"type": "array", "items": {"type": "string"}, "description": "Explicit project-local derived raster copies; original photos remain authoritative."},
+        "license_or_reproduction_rights": {"type": "string"},
+        "access_constraints": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "output_directory": {"type": "string", "minLength": 1},
+    "viewer": {
+      "type": "object",
+      "properties": {
+        "title": {"type": "string"},
+        "theme": {"enum": ["dark", "light"]},
+        "public_geometry_view_ids": {"type": "array", "items": {"type": "string"}},
+        "default_geometry_view_id": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "publication": {
+      "type": "object",
+      "properties": {
+        "public_site": {"type": "boolean"},
+        "include_source_photographs": {"const": false},
+        "include_private_review_notes": {"const": false},
+        "artwork_reproduction_rights": {"type": "string"},
+        "access_constraints": {"type": "string"},
+        "public_artwork_catalogue": {"type": "string"}
+      },
+      "additionalProperties": true
+    },
+    "archive_policy": {
+      "type": "object",
+      "properties": {
+        "bundle_source_photographs": {"const": false},
+        "source_index_is_self_contained_archive": {"const": false},
+        "retention_note": {"type": "string"},
+        "known_limitations": {"type": "array", "items": {"type": "string"}}
+      },
+      "additionalProperties": true
+    },
+    "retry_policy": {
+      "type": "object",
+      "properties": {
+        "max_failed_attempts": {"type": "integer", "minimum": 1, "maximum": 5},
+        "automatic_retries": {"const": 0}
+      },
+      "additionalProperties": true
+    },
+    "integrations": {
+      "type": "object",
+      "description": "Optional artifact adapters. Paths may be absolute or relative to the project workspace.",
+      "properties": {
+        "preflight": {"type": "object"},
+        "artwork": {"type": "object"},
+        "sfm": {
+          "type": "object",
+          "properties": {
+            "mode": {"enum": ["adopt_existing", "spirula_fresh"]},
+            "executable": {"type": "string"},
+            "directory": {"type": "string", "description": "Existing reconstruction directory when mode=adopt_existing"},
+            "image_directory": {"type": "string", "description": "Read-only source subdirectory; must stay within source.photo_directory for fresh mode"},
+            "derived_image_manifest": {"type": "string", "description": "Project-local mapping and hashes for a registered derived image directory."},
+            "quality": {"enum": ["low", "medium", "high", "extreme"]},
+            "data_type": {"enum": ["individual", "video", "internet"]},
+            "max_image_size": {"type": "integer", "minimum": 320},
+            "device": {"type": "string", "description": "Optional Spirula Vulkan device selector as listed by this installed version."},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "additional_args": {"type": "array", "items": {"type": "string"}},
+            "environment_overrides": {"type": "object", "additionalProperties": {"type": "string"}},
+            "quality_gate": {
+              "type": "object",
+              "properties": {
+                "minimum_registered_ratio": {"type": "number", "minimum": 0, "maximum": 1},
+                "minimum_registered_images": {"type": "integer", "minimum": 2},
+                "maximum_mean_point_reprojection_error_px": {"type": "number", "exclusiveMinimum": 0},
+                "allow_training_with_warnings": {"type": "boolean"}
+              },
+              "additionalProperties": true
+            }
+          },
+          "additionalProperties": true
+        },
+        "model": {
+          "type": "object",
+          "properties": {
+            "mode": {"enum": ["adopt_existing", "spirula_fresh"]},
+            "path": {"type": "string", "description": "Existing selected PLY when mode=adopt_existing"},
+            "executable": {"type": "string"},
+            "run_type": {"enum": ["smoke_test", "candidate"]},
+            "preset": {"enum": ["3dgs", "360-camera", "in-the-wild", "centered-object", "hdr", "synthetic", "meshing"]},
+            "iterations": {"type": "integer", "minimum": 1},
+            "data_format": {"enum": ["colmap", "nerfstudio", "metashape"]},
+            "image_directory": {"type": "string"},
+            "image_dir": {"type": "string"},
+            "colmap_recon_dir": {"type": "string"},
+            "resolution_divisor": {"type": "integer", "minimum": 1},
+            "device": {"type": "string"},
+            "steps_per_save": {"type": "integer", "minimum": 1},
+            "seed": {"type": "integer"},
+            "artifact_selector": {"type": "string"},
+            "timeout_seconds": {"type": "integer", "minimum": 1},
+            "additional_args": {"type": "array", "items": {"type": "string"}},
+            "environment_overrides": {"type": "object", "additionalProperties": {"type": "string"}}
+          },
+          "additionalProperties": true
+        },
+        "evaluation": {"type": "object"},
+        "navigation": {
+          "type": "object",
+          "description": "Adopt a reviewed envelope or generate a conservative, review-required proposal from validated SfM geometry.",
+          "properties": {
+            "mode": {"enum": ["adopt_existing", "generate_from_sfm"], "default": "adopt_existing"},
+            "envelope": {"type": "string"},
+            "runtime_policy": {"type": "string"},
+            "camera_centers": {"type": "string", "description": "Optional trusted-center artifact; otherwise COLMAP registered poses are read from integrations.sfm.directory."},
+            "trusted_pose_classification": {"type": "string"},
+            "viewer_transform_verified": {"type": "boolean", "default": false, "description": "Explicitly confirm that configured common-viewer camera centers use the selected model's viewer frame."},
+            "default_station_id": {"type": "string", "description": "Optional initial camera station; the selected pose must pass region, clearance, floor, and ceiling validation."},
+            "floor_plane": {"oneOf": [{"type": "string"}, {"type": "object"}]},
+            "ceiling": {"oneOf": [{"type": "string"}, {"type": "object"}]},
+            "coordinate_frame": {"type": "object", "description": "Explicit source-to-viewer rotation, translation, scale, and transform-verification status."},
+            "transitions": {"type": "array", "items": {"type": "object"}, "description": "Explicit room portals; proximity alone never establishes a doorway."},
+            "guided_paths": {"type": "array", "items": {"type": "object"}},
+            "viewpoints": {"type": "array", "items": {"type": "object"}},
+            "alpha_scale": {"type": "number", "exclusiveMinimum": 0, "default": 1.6},
+            "region_connection_scale": {"type": "number", "exclusiveMinimum": 0, "default": 2.5},
+            "nearest_neighbor_outlier_factor": {"type": "number", "exclusiveMinimum": 0, "default": 5.0},
+            "margin_units": {"type": "number", "minimum": 0, "description": "Optional inferred extension in scene-local units; not meters unless calibrated."},
+            "camera_clearance_units": {"type": "number", "minimum": 0},
+            "floor_clearance_units": {"type": "number", "minimum": 0},
+            "ceiling_clearance_units": {"type": "number", "minimum": 0}
+          },
+          "additionalProperties": true
+        }
+      },
+      "additionalProperties": true
+    },
+    "resource_policy": {
+      "type": "object",
+      "properties": {
+        "max_training_iterations": {"type": "integer", "minimum": 1, "description": "Required hard upper bound for a fresh training run."},
+        "minimum_free_disk_bytes": {"type": "integer", "minimum": 0},
+        "minimum_free_disk_bytes_sfm": {"type": "integer", "minimum": 0},
+        "minimum_free_disk_bytes_training": {"type": "integer", "minimum": 0},
+        "sfm_timeout_seconds": {"type": "integer", "minimum": 1},
+        "training_timeout_seconds": {"type": "integer", "minimum": 1},
+        "poll_interval_seconds": {"type": "number", "minimum": 0.1, "maximum": 5},
+        "max_concurrent_backend_processes": {"const": 1, "description": "One active SfM or training process per project; enforced by the workflow lock."},
+        "retained_attempt_limit": {"type": "integer", "minimum": 1, "description": "Per stage; reaching the limit blocks new attempts and never deletes prior data."},
+        "log_retention": {"enum": ["keep_all"], "default": "keep_all"}
+      },
+      "additionalProperties": true
+    }
+  },
+  "additionalProperties": true
+}

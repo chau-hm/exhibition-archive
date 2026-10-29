@@ -1,0 +1,71 @@
+# Exhibition Archive Engine
+
+A local-first Python CLI and Codex Skill for preparing reviewable exhibition archives from photo collections and existing reconstruction/model artifacts. The Engine owns durable workflow state, provenance, validation, and publication gates; exhibition source data and project workspaces stay outside this repository.
+
+## What it does
+
+- Initializes an exhibition project and SQLite workflow state in a workspace you choose.
+- Inventories source photographs and runs safe capture preflight.
+- Adopts existing COLMAP, Gaussian-splat PLY, artwork, and navigation inputs, or plans fresh Spirula SfM/training work.
+- Binds fresh expensive backend runs to a one-use approval for the exact current plan.
+- Generates and validates navigation proposals and provides local review interfaces.
+- Builds a static visitor package and checks its integrity and publication review state.
+
+The Engine does not determine legal rights, approve curatorial decisions, certify inferred architecture as surveyed, or create a self-contained Preservation Package. The independent exhibition pilot has not started.
+
+## Install
+
+Requires Python 3.11 or later. The package has no Python runtime dependencies.
+
+~~~bash
+python3 -m venv .venv
+.venv/bin/python -m pip install -e .
+.venv/bin/exhibition-archive --help
+~~~
+
+For a Codex session opened at this repository, repository-scoped Skill discovery uses the checked-in .agents/skills/exhibition-archive link. The one authoritative Skill source is skills/exhibition-archive. Type /skills to inspect available Skills or explicitly invoke $exhibition-archive.
+
+## First project
+
+Keep the source photographs read-only and create a separate project workspace. Copy the generic example and edit project ID, source path, output path, publication policy, and optional integrations for the exhibition:
+
+~~~bash
+mkdir -p /path/to/new-project
+cp examples/fresh-run.project.example.json /path/to/new-project/project.json
+~~~
+
+Then initialize and inspect the durable plan and status:
+
+~~~bash
+exhibition-archive init --config /path/to/new-project/project.json --workspace /path/to/new-project/workspace
+exhibition-archive plan /path/to/new-project/workspace --full-hash
+exhibition-archive status /path/to/new-project/workspace
+~~~
+
+The example config is a template; it may describe fresh backends, which remain gated. Do not authorize a backend until its exact plan and limits have been reviewed.
+
+## Safe operation
+
+- Use plan, status, verify, and logs for inspection.
+- Use run for safe local intake and configured adopted artifacts. A new SfM or training attempt stops at its authorization gate.
+- Authorize fresh SfM or training only for the current full-hash plan, after reviewing the named stage, input, command, limits, resources, and expected output.
+- Use review and navigation review for human decisions. Review approvals bind to exact current candidates.
+- Use package for package-only work based on current validated artifacts. It does not launch SfM or training.
+- Use verify --full-hash for integrity. verify --public-release additionally requires current human publication and rights approval.
+- Do not deploy automatically. A local package is not authorization to publish.
+
+See docs/installation.md, docs/workflow.md, docs/gpu-authorization.md, docs/navigation-review.md, docs/publishing.md, and docs/pilot-onboarding.md.
+
+## Development
+
+~~~bash
+python -m unittest discover -s tests -v
+python tests/run_portability_test.py
+python tests/run_fresh_backend_tests.py
+~~~
+
+Generated test workspaces and evidence are written under the ignored .local/ directory. Browser acceptance uses a real browser harness and is recorded separately from geometry/unit and synthetic backend tests. See docs/release for migration and release evidence.
+
+## Release and licensing
+
+The current package version is 0.1.0. Its Phase 3C release-candidate provenance is 0.1.0-rc.1. No new release tag has been assigned. No license has been selected; this repository does not invent one.

@@ -1,0 +1,32 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+.pytest_cache/
+.coverage
+
+# Local validation output and project runtime state
+.local/
+.cache/
+*.sqlite
+*.sqlite3
+*.sqlite3-*
+*.workflow.lock
+review-hub.json
+review-hub.log
+review-data/
+
+# Generated processing and publication output
+backend-runs/
+training-runs/
+browser-test-output/
+outputs/
+workspaces/
+*.ckpt
+*.splat
+*.spz
+*.sog
+
+# OS metadata
+.DS_Store

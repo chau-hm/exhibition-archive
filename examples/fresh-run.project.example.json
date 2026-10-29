@@ -1,0 +1,71 @@
+{
+  "schema_version": "exhibition-archive.project.v1",
+  "project_id": "new-exhibition-project",
+  "created_at_utc": "2026-10-28T00:00:00Z",
+  "source": {
+    "photo_directory": "input/originals",
+    "read_only": true,
+    "originals_modified": false,
+    "license_or_reproduction_rights": "PROJECT_SPECIFIC_DECISION_REQUIRED",
+    "access_constraints": "PROJECT_SPECIFIC_DECISION_REQUIRED"
+  },
+  "output_directory": "output",
+  "viewer": {
+    "title": "New Exhibition",
+    "theme": "dark"
+  },
+  "publication": {
+    "public_site": false,
+    "include_source_photographs": false,
+    "include_private_review_notes": false,
+    "artwork_reproduction_rights": "PROJECT_SPECIFIC_DECISION_REQUIRED",
+    "access_constraints": "PROJECT_SPECIFIC_DECISION_REQUIRED"
+  },
+  "archive_policy": {
+    "bundle_source_photographs": false,
+    "retention_note": "Source photographs remain at the managed read-only source location unless a separate preservation package is explicitly configured."
+  },
+  "retry_policy": {
+    "automatic_retries": 0,
+    "max_failed_attempts": 2
+  },
+  "resource_policy": {
+    "max_training_iterations": 300,
+    "max_concurrent_backend_processes": 1,
+    "minimum_free_disk_bytes_sfm": 10737418240,
+    "minimum_free_disk_bytes_training": 21474836480,
+    "sfm_timeout_seconds": 3600,
+    "training_timeout_seconds": 7200,
+    "poll_interval_seconds": 1,
+    "retained_attempt_limit": 5,
+    "log_retention": "keep_all"
+  },
+  "integrations": {
+    "sfm": {
+      "mode": "spirula_fresh",
+      "executable": "spirula",
+      "image_directory": "input/originals",
+      "quality": "low",
+      "data_type": "individual",
+      "max_image_size": 1600,
+      "quality_gate": {
+        "minimum_registered_ratio": 0.7,
+        "minimum_registered_images": 24,
+        "maximum_mean_point_reprojection_error_px": 2,
+        "allow_training_with_warnings": false
+      }
+    },
+    "model": {
+      "mode": "spirula_fresh",
+      "executable": "spirula",
+      "run_type": "smoke_test",
+      "preset": "3dgs",
+      "data_format": "colmap",
+      "image_directory": "input/originals",
+      "iterations": 300,
+      "resolution_divisor": 8,
+      "steps_per_save": 100,
+      "device": "auto"
+    }
+  }
+}
