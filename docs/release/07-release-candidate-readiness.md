@@ -1,4 +1,6 @@
-# 07 - Release candidate readiness
+# 07 - Release candidate readiness (Phase 3C.1 historical)
+
+> This is the Phase 3C.1 snapshot. Its browser and Skill-runtime blockers were closed in Phase 3C.2; use the current [Phase 3C.2 release acceptance and pilot readiness report](phase3c2/07-release-acceptance-and-pilot-readiness.md) for the present decision.
 
 ## Decision
 

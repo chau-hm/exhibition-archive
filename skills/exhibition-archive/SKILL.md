@@ -12,6 +12,7 @@ Act as a thin operator interface for the local Exhibition Archive Engine. The En
 1. Find the CLI through `EXHIBITION_ARCHIVE_ENGINE`, `exhibition-archive` on `PATH`, or `bin/exhibition-archive` in the installed product workspace. Do not search historical experiment directories or unrelated disks. If it is missing, say so and provide the installation path from `references/workflow.md`.
 2. For an existing project, inspect `plan` and `status`. For a new project, verify the photo directory exists, ask for a stable exhibition ID and new workspace if either is missing, then run `init`. The Engine treats originals as read-only and does not copy them.
 3. Summarize image count/formats, completed/adopted/pending stages, cache reuse, review gates, and next safe action. Use exact Engine labels and cite durable evidence paths when available.
+   If current plan readiness reports `BLOCKED_NO_CONFIGURED_ARTIFACT` while durable status records that stage as `COMPLETED` or `ADOPTED`, explain that recorded completion is not the same as present readiness to recompute the stage; preserve both facts and do not rewrite workflow state to reconcile the display.
 
 ## Classify each action
 

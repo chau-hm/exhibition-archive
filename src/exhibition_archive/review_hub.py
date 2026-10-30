@@ -94,7 +94,13 @@ def main(argv=None):
     dashboard = (Path(__file__).resolve().parents[2] / "dashboard" / "index.html").read_text(encoding="utf-8")
     review_url = f"http://127.0.0.1:{args.port+1}/"
     artwork_link = f'<a href="{review_url}" target="_blank" rel="noreferrer">Open artwork review separately</a>' if review_server else ""
+    artwork_frame = (
+        f'<iframe title="Phase 2EV artwork identity and association review" src="{review_url}"></iframe>'
+        if review_server else
+        '<div class="review-unavailable">Artwork review is not configured for this project.</div>'
+    )
     dashboard = dashboard.replace("__PROJECT_ID__", config["project_id"]).replace("__ARTWORK_REVIEW_LINK__", artwork_link)
+    dashboard = dashboard.replace("__ARTWORK_REVIEW_FRAME__", artwork_frame)
     nav_cfg = config.get("integrations", {}).get("navigation", {})
     nav_link = '<a href="/navigation" target="_blank" rel="noreferrer">Review generated navigation</a>' if nav_cfg.get("mode") == "generate_from_sfm" else ""
     dashboard = dashboard.replace("__NAVIGATION_REVIEW_LINK__", nav_link)

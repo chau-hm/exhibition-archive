@@ -1,5 +1,7 @@
 # 05 - Skill functional evaluation
 
+> Historical Phase 3C.1 snapshot: the model runtime failed before inference. Phase 3C.2 later completed fresh-session evaluations; use the current [Skill functional evaluation](phase3c2/04-skill-functional-evaluation.md) for the latest result.
+
 ## Result
 
 No fresh model session reached inference. Therefore no test below is classified `VERIFIED_BY_SKILL_INVOCATION`; each is `BLOCKED` at the runtime boundary. Direct Engine tests are reported separately in report 03 and do not substitute for Skill invocation.

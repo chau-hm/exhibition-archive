@@ -1,5 +1,7 @@
 # 06 - Regression and preservation
 
+> This report records the Phase 3C.1 regression snapshot. Phase 3C.2 adds the successful post-migration browser run and final engine/package checks in [report 02](phase3c2/02-post-migration-browser-acceptance.md) and [report 06](phase3c2/06-engine-package-and-preservation-regression.md).
+
 ## Migrated Engine regressions
 
 The 28-test unit suite, fake backend integration, and independent portability suite passed from the canonical repository. The fake backend exercised fresh adapter flow, PLY/metadata rejection, authorization, cache reuse, process failure, timeout, cancellation, interrupted process recovery, and finalization. The synthetic portability workflow exercised init, plan/run/recovery, cache-only package, configuration invalidation, and verification. The test outputs live under ignored `.local/validation/phase3c1/`; summaries are linked in report 03.
