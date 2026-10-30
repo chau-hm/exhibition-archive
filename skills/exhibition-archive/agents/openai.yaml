@@ -1,0 +1,6 @@
+# Codex invocation policy for the Exhibition Archive operator Skill.
+# Invoke explicitly with $exhibition-archive; do not auto-select based on topic.
+# If this file already exists in the repository, MERGE this policy into it
+# and preserve all existing interface/dependencies fields.
+policy:
+  allow_implicit_invocation: false
