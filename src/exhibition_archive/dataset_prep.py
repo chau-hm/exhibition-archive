@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -341,7 +342,15 @@ def _canonical_exif(value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return [_canonical_exif(item) for item in value]
     if hasattr(value, "numerator") and hasattr(value, "denominator"):
-        return [int(value.numerator), int(value.denominator)]
+        numerator = int(value.numerator)
+        denominator = int(value.denominator)
+        try:
+            normalized = Fraction(numerator, denominator)
+        except ZeroDivisionError:
+            # Preserve malformed rationals for comparison; do not turn them
+            # into an equivalent value or make invalid metadata pass.
+            return [numerator, denominator]
+        return [normalized.numerator, normalized.denominator]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)

@@ -70,6 +70,53 @@ def write_inventory(root: Path, photos: Path) -> dict:
     return inventory
 
 
+def validation_exif(*, omit_required: str | None = None,
+                    gps_seconds: tuple[int, int] | None = None):
+    from PIL import Image
+    from PIL.TiffImagePlugin import IFDRational
+
+    exif = Image.Exif()
+    exif[274] = 1
+    if omit_required != "camera_make":
+        exif[271] = "Apple"
+    if omit_required != "camera_model":
+        exif[272] = "iPhone metadata fixture"
+    exif_ifd = {36867: "2026:10:31 12:00:00", 36868: "2026:10:31 12:00:00"}
+    if omit_required != "focal_length":
+        exif_ifd[37386] = IFDRational(425, 100)
+        exif_ifd[41989] = 24
+    exif[34665] = exif_ifd
+    if gps_seconds is not None:
+        seconds_numerator, seconds_denominator = gps_seconds
+        exif[34853] = {
+            1: "N", 2: (IFDRational(22, 1), IFDRational(18, 1), IFDRational(0, 1)),
+            3: "E", 4: (IFDRational(114, 1), IFDRational(10, 1), IFDRational(0, 1)),
+            7: (IFDRational(5, 1), IFDRational(8, 1),
+                IFDRational(seconds_numerator, seconds_denominator)),
+            29: "2026:10:31",
+        }
+    return exif
+
+
+def write_validation_images(root: Path, source_exif, output_exif) -> tuple[Path, Path, Path, Path, bytes]:
+    from PIL import Image, ImageDraw
+
+    root.mkdir(parents=True, exist_ok=True)
+    target_icc = dataset_prep._srgb_profile_bytes()
+    image = Image.new("RGB", (96, 64), (48, 72, 91))
+    ImageDraw.Draw(image).rectangle((24, 14, 72, 50), fill=(162, 108, 62))
+    source_reference = root / "source.png"
+    pixel_reference = root / "transformed.png"
+    jpeg = root / "converted.jpg"
+    sidecar = root / "source.exif"
+    image.save(source_reference, "PNG", icc_profile=target_icc)
+    image.save(pixel_reference, "PNG", icc_profile=target_icc)
+    image.save(jpeg, "JPEG", quality=95, exif=output_exif.tobytes(), icc_profile=target_icc)
+    # Write the TIFF payload form accepted by _load_exif_sidecar.
+    sidecar.write_bytes(source_exif.tobytes()[6:])
+    return source_reference, pixel_reference, jpeg, sidecar, target_icc
+
+
 def fake_batch(requests: list[dict[str, str]], _converter: dict, _timeout: int) -> dict:
     result = {}
     for request in requests:
@@ -147,6 +194,53 @@ class DatasetPreparationTests(unittest.TestCase):
         self.assertEqual(dataset_prep._decoded_pixel_evidence(reference, matching_jpeg)["status"], "PASS")
         with self.assertRaisesRegex(BackendError, "pixel content does not match"):
             dataset_prep._decoded_pixel_evidence(reference, black_jpeg)
+
+    def test_srgb_metadata_validation_accepts_equivalent_gps_time_rationals(self):
+        source_exif = validation_exif(gps_seconds=(5768, 100))
+        output_exif = validation_exif(gps_seconds=(1442, 25))
+        (source_reference, pixel_reference, jpeg, sidecar,
+         target_icc) = write_validation_images(self.root, source_exif, output_exif)
+
+        details = dataset_prep._validate_heif_outputs(
+            source_reference, pixel_reference, jpeg, sidecar,
+            dataset_prep._srgb_preparation_settings(), target_icc,
+        )
+        self.assertIn("gps_time_stamp", details["source_metadata_fields"])
+        self.assertIn("gps_time_stamp", details["retained_metadata_fields"])
+        self.assertEqual(details["icc_profile_validation_status"],
+                         "TARGET_SRGB_ICC_PROFILE_BYTES_VERIFIED")
+        self.assertEqual(details["pixel_content_validation"]["status"], "PASS")
+
+    def test_srgb_metadata_validation_allows_missing_optional_gps_but_requires_camera_and_focal(self):
+        source_exif = validation_exif()
+        output_exif = validation_exif()
+        artifacts = write_validation_images(self.root / "optional-gps", source_exif, output_exif)
+        optional_details = dataset_prep._validate_heif_outputs(
+            *artifacts[:4], dataset_prep._srgb_preparation_settings(), artifacts[4],
+        )
+        self.assertNotIn("gps_time_stamp", optional_details["source_metadata_fields"])
+        self.assertEqual(optional_details["pixel_content_validation"]["status"], "PASS")
+        self.assertTrue({"camera_make", "camera_model", "focal_length", "focal_length_35mm",
+                         "date_time_original", "date_time_digitized"}.issubset(
+                             optional_details["retained_metadata_fields"]))
+
+        for required_field in ("camera_make", "camera_model", "focal_length"):
+            with self.subTest(required_field=required_field):
+                case_root = self.root / f"missing-{required_field}"
+                case_root.mkdir()
+                missing_source_exif = validation_exif(omit_required=required_field)
+                missing_output_exif = validation_exif(omit_required=required_field)
+                missing_artifacts = write_validation_images(
+                    case_root, missing_source_exif, missing_output_exif,
+                )
+                with self.assertRaises(BackendError) as raised:
+                    dataset_prep._validate_heif_outputs(
+                        *missing_artifacts[:4], dataset_prep._srgb_preparation_settings(),
+                        missing_artifacts[4],
+                    )
+                self.assertEqual(raised.exception.failure_kind, "CONVERSION_FAILED")
+                self.assertIn(required_field,
+                              raised.exception.details["missing_source_essential_fields"])
 
     def test_mixed_dataset_collision_manifest_and_cache_reuse(self):
         (self.photos / "same.jpg").write_bytes(b"jpeg-original-exact-bytes")
@@ -531,7 +625,7 @@ class DatasetPreparationTests(unittest.TestCase):
                 1: "N", 2: (rational(22, 1), rational(18, 1), rational(0, 1)),
                 3: "E", 4: (rational(114, 1), rational(10, 1), rational(0, 1)),
                 5: 0, 6: rational(12, 1),
-                7: (rational(4, 1), rational(5, 1), rational(6, 1)),
+                7: (rational(4, 1), rational(5, 1), rational(5768, 100)),
                 29: "2026:10:31",
             }
             source.save(base, "JPEG", quality=95, exif=exif, icc_profile=profile_bytes)
@@ -569,6 +663,7 @@ class DatasetPreparationTests(unittest.TestCase):
                 self.assertEqual(gps.get(1), "N")
                 self.assertEqual(gps.get(3), "E")
                 self.assertEqual(gps.get(29), "2026:10:31")
+                self.assertEqual(tuple(float(value) for value in gps.get(7)), (4.0, 5.0, 57.68))
                 self.assertEqual(converted.info.get("icc_profile"), target_icc)
                 self.assertEqual(dataset_prep._profile_kind(
                     ImageCms.getProfileDescription(ImageCms.ImageCmsProfile(
@@ -579,6 +674,7 @@ class DatasetPreparationTests(unittest.TestCase):
             self.assertEqual(details["source_height"], size[1])
             self.assertEqual(details["source_orientation"], 3)
             self.assertEqual(details["output_orientation"], 1)
+            self.assertIn("gps_time_stamp", details["retained_metadata_fields"])
             self.assertEqual(details["source_color_profile"], "Display P3")
             self.assertIn("sRGB", details["output_color_profile"])
             self.assertEqual(details["icc_profile_validation_status"], "TARGET_SRGB_ICC_PROFILE_BYTES_VERIFIED")
