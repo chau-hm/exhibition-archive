@@ -14,7 +14,8 @@ from .backends import (BackendError, IMAGE_SUFFIXES, build_sfm_command, build_tr
                        check_resources, create_attempt_dir, discover_environment, discover_model_files,
                        execute_process, finalize_attempt_record, finalize_stage_attempt, image_inventory as backend_image_inventory, prepare_training_dataset,
                        validate_colmap_directory, validate_gaussian_ply)
-from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_preparation_required,
+from .dataset_prep import (DATASET_MANIFEST, PREP_SETTINGS, DatasetPreparationRequired, auto_preparation_required,
+                           contains_heif, heif_converter_identity,
                            effective_sfm_dataset, effective_training_dataset, raw_sfm_image_directory,
                            image_gamut_mismatch, preparation_manifest_path,
                            prepare_spirula_dataset, validate_preparation_stage_outputs)
@@ -166,11 +167,12 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
         sfm_cfg = integration.get("sfm", {})
         image_dir = project_path(root, config, sfm_cfg.get("image_directory", config["source"]["photo_directory"]))
         selected["source"] = config["source"]
-        selected["preparation_settings"] = {"jpeg_quality": 95, "orientation": "normalized-and-tag-flattened", "color": "ImageIO-profile-preserving"}
+        selected["preparation_settings"] = PREP_SETTINGS
         selected["implementation_files"] = [
             fingerprint_file(state, Path(__file__).with_name("dataset_prep.py"), full_hash),
-            fingerprint_file(state, Path(__file__).with_name("imageio_heic.swift"), full_hash),
         ]
+        if contains_heif(image_dir):
+            selected["converter"] = heif_converter_identity()
         selected["input_images"] = [fingerprint_file(state, file, full_hash)
                                      for file in sorted(image_dir.rglob("*") if image_dir.is_dir() else [])
                                      if file.is_file() and file.suffix.casefold() in IMAGE_SUFFIXES]

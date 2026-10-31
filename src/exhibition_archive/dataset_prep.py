@@ -3,13 +3,13 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-import platform
 import re
 import shutil
 import subprocess
-import sys
 import tempfile
+import time
 import uuid
+from io import BytesIO
 from pathlib import Path
 from typing import Any
 
@@ -23,14 +23,18 @@ JPEG_QUALITY = 95
 PREP_DIR = Path("derived/spirula-jpeg")
 PREP_MANIFEST = Path("derived/sfm-dataset-preparation.json")
 DATASET_MANIFEST = ".exhibition-archive-dataset.json"
-PREP_SCHEMA = "exhibition-archive.spirula-image-dataset.v1"
+PREP_SCHEMA = "exhibition-archive.spirula-image-dataset.v2"
+CONVERSION_VALIDATION_POLICY = "libheif-pixel-content-exif-icc-v1"
+PIXEL_SAMPLE_MAX_SIDE = 512
 PREP_SETTINGS = {
     "jpeg_quality": JPEG_QUALITY,
     "orientation": "bake-EXIF-transform-into-pixels-and-write-orientation-1",
     "resize": "none",
     "crop": "none",
     "lens_correction": "none",
-    "color": "preserve-ImageIO-decoded-source-profile-without-explicit-gamut-relabel",
+    "color": "preserve-libheif-decoded-source-ICC-profile-without-gamut-relabel",
+    "validation_policy": CONVERSION_VALIDATION_POLICY,
+    "pixel_sample_max_side": PIXEL_SAMPLE_MAX_SIDE,
 }
 
 
@@ -72,42 +76,39 @@ def auto_preparation_required(root: Path, config: dict[str, Any]) -> bool:
     return contains_heif(raw)
 
 
-def _imageio_script() -> Path:
-    return Path(__file__).with_name("imageio_heic.swift")
-
-
-def imageio_converter_identity() -> dict[str, Any]:
-    if sys.platform != "darwin":
-        raise BackendError(
-            "HEIC preparation requires macOS ImageIO and Swift on this host; no metadata-safe fallback converter is configured",
-            failure_kind="CONVERTER_UNAVAILABLE",
-        )
-    swift = shutil.which("swift")
-    if not swift:
-        raise BackendError(
-            "HEIC preparation requires Swift to call macOS ImageIO; install the Xcode Command Line Tools and retry",
-            failure_kind="CONVERTER_UNAVAILABLE",
-        )
-    script = _imageio_script()
-    if not script.is_file():
-        raise BackendError("Packaged ImageIO HEIC converter is missing", failure_kind="CONVERTER_UNAVAILABLE")
+def _pillow_modules():
     try:
-        version_output = subprocess.run([swift, "--version"], check=True, text=True,
+        from PIL import Image, ImageChops, ImageCms, ImageStat, __version__
+    except ImportError as exc:
+        raise BackendError(
+            "HEIC preparation requires Pillow for decoded-pixel, EXIF, and ICC validation; install the exhibition-archive package dependencies",
+            failure_kind="CONVERTER_UNAVAILABLE",
+        ) from exc
+    return Image, ImageChops, ImageCms, ImageStat, __version__
+
+
+def heif_converter_identity() -> dict[str, Any]:
+    executable = shutil.which("heif-convert")
+    if not executable:
+        raise BackendError(
+            "HEIC preparation requires heif-convert from libheif; on macOS install it with `brew install libheif`, then confirm `heif-convert --version` works",
+            failure_kind="CONVERTER_UNAVAILABLE",
+        )
+    try:
+        version_output = subprocess.run([executable, "--version"], check=True, text=True,
                                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                                        timeout=15).stdout
-        version_lines = [line.strip() for line in version_output.splitlines()
-                         if line.strip().startswith(("Swift version", "Target:"))]
-        version = "\n".join(version_lines) or version_output.strip()
+                                        timeout=15).stdout.strip()
     except (OSError, subprocess.SubprocessError) as exc:
-        raise BackendError(f"Could not identify the Swift/ImageIO converter: {exc}",
+        raise BackendError(f"Could not identify the heif-convert/libheif converter: {exc}",
                            failure_kind="CONVERTER_UNAVAILABLE") from exc
+    if not version_output:
+        raise BackendError("heif-convert returned no version information", failure_kind="CONVERTER_UNAVAILABLE")
+    _, _, _, _, pillow_version = _pillow_modules()
     return {
-        "name": "Apple ImageIO",
-        "wrapper": "Swift command-line helper",
-        "executable": str(Path(swift).resolve()),
-        "version": version,
-        "macos_version": platform.mac_ver()[0] or "UNKNOWN",
-        "helper_sha256": sha256_file(script),
+        "name": "libheif heif-convert",
+        "executable": str(Path(executable).resolve()),
+        "version": version_output,
+        "pixel_validator": {"name": "Pillow", "version": pillow_version},
     }
 
 
@@ -227,49 +228,297 @@ def _mapped_output_names(records: list[dict[str, Any]]) -> dict[str, str]:
     return resolved
 
 
-def _run_imageio_batch(requests: list[dict[str, str]], converter: dict[str, Any],
-                       timeout_seconds: int) -> dict[str, dict[str, Any]]:
+_EXIF_FIELDS = (
+    ("camera_make", "root", 271), ("camera_model", "root", 272),
+    ("lens_make", "exif", 42035), ("lens_model", "exif", 42036),
+    ("focal_length", "exif", 37386), ("focal_length_35mm", "exif", 41989),
+    ("f_number", "exif", 33437), ("exposure_time", "exif", 33434),
+    ("iso_speed_ratings", "exif", 34855),
+    ("focal_plane_x_resolution", "exif", 41486),
+    ("focal_plane_y_resolution", "exif", 41487),
+    ("focal_plane_resolution_unit", "exif", 41488),
+    ("date_time_original", "exif", 36867), ("date_time_digitized", "exif", 36868),
+    ("gps_latitude", "gps", 2), ("gps_latitude_ref", "gps", 1),
+    ("gps_longitude", "gps", 4), ("gps_longitude_ref", "gps", 3),
+    ("gps_altitude", "gps", 6), ("gps_altitude_ref", "gps", 5),
+    ("gps_date_stamp", "gps", 29), ("gps_time_stamp", "gps", 7),
+)
+
+
+def _exif_group(exif: Any, group: str) -> dict:
+    if group == "root":
+        return exif
+    return exif.get_ifd(34665 if group == "exif" else 34853)
+
+
+def _canonical_exif(value: Any) -> Any:
+    if isinstance(value, bytes):
+        return {"bytes": value.hex()}
+    if isinstance(value, dict):
+        return {str(key): _canonical_exif(item) for key, item in sorted(value.items(), key=lambda row: str(row[0]))}
+    if isinstance(value, (tuple, list)):
+        return [_canonical_exif(item) for item in value]
+    if hasattr(value, "numerator") and hasattr(value, "denominator"):
+        return [int(value.numerator), int(value.denominator)]
+    if isinstance(value, (str, int, float, bool)) or value is None:
+        return value
+    return str(value)
+
+
+def _load_exif_sidecar(path: Path):
+    Image, _, _, _, _ = _pillow_modules()
+    data = path.read_bytes()
+    offsets = [0]
+    if len(data) >= 4:
+        offsets.append(4 + int.from_bytes(data[:4], "big"))
+    for offset in dict.fromkeys(offsets):
+        if data[offset:offset + 2] not in {b"II", b"MM"}:
+            continue
+        exif = Image.Exif()
+        try:
+            exif.load(data[offset:])
+            return exif
+        except (OSError, SyntaxError, ValueError):
+            continue
+    raise BackendError("heif-convert wrote an EXIF sidecar that Pillow could not parse", failure_kind="CONVERSION_FAILED")
+
+
+def _profile_description(icc_profile: bytes | None) -> str | None:
+    if not icc_profile:
+        return None
+    _, _, ImageCms, _, _ = _pillow_modules()
+    try:
+        description = ImageCms.getProfileDescription(ImageCms.ImageCmsProfile(BytesIO(icc_profile))).strip()
+    except Exception as exc:
+        raise BackendError(f"Decoded JPEG contains an unreadable ICC profile: {exc}", failure_kind="CONVERSION_FAILED") from exc
+    return description or "ICC profile with no description"
+
+
+def _luminance_percentile(image: Any, percentile: float = 0.99) -> int:
+    histogram = image.convert("L").histogram()
+    threshold = max(1, int(image.width * image.height * percentile))
+    cumulative = 0
+    for value, count in enumerate(histogram):
+        cumulative += count
+        if cumulative >= threshold:
+            return value
+    return 255
+
+
+def _decoded_pixel_evidence(reference_path: Path, jpeg_path: Path) -> dict[str, Any]:
+    Image, ImageChops, _, ImageStat, _ = _pillow_modules()
+    try:
+        with Image.open(reference_path) as reference:
+            reference.load()
+            reference_size = reference.size
+            reference_sample = reference.convert("RGB")
+            reference_sample.thumbnail((PIXEL_SAMPLE_MAX_SIDE, PIXEL_SAMPLE_MAX_SIDE), Image.Resampling.BOX)
+        with Image.open(jpeg_path) as converted:
+            converted.load()
+            converted_size = converted.size
+            converted_sample = converted.convert("RGB")
+            converted_sample.thumbnail((PIXEL_SAMPLE_MAX_SIDE, PIXEL_SAMPLE_MAX_SIDE), Image.Resampling.BOX)
+    except Exception as exc:
+        raise BackendError(f"Could not decode the libheif pixel reference or converted JPEG: {exc}",
+                           failure_kind="CONVERSION_FAILED") from exc
+    if reference_size != converted_size or reference_sample.size != converted_sample.size:
+        raise BackendError("Converted JPEG dimensions differ from the normalized libheif reference",
+                           failure_kind="CONVERSION_FAILED",
+                           details={"reference_size": reference_size, "output_size": converted_size})
+
+    difference = ImageChops.difference(reference_sample, converted_sample)
+    mean_error = sum(ImageStat.Stat(difference).mean) / 3.0
+    source_luminance_p99 = _luminance_percentile(reference_sample)
+    output_luminance_p99 = _luminance_percentile(converted_sample)
+    # Compare with the source instead of rejecting images by their absolute
+    # brightness. A genuinely dark source remains valid when the JPEG matches it.
+    looks_black = source_luminance_p99 >= 12 and output_luminance_p99 <= max(2, source_luminance_p99 * 0.2)
+    if looks_black or mean_error > 24:
+        raise BackendError(
+            "Converted JPEG pixel content does not match the decoded HEIF source; a black or otherwise corrupted derivative was discarded",
+            failure_kind="CONVERSION_FAILED",
+            details={"mean_absolute_channel_error": round(mean_error, 3),
+                     "source_luminance_p99": source_luminance_p99,
+                     "output_luminance_p99": output_luminance_p99,
+                     "near_black_output": looks_black},
+        )
+    return {
+        "status": "PASS",
+        "method": "libheif PNG decode compared with decoded JPEG pixels",
+        "sample_max_side": PIXEL_SAMPLE_MAX_SIDE,
+        "mean_absolute_channel_error": round(mean_error, 3),
+        "source_luminance_p99": source_luminance_p99,
+        "output_luminance_p99": output_luminance_p99,
+    }
+
+
+def _validate_heif_outputs(reference_path: Path, jpeg_path: Path, exif_path: Path) -> dict[str, Any]:
+    Image, _, _, _, _ = _pillow_modules()
+    source_exif = _load_exif_sidecar(exif_path)
+    try:
+        with Image.open(reference_path) as reference, Image.open(jpeg_path) as converted:
+            if reference.format != "PNG" or converted.format != "JPEG":
+                raise BackendError("libheif reference or conversion output has an unexpected image format",
+                                   failure_kind="CONVERSION_FAILED")
+            reference_size = reference.size
+            output_size = converted.size
+            if reference_size != output_size:
+                raise BackendError("JPEG dimensions do not match the orientation-normalized HEIF source",
+                                   failure_kind="CONVERSION_FAILED",
+                                   details={"source_size": reference_size, "output_size": output_size})
+            output_exif = converted.getexif()
+            source_icc = reference.info.get("icc_profile")
+            output_icc = converted.info.get("icc_profile")
+            if source_icc is not None and not isinstance(source_icc, bytes):
+                raise BackendError("libheif reference contains invalid ICC profile data", failure_kind="CONVERSION_FAILED")
+            if output_icc is not None and not isinstance(output_icc, bytes):
+                raise BackendError("Converted JPEG contains invalid ICC profile data", failure_kind="CONVERSION_FAILED")
+            source_icc = source_icc or None
+            output_icc = output_icc or None
+            if source_icc and output_icc != source_icc:
+                raise BackendError("Converted JPEG ICC profile bytes differ from the libheif-decoded HEIF source",
+                                   failure_kind="CONVERSION_FAILED",
+                                   details={"source_icc_profile_byte_count": len(source_icc),
+                                            "output_icc_profile_byte_count": len(output_icc or b"")})
+
+            source_orientation = int(source_exif.get(274, 1))
+            output_orientation = int(output_exif.get(274, 1))
+            output_tiff_orientation = int(output_exif.get(274, 1))
+            if source_orientation not in range(1, 9) or output_orientation != 1:
+                raise BackendError("JPEG orientation was not normalized to EXIF orientation 1",
+                                   failure_kind="CONVERSION_FAILED",
+                                   details={"source_orientation": source_orientation,
+                                            "output_orientation": output_orientation})
+
+            source_fields: list[str] = []
+            retained_fields: list[str] = []
+            missing_fields: list[str] = []
+            for name, group, tag in _EXIF_FIELDS:
+                source_group = _exif_group(source_exif, group)
+                if tag not in source_group:
+                    continue
+                source_fields.append(name)
+                output_group = _exif_group(output_exif, group)
+                if tag in output_group and _canonical_exif(output_group[tag]) == _canonical_exif(source_group[tag]):
+                    retained_fields.append(name)
+                else:
+                    missing_fields.append(name)
+            missing_essential = []
+            if not source_exif.get(271):
+                missing_essential.append("camera_make")
+            if not source_exif.get(272):
+                missing_essential.append("camera_model")
+            source_exif_ifd = _exif_group(source_exif, "exif")
+            if source_exif_ifd.get(37386) is None and source_exif_ifd.get(41989) is None:
+                missing_essential.append("focal_length")
+            if missing_essential:
+                raise BackendError("HEIF source lacks essential camera make/model/focal metadata for SfM",
+                                   failure_kind="CONVERSION_FAILED",
+                                   details={"missing_source_essential_fields": missing_essential})
+            if missing_fields:
+                raise BackendError("JPEG did not retain source EXIF fields: " + ", ".join(missing_fields),
+                                   failure_kind="CONVERSION_FAILED",
+                                   details={"missing_or_changed_metadata_fields": missing_fields})
+
+            source_profile = _profile_description(source_icc)
+            output_profile = _profile_description(output_icc)
+            pixel_evidence = _decoded_pixel_evidence(reference_path, jpeg_path)
+    except BackendError:
+        raise
+    except Exception as exc:
+        raise BackendError(f"Could not validate converted JPEG metadata or ICC profile: {exc}",
+                           failure_kind="CONVERSION_FAILED") from exc
+
+    return {
+        "source_width": reference_size[0], "source_height": reference_size[1],
+        "width": output_size[0], "height": output_size[1],
+        "source_orientation": source_orientation,
+        "output_orientation": output_orientation,
+        "output_tiff_orientation": output_tiff_orientation,
+        "jpeg_quality": JPEG_QUALITY,
+        "validation_policy": CONVERSION_VALIDATION_POLICY,
+        "pixel_content_validation": pixel_evidence,
+        "source_metadata_fields": source_fields,
+        "retained_metadata_fields": retained_fields,
+        "missing_source_essential_fields": missing_essential,
+        "metadata_validation_status": "PRESERVED_SOURCE_FIELDS" if source_fields else "NO_RELEVANT_SOURCE_METADATA",
+        "source_color_profile": source_profile,
+        "output_color_profile": output_profile,
+        "source_icc_profile_byte_count": len(source_icc) if source_icc else 0,
+        "output_icc_profile_byte_count": len(output_icc) if output_icc else 0,
+        "source_icc_profile_sha256": hashlib.sha256(source_icc).hexdigest() if source_icc else None,
+        "output_icc_profile_sha256": hashlib.sha256(output_icc).hexdigest() if output_icc else None,
+        "icc_profile_validation_status": "ICC_PROFILE_BYTES_PRESERVED" if source_icc else "SOURCE_ICC_PROFILE_ABSENT",
+        "color_profile_validation_status": "ICC_PROFILE_BYTES_MATCHED" if source_icc else "OUTPUT_ICC_PROFILE_INSPECTED",
+        "color_handling": "heif-convert/libheif output ICC bytes inspected with Pillow; source ICC bytes compared when present; no gamut relabel or color conversion",
+    }
+
+
+def _run_heif_command(executable: str, arguments: list[str], source: str,
+                      deadline: float, timeout_seconds: int) -> None:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise BackendError(
+            f"heif-convert exceeded the configured {timeout_seconds}-second dataset-preparation limit; incomplete outputs were discarded",
+            failure_kind="RESOURCE_LIMIT",
+        )
+    try:
+        completed = subprocess.run([executable, *arguments], check=False, text=True,
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                   timeout=remaining)
+    except subprocess.TimeoutExpired as exc:
+        raise BackendError(
+            f"heif-convert exceeded the configured {timeout_seconds}-second dataset-preparation limit; incomplete outputs were discarded",
+            failure_kind="RESOURCE_LIMIT",
+        ) from exc
+    except OSError as exc:
+        raise BackendError(f"Could not launch heif-convert: {exc}", failure_kind="CONVERTER_UNAVAILABLE") from exc
+    if completed.returncode != 0:
+        raise BackendError(
+            f"heif-convert failed while processing {Path(source).name}; incomplete outputs were discarded",
+            failure_kind="CONVERSION_FAILED",
+            details={"exit_code": completed.returncode,
+                     "stdout": completed.stdout[-2000:], "stderr": completed.stderr[-4000:]},
+        )
+
+
+def _run_heif_convert_batch(requests: list[dict[str, str]], converter: dict[str, Any],
+                            timeout_seconds: int) -> dict[str, dict[str, Any]]:
     if not requests:
         return {}
-    script = _imageio_script()
-    with tempfile.TemporaryDirectory(prefix="exhibition-archive-imageio-") as temp_name:
+    deadline = time.monotonic() + timeout_seconds
+    results: dict[str, dict[str, Any]] = {}
+    # The JPEG and libheif pixel reference, including heif-convert's .exif
+    # sidecar, are all kept in this OS temporary directory, outside the final
+    # SfM image directory.
+    with tempfile.TemporaryDirectory(prefix="exhibition-archive-heif-") as temp_name:
         temp = Path(temp_name)
-        request_path = temp / "requests.json"
-        request_path.write_text(json.dumps(requests, sort_keys=True), encoding="utf-8")
-        cache = temp / "module-cache"
-        env = dict(os.environ)
-        env["TMPDIR"] = temp_name
-        try:
-            completed = subprocess.run(
-                [converter["executable"], "-module-cache-path", str(cache), str(script), str(request_path)],
-                check=False, text=True, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                timeout=timeout_seconds, env=env,
+        for index, request in enumerate(requests):
+            source = str(request["source"])
+            output = Path(request["output"])
+            converted = temp / f"converted-{index:05d}.jpg"
+            reference = temp / f"reference-{index:05d}.png"
+            exif_sidecar = temp / f"converted-{index:05d}.exif"
+            _run_heif_command(
+                converter["executable"],
+                ["--with-exif", "-q", str(JPEG_QUALITY), source, str(converted)],
+                source, deadline, timeout_seconds,
             )
-        except subprocess.TimeoutExpired as exc:
-            raise BackendError(
-                f"ImageIO conversion exceeded the configured {timeout_seconds}-second dataset-preparation limit; incomplete outputs were discarded",
-                failure_kind="RESOURCE_LIMIT",
-            ) from exc
-        except OSError as exc:
-            raise BackendError(f"Could not launch macOS ImageIO conversion: {exc}",
-                               failure_kind="CONVERTER_UNAVAILABLE") from exc
-        try:
-            response = json.loads(completed.stdout.strip().splitlines()[-1])
-        except (ValueError, IndexError) as exc:
-            raise BackendError(
-                "ImageIO converter returned no machine-readable verification result; incomplete outputs were discarded",
-                failure_kind="CONVERSION_FAILED",
-                details={"exit_code": completed.returncode, "stderr": completed.stderr[-4000:]},
-            ) from exc
-        rows = response.get("results", [])
-        failed = [row for row in rows if row.get("status") != "VERIFIED"]
-        if completed.returncode != 0 or failed or len(rows) != len(requests):
-            raise BackendError(
-                "HEIC conversion failed or its JPEG/metadata validation did not pass; incomplete outputs were discarded",
-                failure_kind="CONVERSION_FAILED",
-                details={"results": rows, "stderr": completed.stderr[-4000:], "exit_code": completed.returncode},
-            )
-        return {str(row["source"]): dict(row["details"]) for row in rows}
+            if not converted.is_file() or not exif_sidecar.is_file():
+                raise BackendError(
+                    f"heif-convert did not produce a JPEG and EXIF sidecar for {Path(source).name}",
+                    failure_kind="CONVERSION_FAILED",
+                )
+            _run_heif_command(converter["executable"], [source, str(reference)],
+                              source, deadline, timeout_seconds)
+            if not reference.is_file():
+                raise BackendError(f"heif-convert did not produce a decoded pixel reference for {Path(source).name}",
+                                   failure_kind="CONVERSION_FAILED")
+            details = _validate_heif_outputs(reference, converted, exif_sidecar)
+            output.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(converted, output)
+            results[source] = details
+    return results
 
 
 def _jpeg_dimensions(path: Path) -> tuple[int | None, int | None]:
@@ -300,6 +549,36 @@ def _jpeg_dimensions(path: Path) -> tuple[int | None, int | None]:
                 stream.seek(size - 2, 1)
     except (OSError, ValueError):
         return None, None
+
+
+def _dataset_file_membership(dataset: Path) -> set[str] | None:
+    files: set[str] = set()
+    for path in dataset.rglob("*"):
+        if path.is_symlink():
+            return None
+        if path.is_file():
+            relative = path.relative_to(dataset).as_posix().casefold()
+            if relative != DATASET_MANIFEST.casefold():
+                files.add(relative)
+    return files
+
+
+def _conversion_validation_current(details: Any) -> bool:
+    if not isinstance(details, dict):
+        return False
+    pixel = details.get("pixel_content_validation")
+    icc_status = details.get("icc_profile_validation_status")
+    return (
+        details.get("validation_policy") == CONVERSION_VALIDATION_POLICY and
+        isinstance(pixel, dict) and pixel.get("status") == "PASS" and
+        str(pixel.get("method", "")).startswith("libheif PNG decode") and
+        details.get("output_orientation") == 1 and
+        details.get("jpeg_quality") == JPEG_QUALITY and
+        details.get("metadata_validation_status") == "PRESERVED_SOURCE_FIELDS" and
+        icc_status in {"ICC_PROFILE_BYTES_PRESERVED", "SOURCE_ICC_PROFILE_ABSENT"} and
+        (not details.get("output_icc_profile_byte_count") or
+         isinstance(details.get("output_icc_profile_sha256"), str))
+    )
 
 
 def _prepared_dataset_valid(dataset: Path, preparation_id: str,
@@ -352,16 +631,14 @@ def _prepared_dataset_valid(dataset: Path, preparation_id: str,
             details = mapping.get("conversion_validation", {})
             if (target.suffix.casefold() not in JPEG_SUFFIXES or target.stat().st_size <= 0 or
                     _jpeg_dimensions(target) != (mapping.get("width"), mapping.get("height")) or
-                    details.get("output_orientation") != 1 or
-                    details.get("jpeg_quality") != JPEG_QUALITY or
-                    details.get("metadata_validation_status") not in {"PRESERVED_SOURCE_FIELDS", "NO_RELEVANT_SOURCE_METADATA"}):
+                    not _conversion_validation_current(details)):
                 return None
         elif mapping.get("derived_sha256") != mapping.get("source_sha256"):
             return None
     if seen_source != set(expected_sources):
         return None
     actual = {p.relative_to(dataset).as_posix().casefold() for p in _supported_images(dataset)}
-    if actual != seen_output:
+    if actual != seen_output or _dataset_file_membership(dataset) != seen_output:
         return None
     return manifest
 
@@ -432,10 +709,8 @@ def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str,
             raise BackendError(f"Prepared JPEG/image changed after verification: {output_rel}", failure_kind="STALE_DATASET_PREPARATION")
         if Path(source_rel).suffix.casefold() in HEIF_SUFFIXES:
             details = mapping.get("conversion_validation", {})
-            if (Path(output_rel).suffix.casefold() not in JPEG_SUFFIXES or details.get("output_orientation") != 1 or
-                    details.get("jpeg_quality") != JPEG_QUALITY or
-                    details.get("metadata_validation_status") not in {"PRESERVED_SOURCE_FIELDS", "NO_RELEVANT_SOURCE_METADATA"}):
-                raise BackendError(f"Prepared HEIC mapping lacks verified JPEG/EXIF/orientation evidence: {source_rel}", failure_kind="INVALID_INPUT")
+            if Path(output_rel).suffix.casefold() not in JPEG_SUFFIXES or not _conversion_validation_current(details):
+                raise BackendError(f"Prepared HEIC mapping lacks current pixel/EXIF/ICC verification evidence: {source_rel}", failure_kind="INVALID_INPUT")
     if seen_source != set(expected_by_source):
         raise BackendError("Prepared source mapping does not cover the current registered image dataset", failure_kind="STALE_DATASET_PREPARATION")
     if manifest.get("preparation_settings") != PREP_SETTINGS:
@@ -443,7 +718,7 @@ def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str,
     basis = manifest.get("preparation_basis")
     if not isinstance(basis, dict) or _json_digest(basis) != manifest.get("preparation_fingerprint"):
         raise BackendError("Prepared dataset fingerprint does not match its recorded conversion inputs", failure_kind="STALE_DATASET_PREPARATION")
-    current_converter = imageio_converter_identity()
+    current_converter = heif_converter_identity()
     expected_basis = {
         "schema_version": PREP_SCHEMA,
         "source_directory": str(input_dir.resolve()),
@@ -457,13 +732,13 @@ def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str,
         "converter": current_converter,
     }
     if basis != expected_basis or basis.get("converter") != current_converter or basis.get("settings") != PREP_SETTINGS:
-        raise BackendError("ImageIO converter identity or JPEG preparation settings changed; rerun safe dataset preparation", failure_kind="STALE_DATASET_PREPARATION")
+        raise BackendError("heif-convert/libheif identity or JPEG preparation settings changed; rerun safe dataset preparation", failure_kind="STALE_DATASET_PREPARATION")
     conversion = manifest.get("conversion", {})
     if conversion.get("backend") != current_converter or conversion.get("settings") != PREP_SETTINGS or manifest.get("image_count") != len(expected_records):
         raise BackendError("Prepared manifest conversion provenance is incomplete or stale", failure_kind="STALE_DATASET_PREPARATION")
     actual_outputs = {path.relative_to(dataset).as_posix().casefold() for path in _supported_images(dataset)}
-    if actual_outputs != seen_output:
-        raise BackendError("Prepared dataset image membership differs from its verified mapping", failure_kind="STALE_DATASET_PREPARATION")
+    if actual_outputs != seen_output or _dataset_file_membership(dataset) != seen_output:
+        raise BackendError("Prepared dataset contains unexpected or missing files relative to its verified image mapping", failure_kind="STALE_DATASET_PREPARATION")
     if not contains_heif(input_dir):
         raise BackendError("Prepared dataset no longer corresponds to a HEIC input set", failure_kind="STALE_DATASET_PREPARATION")
     return dataset, manifest
@@ -576,7 +851,7 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
     if not records or not any(row["source_format"] in {x.lstrip(".") for x in HEIF_SUFFIXES} for row in records):
         raise BackendError("HEIC files were detected but none are represented in the registered source inventory", failure_kind="STALE_SOURCE_INVENTORY")
 
-    converter = imageio_converter_identity()
+    converter = heif_converter_identity()
     output_names = _mapped_output_names(records)
     source_fingerprint_rows = [{"source_relative_path": row["source_relative_path"],
                                 "source_sha256": row["source_sha256"],
@@ -641,7 +916,7 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
             else:
                 shutil.copy2(row["source_path"], output)
 
-        conversion_details = _run_imageio_batch(
+        conversion_details = _run_heif_convert_batch(
             requests, converter,
             int(policy.get("dataset_prep_timeout_seconds", 3600)),
         )
@@ -653,11 +928,11 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
                 temporary_output = target.with_name(target.name + ".part")
                 details = conversion_details.get(row["source_path"])
                 if not details or not temporary_output.is_file():
-                    raise BackendError(f"ImageIO did not produce a verified JPEG for {row['source_relative_path']}", failure_kind="CONVERSION_FAILED")
+                    raise BackendError(f"heif-convert did not produce a fully verified JPEG for {row['source_relative_path']}", failure_kind="CONVERSION_FAILED")
                 os.replace(temporary_output, target)
                 if target.suffix.casefold() not in JPEG_SUFFIXES or _jpeg_dimensions(target) != (details.get("width"), details.get("height")):
                     raise BackendError(f"JPEG header/dimensions failed independent verification for {row['source_relative_path']}", failure_kind="CONVERSION_FAILED")
-                conversion_name = "HEIC_TO_JPEG_IMAGEIO"
+                conversion_name = "HEIC_TO_JPEG_LIBHEIF"
             else:
                 details = None
                 if not target.is_file() or sha256_file(target) != row["source_sha256"]:
@@ -689,7 +964,7 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
             "conversion_required": True,
             "conversion": {"backend": converter, "settings": PREP_SETTINGS,
                            "jpeg_quality": JPEG_QUALITY,
-                           "color_handling": "For converted HEIC, ImageIO checks source ICC bytes when present, otherwise compares decoded color-space profile names. Byte-copied JPEG inputs are not re-encoded or profile-inspected. No explicit gamut conversion or DCI-P3 relabel is applied; ICC colorimetric fidelity has not been independently measured."},
+                           "color_handling": "For converted HEIC, the output JPEG ICC profile is decoded and identified; ICC bytes are compared with the libheif-decoded source when present. Display P3 is never treated as DCI-P3. Byte-copied JPEG inputs remain unchanged and are not profile-inspected."},
             "preparation_settings": PREP_SETTINGS,
             "jpeg_quality": JPEG_QUALITY,
             "preparation_fingerprint": preparation_id,
@@ -740,7 +1015,7 @@ def image_gamut_mismatch(config: dict[str, Any], manifest: dict[str, Any] | None
         return None
     values = []
     converted = [mapping for mapping in manifest.get("image_mappings", [])
-                 if mapping.get("conversion") == "HEIC_TO_JPEG_IMAGEIO"]
+                 if mapping.get("conversion") == "HEIC_TO_JPEG_LIBHEIF"]
     for mapping in converted:
         details = mapping.get("conversion_validation") or {}
         profile = details.get("output_color_profile")
@@ -748,6 +1023,8 @@ def image_gamut_mismatch(config: dict[str, Any], manifest: dict[str, Any] | None
             normalized = re.sub(r"[^a-z0-9]", "", profile.casefold())
             if "displayp3" in normalized:
                 values.append("display-p3")
+            elif "dcip3" in normalized:
+                values.append("dci-p3")
             elif "srgb" in normalized:
                 values.append("srgb")
             elif profile:

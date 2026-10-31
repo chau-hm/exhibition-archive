@@ -7,7 +7,7 @@ name = "exhibition-archive"
 version = "0.1.0"
 description = "Local-first exhibition capture-to-archive workflow engine"
 requires-python = ">=3.11"
-dependencies = []
+dependencies = ["Pillow>=10.0"]
 
 [project.scripts]
 exhibition-archive = "exhibition_archive.cli:main"
@@ -17,6 +17,3 @@ package-dir = {"" = "src"}
 
 [tool.setuptools.packages.find]
 where = ["src"]
-
-[tool.setuptools.package-data]
-exhibition_archive = ["imageio_heic.swift"]
