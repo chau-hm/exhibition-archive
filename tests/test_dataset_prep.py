@@ -1,10 +1,12 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import shutil
 import subprocess
 import tempfile
 import unittest
+from io import BytesIO
 from pathlib import Path
 from unittest.mock import patch
 
@@ -42,7 +44,7 @@ def config_for(root: Path) -> dict:
         "integrations": {
             "sfm": {"mode": "spirula_fresh", "executable": "/opt/test/spirula",
                     "image_directory": str(photos), "quality": "low", "data_type": "individual",
-                    "additional_args": ["--image-gamut", "sRGB"]},
+                    "additional_args": []},
             "model": {"mode": "spirula_fresh", "executable": "/opt/test/spirula",
                       "image_directory": str(photos), "run_type": "candidate", "preset": "3dgs",
                       "iterations": 50, "resolution_divisor": 2},
@@ -246,6 +248,30 @@ class DatasetPreparationTests(unittest.TestCase):
         self.config["integrations"]["sfm"]["additional_args"] = ["--image-gamut", "sRGB"]
         self.assertIn("mixed dataset", dataset_prep.image_gamut_mismatch(self.config, mixed))
 
+    def test_rec709_selects_separate_srgb_dataset_and_requires_verified_profile(self):
+        self.assertEqual(dataset_prep.preparation_settings_for(self.config), dataset_prep.PREP_SETTINGS)
+        self.config["integrations"]["sfm"]["additional_args"] = ["--image-gamut", "Rec.709"]
+        settings = dataset_prep.preparation_settings_for(self.config)
+        self.assertTrue(dataset_prep._is_srgb_target(settings))
+        self.assertEqual(settings["dataset_directory"], dataset_prep.SRGB_PREP_DIR.as_posix())
+
+        mapping = {
+            "conversion": "HEIC_TO_JPEG_LIBHEIF",
+            "conversion_validation": {
+                "output_color_profile": "sRGB built-in",
+                "output_icc_profile_sha256": "verified-profile-hash",
+                "icc_profile_validation_status": "TARGET_SRGB_ICC_PROFILE_BYTES_VERIFIED",
+                "color_conversion_validation": {
+                    "status": "PASS", "target_profile_bytes_verified": True,
+                },
+            },
+        }
+        manifest = {"status": "PREPARED", "image_mappings": [mapping]}
+        self.assertIsNone(dataset_prep.image_gamut_mismatch(self.config, manifest))
+        mapping["conversion_validation"]["icc_profile_validation_status"] = "ICC_PROFILE_BYTES_PRESERVED"
+        mapping["conversion_validation"]["output_icc_profile_sha256"] = None
+        self.assertIn("requires verified sRGB ICC", dataset_prep.image_gamut_mismatch(self.config, manifest))
+
     def test_display_p3_icc_is_preserved_and_not_labeled_dci_p3(self):
         if not shutil.which("heif-convert") or not shutil.which("heif-enc"):
             self.skipTest("requires heif-convert and heif-enc")
@@ -271,13 +297,19 @@ class DatasetPreparationTests(unittest.TestCase):
         subprocess.run([shutil.which("heif-enc"), str(base_jpeg), "-o", str(heic)],
                        check=True, capture_output=True, text=True, timeout=60)
 
-        result = dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory_for(self.photos))
+        self.config["integrations"]["sfm"]["additional_args"] = ["--image-gamut", "Display-P3"]
+        inventory = write_inventory(self.root, self.photos)
+        result = dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
         manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
         details = manifest["image_mappings"][0]["conversion_validation"]
+        self.assertEqual(manifest["schema_version"], dataset_prep.PREP_SCHEMA)
         self.assertEqual(details["output_color_profile"], "Display P3")
         self.assertEqual(details["source_icc_profile_sha256"], details["output_icc_profile_sha256"])
         self.config["integrations"]["sfm"]["additional_args"] = ["--image-gamut", "Display-P3"]
         self.assertIsNone(dataset_prep.image_gamut_mismatch(self.config, manifest))
+        with patch.object(dataset_prep, "_run_heif_convert_batch", side_effect=AssertionError("P3 cache miss")):
+            cached = dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
+        self.assertTrue(cached["details"]["cache_reused"])
         self.config["integrations"]["sfm"]["additional_args"] = ["--image-gamut", "DCI-P3"]
         self.assertIn("does not match", dataset_prep.image_gamut_mismatch(self.config, manifest))
 
@@ -331,6 +363,7 @@ class DatasetPreparationTests(unittest.TestCase):
             state.close()
 
     def test_failed_conversion_discards_staging_and_preserves_originals(self):
+        self.config["integrations"]["sfm"]["additional_args"] = ["--image-gamut", "Rec.709"]
         heic = self.photos / "failed.heic"
         heic.write_bytes(b"original-remains-unchanged")
         before = sha256_file(heic)
@@ -345,7 +378,7 @@ class DatasetPreparationTests(unittest.TestCase):
                 dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory_for(self.photos))
         self.assertEqual(sha256_file(heic), before)
         self.assertFalse(dataset_prep.preparation_manifest_path(self.root).exists())
-        managed = self.root / dataset_prep.PREP_DIR
+        managed = self.root / dataset_prep.SRGB_PREP_DIR
         self.assertEqual(list(managed.iterdir()), [])
 
     def test_workflow_prepares_then_stops_before_unauthorized_sfm_or_training(self):
@@ -384,7 +417,7 @@ class DatasetPreparationTests(unittest.TestCase):
 
         cases = [
             ("capture-24mp.heic", (5712, 4284), 1),
-            ("capture-48mp.heic", (8064, 6048), 3),
+            ("capture-12mp.heic", (4032, 3024), 3),
         ]
         icc_profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
         for index, (name, size, orientation) in enumerate(cases):
@@ -457,6 +490,139 @@ class DatasetPreparationTests(unittest.TestCase):
         expected_files.add(dataset_prep.DATASET_MANIFEST)
         actual_files = {path.relative_to(dataset).as_posix() for path in dataset.rglob("*") if path.is_file()}
         self.assertEqual(actual_files, expected_files)
+
+    @unittest.skipUnless(shutil.which("heif-convert") and shutil.which("heif-enc"),
+                         "requires heif-convert and heif-enc")
+    def test_rec709_converts_real_display_p3_heic_at_both_lumo_resolutions(self):
+        profiles = [Path("/System/Library/ColorSync/Profiles/Display P3.icc"),
+                    Path("/Library/ColorSync/Profiles/Display P3.icc")]
+        profile_path = next((path for path in profiles if path.is_file()), None)
+        if profile_path is None:
+            self.skipTest("a distributable system Display P3 ICC profile is unavailable")
+
+        from PIL import Image, ImageCms, ImageDraw, ImageStat
+        from PIL.TiffImagePlugin import IFDRational
+
+        self.config["integrations"]["sfm"]["additional_args"] = ["--image-gamut", "Rec.709"]
+        profile_bytes = profile_path.read_bytes()
+        cases = [
+            ("lumo-large.heic", (5712, 4284)),
+            ("lumo-small.heic", (4032, 3024)),
+        ]
+        originals = {}
+        for index, (name, size) in enumerate(cases):
+            base = self.root / f"display-p3-input-{index}.jpg"
+            heic = self.photos / name
+            source = Image.new("RGB", size, (8, 12, 16))
+            draw = ImageDraw.Draw(source)
+            # Saturated warm colors exercise the P3-to-sRGB channel transform.
+            draw.rectangle((0, 0, size[0] // 2, size[1]), fill=(255, 128, 0))
+            draw.rectangle((size[0] // 2, 0, size[0], size[1] // 2), fill=(35, 150, 75))
+            draw.ellipse((size[0] // 3, size[1] // 4, size[0] * 2 // 3, size[1] * 3 // 4),
+                         fill=(180, 80, 50))
+            exif = Image.Exif()
+            exif[271] = "Apple"
+            exif[272] = "iPhone 16 Pro Display P3 test fixture"
+            exif[274] = 3
+            exif[34665] = {37386: (425, 100), 41989: 24,
+                            36867: "2026:10:31 12:00:00", 36868: "2026:10:31 12:00:00"}
+            rational = lambda numerator, denominator: IFDRational(numerator, denominator)
+            exif[34853] = {
+                1: "N", 2: (rational(22, 1), rational(18, 1), rational(0, 1)),
+                3: "E", 4: (rational(114, 1), rational(10, 1), rational(0, 1)),
+                5: 0, 6: rational(12, 1),
+                7: (rational(4, 1), rational(5, 1), rational(6, 1)),
+                29: "2026:10:31",
+            }
+            source.save(base, "JPEG", quality=95, exif=exif, icc_profile=profile_bytes)
+            subprocess.run([shutil.which("heif-enc"), "-q", "95", str(base), "-o", str(heic)],
+                           check=True, capture_output=True, text=True, timeout=180)
+            base.unlink()
+            originals[name] = sha256_file(heic)
+
+        inventory = write_inventory(self.root, self.photos)
+        result = dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
+        manifest = json.loads(Path(result["manifest_path"]).read_text(encoding="utf-8"))
+        dataset = Path(result["effective_image_directory"])
+        self.assertEqual(dataset.parent, (self.root / dataset_prep.SRGB_PREP_DIR).resolve())
+        self.assertNotEqual(dataset.parent, (self.root / dataset_prep.PREP_DIR).resolve())
+        self.assertEqual(manifest["schema_version"], "exhibition-archive.spirula-image-dataset.v3")
+        self.assertEqual(manifest["preparation_settings"]["color"]["target_profile"], "sRGB")
+        self.assertEqual(manifest["conversion"]["jpeg_quality"], 95)
+        target_icc = dataset_prep._srgb_profile_bytes()
+        for row in manifest["image_mappings"]:
+            source_name = Path(row["source_relative_path"]).name
+            size = dict(cases)[source_name]
+            source_heic = self.photos / source_name
+            target = dataset / row["derived_relative_path"]
+            self.assertEqual(sha256_file(source_heic), originals[source_name])
+            with Image.open(target) as converted:
+                self.assertEqual(converted.format, "JPEG")
+                self.assertEqual(converted.size, size)
+                tags = converted.getexif()
+                self.assertEqual(tags.get(274, 1), 1)
+                self.assertEqual(tags.get(271), "Apple")
+                self.assertEqual(tags.get(272), "iPhone 16 Pro Display P3 test fixture")
+                self.assertEqual(tags.get_ifd(34665).get(37386), (425, 100))
+                self.assertEqual(tags.get_ifd(34665).get(41989), 24)
+                gps = tags.get_ifd(34853)
+                self.assertEqual(gps.get(1), "N")
+                self.assertEqual(gps.get(3), "E")
+                self.assertEqual(gps.get(29), "2026:10:31")
+                self.assertEqual(converted.info.get("icc_profile"), target_icc)
+                self.assertEqual(dataset_prep._profile_kind(
+                    ImageCms.getProfileDescription(ImageCms.ImageCmsProfile(
+                        BytesIO(converted.info["icc_profile"]))).strip()), "srgb")
+
+            details = row["conversion_validation"]
+            self.assertEqual(details["source_width"], size[0])
+            self.assertEqual(details["source_height"], size[1])
+            self.assertEqual(details["source_orientation"], 3)
+            self.assertEqual(details["output_orientation"], 1)
+            self.assertEqual(details["source_color_profile"], "Display P3")
+            self.assertIn("sRGB", details["output_color_profile"])
+            self.assertEqual(details["icc_profile_validation_status"], "TARGET_SRGB_ICC_PROFILE_BYTES_VERIFIED")
+            self.assertIsInstance(details["source_icc_profile_sha256"], str)
+            self.assertEqual(details["output_icc_profile_sha256"], hashlib.sha256(target_icc).hexdigest())
+            self.assertEqual(details["pixel_content_validation"]["status"], "PASS")
+            self.assertLess(details["pixel_content_validation"]["mean_absolute_channel_error"], 24)
+            self.assertEqual(details["color_conversion_validation"]["method"],
+                             "Pillow ImageCms.profileToProfile via LittleCMS")
+            self.assertEqual(details["color_conversion_validation"]["final_jpeg_encode_count"], 1)
+            self.assertIsNone(dataset_prep.image_gamut_mismatch(self.config, manifest))
+
+            reference = self.root / (Path(source_name).stem + "-reference.png")
+            subprocess.run([shutil.which("heif-convert"), str(source_heic), str(reference)],
+                           check=True, capture_output=True, text=True, timeout=180)
+            sample_box = (size[0] - 300, size[1] - 300, size[0] - 100, size[1] - 100)
+            with Image.open(reference) as source_pixels, Image.open(target) as converted:
+                self.assertEqual(details["source_icc_profile_sha256"],
+                                 hashlib.sha256(source_pixels.info["icc_profile"]).hexdigest())
+                source_sample = ImageStat.Stat(source_pixels.crop(sample_box).convert("RGB")).mean
+                converted_sample = ImageStat.Stat(converted.crop(sample_box).convert("RGB")).mean
+            self.assertGreater(abs(source_sample[1] - converted_sample[1]), 4,
+                               "Display P3 sample pixels should be transformed, not only relabeled")
+
+        expected_files = {row["derived_relative_path"] for row in manifest["image_mappings"]}
+        expected_files.add(dataset_prep.DATASET_MANIFEST)
+        self.assertEqual({path.relative_to(dataset).as_posix() for path in dataset.rglob("*") if path.is_file()},
+                         expected_files)
+        with patch.object(dataset_prep, "_run_heif_convert_batch", side_effect=AssertionError("cache miss")):
+            cached = dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
+        self.assertTrue(cached["details"]["cache_reused"])
+        self.assertEqual(cached["effective_image_directory"], dataset)
+        state = ProjectState(self.root)
+        try:
+            plan = expensive_execution_plan(self.root, self.config, state, "sfm", backend_info=BACKEND)
+            self.assertEqual(plan["input_dataset"], str(dataset))
+            self.assertEqual(plan["input_dataset_provenance"]["kind"],
+                             "ENGINE_VERIFIED_HEIC_JPEG_DERIVATIVES")
+            self.assertEqual(dataset_prep.effective_training_dataset(self.root, self.config)[0], dataset)
+            self.assertIn("--image-gamut", plan["normalized_command"])
+            self.assertIn("Rec.709", plan["normalized_command"])
+            self.assertEqual(state.db.execute("SELECT COUNT(*) FROM stage_executions").fetchone()[0], 0)
+        finally:
+            state.close()
 
 
 if __name__ == "__main__":

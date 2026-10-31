@@ -14,11 +14,12 @@ from .backends import (BackendError, IMAGE_SUFFIXES, build_sfm_command, build_tr
                        check_resources, create_attempt_dir, discover_environment, discover_model_files,
                        execute_process, finalize_attempt_record, finalize_stage_attempt, image_inventory as backend_image_inventory, prepare_training_dataset,
                        validate_colmap_directory, validate_gaussian_ply)
-from .dataset_prep import (DATASET_MANIFEST, PREP_SETTINGS, DatasetPreparationRequired, auto_preparation_required,
+from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_preparation_required,
                            contains_heif, heif_converter_identity,
                            effective_sfm_dataset, effective_training_dataset, raw_sfm_image_directory,
                            image_gamut_mismatch, preparation_manifest_path,
-                           prepare_spirula_dataset, validate_preparation_stage_outputs)
+                           prepare_spirula_dataset, preparation_settings_for,
+                           validate_preparation_stage_outputs)
 from .state import ProjectState, utc_now
 
 
@@ -166,13 +167,14 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
     if stage_id == "sfm_dataset_prep":
         sfm_cfg = integration.get("sfm", {})
         image_dir = project_path(root, config, sfm_cfg.get("image_directory", config["source"]["photo_directory"]))
+        prep_settings = preparation_settings_for(config)
         selected["source"] = config["source"]
-        selected["preparation_settings"] = PREP_SETTINGS
+        selected["preparation_settings"] = prep_settings
         selected["implementation_files"] = [
             fingerprint_file(state, Path(__file__).with_name("dataset_prep.py"), full_hash),
         ]
         if contains_heif(image_dir):
-            selected["converter"] = heif_converter_identity()
+            selected["converter"] = heif_converter_identity(prep_settings)
         selected["input_images"] = [fingerprint_file(state, file, full_hash)
                                      for file in sorted(image_dir.rglob("*") if image_dir.is_dir() else [])
                                      if file.is_file() and file.suffix.casefold() in IMAGE_SUFFIXES]
@@ -676,7 +678,8 @@ def _validate_read_only_image_scope(root: Path, config: dict, image_dir: Path) -
     source_dir = project_path(root, config, config["source"]["photo_directory"]).resolve()
     resolved = image_dir.resolve()
     within_originals = resolved == source_dir or source_dir in resolved.parents
-    managed_root = (root / "derived" / "spirula-jpeg").resolve()
+    prep_settings = preparation_settings_for(config)
+    managed_root = (root / prep_settings.get("dataset_directory", "derived/spirula-jpeg")).resolve()
     within_engine_managed = (managed_root in resolved.parents and
                              (resolved / DATASET_MANIFEST).is_file())
     within_registered_derived = False
