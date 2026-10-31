@@ -82,7 +82,7 @@
             "max_image_size": {"type": "integer", "minimum": 320},
             "device": {"type": "string", "description": "Optional Spirula Vulkan device selector as listed by this installed version."},
             "timeout_seconds": {"type": "integer", "minimum": 1},
-            "additional_args": {"type": "array", "items": {"type": "string"}},
+            "additional_args": {"type": "array", "items": {"type": "string"}, "description": "For fresh HEIC datasets, --image-gamut Rec.709 selects a separately versioned ICC-managed sRGB derivative set in Spirula Studio 2026.10.16; an sRGB selector works where supported by the configured backend."},
             "environment_overrides": {"type": "object", "additionalProperties": {"type": "string"}},
             "quality_gate": {
               "type": "object",

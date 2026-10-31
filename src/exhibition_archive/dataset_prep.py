@@ -9,6 +9,7 @@ import subprocess
 import tempfile
 import time
 import uuid
+from fractions import Fraction
 from io import BytesIO
 from pathlib import Path
 from typing import Any
@@ -21,10 +22,13 @@ HEIF_SUFFIXES = {".heic", ".heif"}
 JPEG_SUFFIXES = {".jpg", ".jpeg"}
 JPEG_QUALITY = 95
 PREP_DIR = Path("derived/spirula-jpeg")
+SRGB_PREP_DIR = Path("derived/spirula-jpeg-srgb-v1")
 PREP_MANIFEST = Path("derived/sfm-dataset-preparation.json")
 DATASET_MANIFEST = ".exhibition-archive-dataset.json"
 PREP_SCHEMA = "exhibition-archive.spirula-image-dataset.v2"
+SRGB_PREP_SCHEMA = "exhibition-archive.spirula-image-dataset.v3"
 CONVERSION_VALIDATION_POLICY = "libheif-pixel-content-exif-icc-v1"
+SRGB_CONVERSION_VALIDATION_POLICY = "libheif-pixel-content-exif-icc-color-v2"
 PIXEL_SAMPLE_MAX_SIDE = 512
 PREP_SETTINGS = {
     "jpeg_quality": JPEG_QUALITY,
@@ -87,7 +91,78 @@ def _pillow_modules():
     return Image, ImageChops, ImageCms, ImageStat, __version__
 
 
-def heif_converter_identity() -> dict[str, Any]:
+def _configured_image_gamut(config: dict[str, Any]) -> str | None:
+    args = config.get("integrations", {}).get("sfm", {}).get("additional_args", [])
+    if not isinstance(args, list):
+        return None
+    configured = None
+    for index, value in enumerate(args):
+        if value == "--image-gamut" and index + 1 < len(args):
+            configured = str(args[index + 1])
+        elif isinstance(value, str) and value.startswith("--image-gamut="):
+            configured = value.split("=", 1)[1]
+    return configured
+
+
+def _normalized_gamut(value: str | None) -> str:
+    return re.sub(r"[^a-z0-9]", "", (value or "").casefold())
+
+
+def preparation_settings_for(config: dict[str, Any]) -> dict[str, Any]:
+    """Select an isolated sRGB derivative set when Spirula requests Rec.709/sRGB."""
+    if _normalized_gamut(_configured_image_gamut(config)) not in {"srgb", "rec709", "bt709"}:
+        return PREP_SETTINGS
+
+    return _srgb_preparation_settings()
+
+
+def _srgb_preparation_settings() -> dict[str, Any]:
+    return {
+        **PREP_SETTINGS,
+        "color": {
+            "mode": "icc-managed-transform-to-srgb",
+            "accepted_source_profiles": ["Display P3", "sRGB"],
+            "target_profile": "sRGB",
+            "transform": "Pillow ImageCms / LittleCMS profileToProfile",
+            "rendering_intent": "perceptual",
+            "jpeg_encode_count": 1,
+        },
+        "dataset_directory": SRGB_PREP_DIR.as_posix(),
+        "validation_policy": SRGB_CONVERSION_VALIDATION_POLICY,
+    }
+
+
+def _is_srgb_target(settings: dict[str, Any]) -> bool:
+    return isinstance(settings.get("color"), dict) and settings["color"].get("mode") == "icc-managed-transform-to-srgb"
+
+
+def preparation_schema_for(settings: dict[str, Any]) -> str:
+    return SRGB_PREP_SCHEMA if _is_srgb_target(settings) else PREP_SCHEMA
+
+
+def _managed_dataset_directory(settings: dict[str, Any]) -> Path:
+    value = settings.get("dataset_directory", PREP_DIR.as_posix())
+    path = Path(str(value))
+    if path.is_absolute() or ".." in path.parts:
+        raise BackendError("Dataset preparation settings contain an unsafe managed output directory", failure_kind="UNSAFE_OUTPUT")
+    return path
+
+
+def _srgb_profile_bytes() -> bytes:
+    _, _, ImageCms, _, _ = _pillow_modules()
+    try:
+        profile = bytearray(ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes())
+    except Exception as exc:
+        raise BackendError("sRGB preparation requires Pillow built with LittleCMS ICC support",
+                           failure_kind="CONVERTER_UNAVAILABLE") from exc
+    # LittleCMS stamps the current second into the ICC header. Normalize only
+    # that descriptive field so cache fingerprints and output ICC bytes stay
+    # stable for the same LittleCMS version and generated profile data.
+    profile[24:36] = b"\x07\xe4\x00\x01\x00\x01\x00\x00\x00\x00\x00\x00"
+    return bytes(profile)
+
+
+def heif_converter_identity(settings: dict[str, Any] = PREP_SETTINGS) -> dict[str, Any]:
     executable = shutil.which("heif-convert")
     if not executable:
         raise BackendError(
@@ -103,13 +178,21 @@ def heif_converter_identity() -> dict[str, Any]:
                            failure_kind="CONVERTER_UNAVAILABLE") from exc
     if not version_output:
         raise BackendError("heif-convert returned no version information", failure_kind="CONVERTER_UNAVAILABLE")
-    _, _, _, _, pillow_version = _pillow_modules()
-    return {
+    _, _, ImageCms, _, pillow_version = _pillow_modules()
+    identity = {
         "name": "libheif heif-convert",
         "executable": str(Path(executable).resolve()),
         "version": version_output,
         "pixel_validator": {"name": "Pillow", "version": pillow_version},
     }
+    if _is_srgb_target(settings):
+        srgb_icc = _srgb_profile_bytes()
+        identity["color_management"] = {
+            "engine": "LittleCMS",
+            "version": str(ImageCms.core.littlecms_version),
+            "target_srgb_icc_sha256": hashlib.sha256(srgb_icc).hexdigest(),
+        }
+    return identity
 
 
 def _json_digest(value: Any) -> str:
@@ -259,7 +342,15 @@ def _canonical_exif(value: Any) -> Any:
     if isinstance(value, (tuple, list)):
         return [_canonical_exif(item) for item in value]
     if hasattr(value, "numerator") and hasattr(value, "denominator"):
-        return [int(value.numerator), int(value.denominator)]
+        numerator = int(value.numerator)
+        denominator = int(value.denominator)
+        try:
+            normalized = Fraction(numerator, denominator)
+        except ZeroDivisionError:
+            # Preserve malformed rationals for comparison; do not turn them
+            # into an equivalent value or make invalid metadata pass.
+            return [numerator, denominator]
+        return [normalized.numerator, normalized.denominator]
     if isinstance(value, (str, int, float, bool)) or value is None:
         return value
     return str(value)
@@ -294,6 +385,58 @@ def _profile_description(icc_profile: bytes | None) -> str | None:
     return description or "ICC profile with no description"
 
 
+def _profile_kind(description: str | None) -> str | None:
+    if not isinstance(description, str):
+        return None
+    normalized = _normalized_gamut(description)
+    if "displayp3" in normalized:
+        return "display-p3"
+    if "dcip3" in normalized:
+        return "dci-p3"
+    if "srgb" in normalized:
+        return "srgb"
+    return None
+
+
+def _transform_heif_png_to_srgb(source_png: Path, jpeg_path: Path, exif_path: Path,
+                                transformed_png: Path, target_icc: bytes) -> None:
+    """ICC-transform the lossless libheif decode, then encode the final JPEG once."""
+    Image, _, ImageCms, _, _ = _pillow_modules()
+    try:
+        with Image.open(source_png) as source:
+            source.load()
+            source_icc = source.info.get("icc_profile")
+            if not isinstance(source_icc, bytes) or not source_icc:
+                raise BackendError("sRGB preparation requires a verified source ICC profile in the libheif decode",
+                                   failure_kind="CONVERSION_FAILED")
+            source_description = _profile_description(source_icc)
+            if _profile_kind(source_description) not in {"display-p3", "srgb"}:
+                raise BackendError(
+                    f"sRGB preparation cannot transform an unrecognized source ICC profile: {source_description}",
+                    failure_kind="CONVERSION_FAILED",
+                    details={"source_color_profile": source_description},
+                )
+            source_profile = ImageCms.ImageCmsProfile(BytesIO(source_icc))
+            target_profile = ImageCms.ImageCmsProfile(BytesIO(target_icc))
+            transformed = ImageCms.profileToProfile(
+                source.convert("RGB"), source_profile, target_profile,
+                outputMode="RGB", renderingIntent=ImageCms.Intent.PERCEPTUAL,
+            )
+            transformed_png.parent.mkdir(parents=True, exist_ok=True)
+            transformed.save(transformed_png, "PNG", icc_profile=target_icc)
+
+        output_exif = _load_exif_sidecar(exif_path)
+        output_exif[274] = 1
+        jpeg_path.parent.mkdir(parents=True, exist_ok=True)
+        transformed.save(jpeg_path, "JPEG", quality=JPEG_QUALITY,
+                         exif=output_exif.tobytes(), icc_profile=target_icc)
+    except BackendError:
+        raise
+    except Exception as exc:
+        raise BackendError(f"Could not ICC-transform the decoded HEIF pixels to sRGB: {exc}",
+                           failure_kind="CONVERSION_FAILED") from exc
+
+
 def _luminance_percentile(image: Any, percentile: float = 0.99) -> int:
     histogram = image.convert("L").histogram()
     threshold = max(1, int(image.width * image.height * percentile))
@@ -305,7 +448,8 @@ def _luminance_percentile(image: Any, percentile: float = 0.99) -> int:
     return 255
 
 
-def _decoded_pixel_evidence(reference_path: Path, jpeg_path: Path) -> dict[str, Any]:
+def _decoded_pixel_evidence(reference_path: Path, jpeg_path: Path, *,
+                            method: str = "libheif PNG decode compared with decoded JPEG pixels") -> dict[str, Any]:
     Image, ImageChops, _, ImageStat, _ = _pillow_modules()
     try:
         with Image.open(reference_path) as reference:
@@ -344,7 +488,7 @@ def _decoded_pixel_evidence(reference_path: Path, jpeg_path: Path) -> dict[str, 
         )
     return {
         "status": "PASS",
-        "method": "libheif PNG decode compared with decoded JPEG pixels",
+        "method": method,
         "sample_max_side": PIXEL_SAMPLE_MAX_SIDE,
         "mean_absolute_channel_error": round(mean_error, 3),
         "source_luminance_p99": source_luminance_p99,
@@ -352,30 +496,51 @@ def _decoded_pixel_evidence(reference_path: Path, jpeg_path: Path) -> dict[str, 
     }
 
 
-def _validate_heif_outputs(reference_path: Path, jpeg_path: Path, exif_path: Path) -> dict[str, Any]:
+def _validate_heif_outputs(source_reference_path: Path, pixel_reference_path: Path,
+                           jpeg_path: Path, exif_path: Path,
+                           settings: dict[str, Any], target_srgb_icc: bytes | None = None) -> dict[str, Any]:
     Image, _, _, _, _ = _pillow_modules()
     source_exif = _load_exif_sidecar(exif_path)
     try:
-        with Image.open(reference_path) as reference, Image.open(jpeg_path) as converted:
-            if reference.format != "PNG" or converted.format != "JPEG":
+        with Image.open(source_reference_path) as source_reference, \
+                Image.open(pixel_reference_path) as pixel_reference, Image.open(jpeg_path) as converted:
+            if source_reference.format != "PNG" or pixel_reference.format != "PNG" or converted.format != "JPEG":
                 raise BackendError("libheif reference or conversion output has an unexpected image format",
                                    failure_kind="CONVERSION_FAILED")
-            reference_size = reference.size
+            reference_size = source_reference.size
             output_size = converted.size
             if reference_size != output_size:
                 raise BackendError("JPEG dimensions do not match the orientation-normalized HEIF source",
                                    failure_kind="CONVERSION_FAILED",
                                    details={"source_size": reference_size, "output_size": output_size})
             output_exif = converted.getexif()
-            source_icc = reference.info.get("icc_profile")
+            source_icc = source_reference.info.get("icc_profile")
             output_icc = converted.info.get("icc_profile")
+            pixel_reference_icc = pixel_reference.info.get("icc_profile")
             if source_icc is not None and not isinstance(source_icc, bytes):
                 raise BackendError("libheif reference contains invalid ICC profile data", failure_kind="CONVERSION_FAILED")
             if output_icc is not None and not isinstance(output_icc, bytes):
                 raise BackendError("Converted JPEG contains invalid ICC profile data", failure_kind="CONVERSION_FAILED")
             source_icc = source_icc or None
             output_icc = output_icc or None
-            if source_icc and output_icc != source_icc:
+            if _is_srgb_target(settings):
+                if not source_icc or not isinstance(target_srgb_icc, bytes) or not target_srgb_icc:
+                    raise BackendError("sRGB output profile or source ICC profile is missing", failure_kind="CONVERSION_FAILED")
+                target_description = _profile_description(target_srgb_icc)
+                if _profile_kind(target_description) != "srgb":
+                    raise BackendError("The generated target ICC profile is not identified as sRGB",
+                                       failure_kind="CONVERSION_FAILED",
+                                       details={"target_color_profile": target_description})
+                if output_icc != target_srgb_icc or pixel_reference_icc != target_srgb_icc:
+                    raise BackendError("Transformed PNG and final JPEG do not contain the exact generated sRGB ICC profile",
+                                       failure_kind="CONVERSION_FAILED",
+                                       details={"target_icc_profile_byte_count": len(target_srgb_icc),
+                                                "output_icc_profile_byte_count": len(output_icc or b""),
+                                                "pixel_reference_icc_profile_byte_count": len(pixel_reference_icc or b"")})
+                if _profile_kind(_profile_description(source_icc)) not in {"display-p3", "srgb"}:
+                    raise BackendError("The source ICC profile is not a supported Display P3 or sRGB profile",
+                                       failure_kind="CONVERSION_FAILED")
+            elif source_icc and output_icc != source_icc:
                 raise BackendError("Converted JPEG ICC profile bytes differ from the libheif-decoded HEIF source",
                                    failure_kind="CONVERSION_FAILED",
                                    details={"source_icc_profile_byte_count": len(source_icc),
@@ -422,13 +587,23 @@ def _validate_heif_outputs(reference_path: Path, jpeg_path: Path, exif_path: Pat
 
             source_profile = _profile_description(source_icc)
             output_profile = _profile_description(output_icc)
-            pixel_evidence = _decoded_pixel_evidence(reference_path, jpeg_path)
+            if _is_srgb_target(settings) and _profile_kind(output_profile) != "srgb":
+                raise BackendError("The converted JPEG ICC profile is not identified as sRGB",
+                                   failure_kind="CONVERSION_FAILED",
+                                   details={"output_color_profile": output_profile})
+            pixel_method = ("libheif PNG decode ICC-transformed with Pillow/LittleCMS compared with decoded JPEG pixels"
+                            if _is_srgb_target(settings) else
+                            "libheif PNG decode compared with decoded JPEG pixels")
+            pixel_evidence = _decoded_pixel_evidence(pixel_reference_path, jpeg_path, method=pixel_method)
     except BackendError:
         raise
     except Exception as exc:
         raise BackendError(f"Could not validate converted JPEG metadata or ICC profile: {exc}",
                            failure_kind="CONVERSION_FAILED") from exc
 
+    srgb_target = _is_srgb_target(settings)
+    source_icc_sha256 = hashlib.sha256(source_icc).hexdigest() if source_icc else None
+    output_icc_sha256 = hashlib.sha256(output_icc).hexdigest() if output_icc else None
     return {
         "source_width": reference_size[0], "source_height": reference_size[1],
         "width": output_size[0], "height": output_size[1],
@@ -436,7 +611,7 @@ def _validate_heif_outputs(reference_path: Path, jpeg_path: Path, exif_path: Pat
         "output_orientation": output_orientation,
         "output_tiff_orientation": output_tiff_orientation,
         "jpeg_quality": JPEG_QUALITY,
-        "validation_policy": CONVERSION_VALIDATION_POLICY,
+        "validation_policy": settings.get("validation_policy", CONVERSION_VALIDATION_POLICY),
         "pixel_content_validation": pixel_evidence,
         "source_metadata_fields": source_fields,
         "retained_metadata_fields": retained_fields,
@@ -448,9 +623,27 @@ def _validate_heif_outputs(reference_path: Path, jpeg_path: Path, exif_path: Pat
         "output_icc_profile_byte_count": len(output_icc) if output_icc else 0,
         "source_icc_profile_sha256": hashlib.sha256(source_icc).hexdigest() if source_icc else None,
         "output_icc_profile_sha256": hashlib.sha256(output_icc).hexdigest() if output_icc else None,
-        "icc_profile_validation_status": "ICC_PROFILE_BYTES_PRESERVED" if source_icc else "SOURCE_ICC_PROFILE_ABSENT",
-        "color_profile_validation_status": "ICC_PROFILE_BYTES_MATCHED" if source_icc else "OUTPUT_ICC_PROFILE_INSPECTED",
-        "color_handling": "heif-convert/libheif output ICC bytes inspected with Pillow; source ICC bytes compared when present; no gamut relabel or color conversion",
+        "icc_profile_validation_status": ("TARGET_SRGB_ICC_PROFILE_BYTES_VERIFIED" if srgb_target else
+                                          "ICC_PROFILE_BYTES_PRESERVED" if source_icc else
+                                          "SOURCE_ICC_PROFILE_ABSENT"),
+        "color_profile_validation_status": ("ICC_MANAGED_SOURCE_TO_SRGB_TRANSFORM_VERIFIED" if srgb_target else
+                                             "ICC_PROFILE_BYTES_MATCHED" if source_icc else
+                                             "OUTPUT_ICC_PROFILE_INSPECTED"),
+        "color_conversion_validation": ({
+            "status": "PASS",
+            "method": "Pillow ImageCms.profileToProfile via LittleCMS",
+            "rendering_intent": "perceptual",
+            "source_profile": source_profile,
+            "source_profile_kind": _profile_kind(source_profile),
+            "source_icc_profile_sha256": source_icc_sha256,
+            "target_profile": output_profile,
+            "target_icc_profile_sha256": output_icc_sha256,
+            "target_profile_bytes_verified": output_icc == target_srgb_icc,
+            "final_jpeg_encode_count": 1,
+        } if srgb_target else None),
+        "color_handling": ("libheif lossless PNG decode transformed from its embedded source ICC profile to the exact generated sRGB ICC profile with Pillow ImageCms/LittleCMS; final quality-95 JPEG encoded once"
+                           if srgb_target else
+                           "heif-convert/libheif output ICC bytes inspected with Pillow; source ICC bytes compared when present; no gamut relabel or color conversion"),
     }
 
 
@@ -488,33 +681,56 @@ def _run_heif_convert_batch(requests: list[dict[str, str]], converter: dict[str,
         return {}
     deadline = time.monotonic() + timeout_seconds
     results: dict[str, dict[str, Any]] = {}
-    # The JPEG and libheif pixel reference, including heif-convert's .exif
-    # sidecar, are all kept in this OS temporary directory, outside the final
-    # SfM image directory.
+    # Decoded references, intermediate profiles, and heif-convert's EXIF
+    # sidecars stay in this OS temporary directory, outside the SfM directory.
     with tempfile.TemporaryDirectory(prefix="exhibition-archive-heif-") as temp_name:
         temp = Path(temp_name)
+        target_srgb_icc = _srgb_profile_bytes() if any(
+            request.get("color_mode") == "icc-managed-transform-to-srgb" for request in requests
+        ) else None
         for index, request in enumerate(requests):
             source = str(request["source"])
             output = Path(request["output"])
             converted = temp / f"converted-{index:05d}.jpg"
-            reference = temp / f"reference-{index:05d}.png"
-            exif_sidecar = temp / f"converted-{index:05d}.exif"
-            _run_heif_command(
-                converter["executable"],
-                ["--with-exif", "-q", str(JPEG_QUALITY), source, str(converted)],
-                source, deadline, timeout_seconds,
-            )
-            if not converted.is_file() or not exif_sidecar.is_file():
-                raise BackendError(
-                    f"heif-convert did not produce a JPEG and EXIF sidecar for {Path(source).name}",
-                    failure_kind="CONVERSION_FAILED",
+            source_reference = temp / f"source-reference-{index:05d}.png"
+            srgb_reference = temp / f"srgb-reference-{index:05d}.png"
+            color_mode = request.get("color_mode", "preserve-source-icc")
+            settings = (PREP_SETTINGS if color_mode != "icc-managed-transform-to-srgb" else
+                        _srgb_preparation_settings())
+            if color_mode == "icc-managed-transform-to-srgb":
+                exif_sidecar = temp / f"source-reference-{index:05d}.exif"
+                _run_heif_command(converter["executable"],
+                                  ["--with-exif", source, str(source_reference)],
+                                  source, deadline, timeout_seconds)
+                if not source_reference.is_file() or not exif_sidecar.is_file():
+                    raise BackendError(
+                        f"heif-convert did not produce a lossless PNG decode and EXIF sidecar for {Path(source).name}",
+                        failure_kind="CONVERSION_FAILED",
+                    )
+                assert target_srgb_icc is not None
+                _transform_heif_png_to_srgb(source_reference, converted, exif_sidecar,
+                                            srgb_reference, target_srgb_icc)
+                details = _validate_heif_outputs(source_reference, srgb_reference, converted,
+                                                 exif_sidecar, settings, target_srgb_icc)
+            else:
+                exif_sidecar = temp / f"converted-{index:05d}.exif"
+                _run_heif_command(
+                    converter["executable"],
+                    ["--with-exif", "-q", str(JPEG_QUALITY), source, str(converted)],
+                    source, deadline, timeout_seconds,
                 )
-            _run_heif_command(converter["executable"], [source, str(reference)],
-                              source, deadline, timeout_seconds)
-            if not reference.is_file():
-                raise BackendError(f"heif-convert did not produce a decoded pixel reference for {Path(source).name}",
-                                   failure_kind="CONVERSION_FAILED")
-            details = _validate_heif_outputs(reference, converted, exif_sidecar)
+                if not converted.is_file() or not exif_sidecar.is_file():
+                    raise BackendError(
+                        f"heif-convert did not produce a JPEG and EXIF sidecar for {Path(source).name}",
+                        failure_kind="CONVERSION_FAILED",
+                    )
+                _run_heif_command(converter["executable"], [source, str(source_reference)],
+                                  source, deadline, timeout_seconds)
+                if not source_reference.is_file():
+                    raise BackendError(f"heif-convert did not produce a decoded pixel reference for {Path(source).name}",
+                                       failure_kind="CONVERSION_FAILED")
+                details = _validate_heif_outputs(source_reference, source_reference, converted,
+                                                 exif_sidecar, settings)
             output.parent.mkdir(parents=True, exist_ok=True)
             shutil.copy2(converted, output)
             results[source] = details
@@ -563,37 +779,54 @@ def _dataset_file_membership(dataset: Path) -> set[str] | None:
     return files
 
 
-def _conversion_validation_current(details: Any) -> bool:
+def _conversion_validation_current(details: Any, settings: dict[str, Any] = PREP_SETTINGS) -> bool:
     if not isinstance(details, dict):
         return False
     pixel = details.get("pixel_content_validation")
     icc_status = details.get("icc_profile_validation_status")
-    return (
-        details.get("validation_policy") == CONVERSION_VALIDATION_POLICY and
+    if not (
+        details.get("validation_policy") == settings.get("validation_policy", CONVERSION_VALIDATION_POLICY) and
         isinstance(pixel, dict) and pixel.get("status") == "PASS" and
         str(pixel.get("method", "")).startswith("libheif PNG decode") and
         details.get("output_orientation") == 1 and
         details.get("jpeg_quality") == JPEG_QUALITY and
-        details.get("metadata_validation_status") == "PRESERVED_SOURCE_FIELDS" and
+        details.get("metadata_validation_status") == "PRESERVED_SOURCE_FIELDS"
+    ):
+        return False
+    output_icc_sha256 = details.get("output_icc_profile_sha256")
+    if _is_srgb_target(settings):
+        color = details.get("color_conversion_validation")
+        return (
+            icc_status == "TARGET_SRGB_ICC_PROFILE_BYTES_VERIFIED" and
+            isinstance(output_icc_sha256, str) and
+            isinstance(color, dict) and color.get("status") == "PASS" and
+            color.get("method") == "Pillow ImageCms.profileToProfile via LittleCMS" and
+            color.get("source_profile_kind") in {"display-p3", "srgb"} and
+            _profile_kind(color.get("target_profile")) == "srgb" and
+            color.get("target_profile_bytes_verified") is True and
+            color.get("target_icc_profile_sha256") == output_icc_sha256 and
+            color.get("final_jpeg_encode_count") == 1
+        )
+    return (
         icc_status in {"ICC_PROFILE_BYTES_PRESERVED", "SOURCE_ICC_PROFILE_ABSENT"} and
-        (not details.get("output_icc_profile_byte_count") or
-         isinstance(details.get("output_icc_profile_sha256"), str))
+        (not details.get("output_icc_profile_byte_count") or isinstance(output_icc_sha256, str))
     )
 
 
 def _prepared_dataset_valid(dataset: Path, preparation_id: str,
                             source_records: list[dict[str, Any]],
-                            preparation_basis: dict[str, Any]) -> dict[str, Any] | None:
+                            preparation_basis: dict[str, Any],
+                            settings: dict[str, Any]) -> dict[str, Any] | None:
     manifest_path = dataset / DATASET_MANIFEST
     try:
         manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
         return None
-    if (manifest.get("schema_version") != PREP_SCHEMA or manifest.get("status") != "PREPARED" or
+    if (manifest.get("schema_version") != preparation_schema_for(settings) or manifest.get("status") != "PREPARED" or
             manifest.get("preparation_fingerprint") != preparation_id or
             manifest.get("preparation_basis") != preparation_basis or
             _json_digest(preparation_basis) != preparation_id or
-            manifest.get("preparation_settings") != PREP_SETTINGS or
+            manifest.get("preparation_settings") != settings or
             manifest.get("source_photographs_modified") is not False):
         return None
     mappings = manifest.get("image_mappings")
@@ -631,7 +864,7 @@ def _prepared_dataset_valid(dataset: Path, preparation_id: str,
             details = mapping.get("conversion_validation", {})
             if (target.suffix.casefold() not in JPEG_SUFFIXES or target.stat().st_size <= 0 or
                     _jpeg_dimensions(target) != (mapping.get("width"), mapping.get("height")) or
-                    not _conversion_validation_current(details)):
+                    not _conversion_validation_current(details, settings)):
                 return None
         elif mapping.get("derived_sha256") != mapping.get("source_sha256"):
             return None
@@ -645,9 +878,10 @@ def _prepared_dataset_valid(dataset: Path, preparation_id: str,
 
 def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str, Any],
                           *, validate_files: bool = True) -> tuple[Path, dict[str, Any]]:
+    settings = preparation_settings_for(config)
     source_dir = _project_path(root, config["source"]["photo_directory"])
     input_dir = raw_sfm_image_directory(root, config)
-    if (manifest.get("schema_version") != PREP_SCHEMA or manifest.get("status") != "PREPARED" or
+    if (manifest.get("schema_version") != preparation_schema_for(settings) or manifest.get("status") != "PREPARED" or
             manifest.get("project_id") != config.get("project_id") or
             manifest.get("source_photographs_modified") is not False):
         raise DatasetPreparationRequired("The current registered HEIC input has no completed Engine-managed JPEG preparation; run the safe intake workflow before requesting an SfM plan")
@@ -655,7 +889,7 @@ def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str,
     if not isinstance(dataset_raw, str):
         raise BackendError("Prepared dataset manifest has no effective_image_directory", failure_kind="INVALID_INPUT")
     dataset = Path(dataset_raw).resolve()
-    managed_root = (root / PREP_DIR).resolve()
+    managed_root = (root / _managed_dataset_directory(settings)).resolve()
     if dataset.parent != managed_root or dataset.name != manifest.get("preparation_fingerprint") or not dataset.is_dir():
         raise BackendError("Prepared image directory is missing or outside the Engine-managed workspace", failure_kind="UNSAFE_OUTPUT")
     try:
@@ -709,18 +943,18 @@ def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str,
             raise BackendError(f"Prepared JPEG/image changed after verification: {output_rel}", failure_kind="STALE_DATASET_PREPARATION")
         if Path(source_rel).suffix.casefold() in HEIF_SUFFIXES:
             details = mapping.get("conversion_validation", {})
-            if Path(output_rel).suffix.casefold() not in JPEG_SUFFIXES or not _conversion_validation_current(details):
+            if Path(output_rel).suffix.casefold() not in JPEG_SUFFIXES or not _conversion_validation_current(details, settings):
                 raise BackendError(f"Prepared HEIC mapping lacks current pixel/EXIF/ICC verification evidence: {source_rel}", failure_kind="INVALID_INPUT")
     if seen_source != set(expected_by_source):
         raise BackendError("Prepared source mapping does not cover the current registered image dataset", failure_kind="STALE_DATASET_PREPARATION")
-    if manifest.get("preparation_settings") != PREP_SETTINGS:
+    if manifest.get("preparation_settings") != settings:
         raise BackendError("Prepared dataset conversion settings differ from the current Engine requirements", failure_kind="STALE_DATASET_PREPARATION")
     basis = manifest.get("preparation_basis")
     if not isinstance(basis, dict) or _json_digest(basis) != manifest.get("preparation_fingerprint"):
         raise BackendError("Prepared dataset fingerprint does not match its recorded conversion inputs", failure_kind="STALE_DATASET_PREPARATION")
-    current_converter = heif_converter_identity()
+    current_converter = heif_converter_identity(settings)
     expected_basis = {
-        "schema_version": PREP_SCHEMA,
+        "schema_version": preparation_schema_for(settings),
         "source_directory": str(input_dir.resolve()),
         "registered_source_directory": str(source_dir.resolve()),
         "sources": [{"source_relative_path": row["source_relative_path"],
@@ -728,13 +962,13 @@ def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str,
                      "input_relative_path": row["input_relative_path"],
                      "derived_relative_path": expected_outputs[row["input_relative_path"]]}
                     for row in expected_records],
-        "settings": PREP_SETTINGS,
+        "settings": settings,
         "converter": current_converter,
     }
-    if basis != expected_basis or basis.get("converter") != current_converter or basis.get("settings") != PREP_SETTINGS:
+    if basis != expected_basis or basis.get("converter") != current_converter or basis.get("settings") != settings:
         raise BackendError("heif-convert/libheif identity or JPEG preparation settings changed; rerun safe dataset preparation", failure_kind="STALE_DATASET_PREPARATION")
     conversion = manifest.get("conversion", {})
-    if conversion.get("backend") != current_converter or conversion.get("settings") != PREP_SETTINGS or manifest.get("image_count") != len(expected_records):
+    if conversion.get("backend") != current_converter or conversion.get("settings") != settings or manifest.get("image_count") != len(expected_records):
         raise BackendError("Prepared manifest conversion provenance is incomplete or stale", failure_kind="STALE_DATASET_PREPARATION")
     actual_outputs = {path.relative_to(dataset).as_posix().casefold() for path in _supported_images(dataset)}
     if actual_outputs != seen_output or _dataset_file_membership(dataset) != seen_output:
@@ -797,7 +1031,8 @@ def validate_preparation_stage_outputs(root: Path, config: dict[str, Any]) -> bo
             return True
         except BackendError:
             return False
-    if manifest.get("schema_version") != PREP_SCHEMA or manifest.get("source_photographs_modified") is not False:
+    if (manifest.get("schema_version") != preparation_schema_for(preparation_settings_for(config)) or
+            manifest.get("source_photographs_modified") is not False):
         return False
     if Path(manifest.get("source_directory", "")).resolve() != raw:
         return False
@@ -808,10 +1043,11 @@ def validate_preparation_stage_outputs(root: Path, config: dict[str, Any]) -> bo
 
 def _write_not_required(root: Path, config: dict[str, Any], status: str,
                         input_dir: Path, source_inventory: dict[str, Any]) -> dict[str, Any]:
+    settings = preparation_settings_for(config)
     rows = source_inventory.get("images", [])
     selected_hash = _json_digest(sorted((str(row.get("relative_path")), str(row.get("sha256"))) for row in rows))
     manifest = {
-        "schema_version": PREP_SCHEMA,
+        "schema_version": preparation_schema_for(settings),
         "status": status,
         "project_id": config["project_id"],
         "source_directory": str(input_dir.resolve()),
@@ -819,7 +1055,7 @@ def _write_not_required(root: Path, config: dict[str, Any], status: str,
         "conversion_required": False,
         "reason": "The selected stage/backend does not require Engine HEIC conversion" if status != "NO_CONVERSION_REQUIRED" else "No HEIC/HEIF source files were present",
         "source_inventory_fingerprint_sha256": selected_hash,
-        "preparation_settings": PREP_SETTINGS,
+        "preparation_settings": settings,
         "jpeg_quality": JPEG_QUALITY,
         "source_photographs_modified": False,
         "image_mappings": [],
@@ -851,22 +1087,23 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
     if not records or not any(row["source_format"] in {x.lstrip(".") for x in HEIF_SUFFIXES} for row in records):
         raise BackendError("HEIC files were detected but none are represented in the registered source inventory", failure_kind="STALE_SOURCE_INVENTORY")
 
-    converter = heif_converter_identity()
+    settings = preparation_settings_for(config)
+    converter = heif_converter_identity(settings)
     output_names = _mapped_output_names(records)
     source_fingerprint_rows = [{"source_relative_path": row["source_relative_path"],
                                 "source_sha256": row["source_sha256"],
                                 "input_relative_path": row["input_relative_path"],
                                 "derived_relative_path": output_names[row["input_relative_path"]]}
                                for row in records]
-    preparation_basis = {"schema_version": PREP_SCHEMA, "source_directory": str(input_dir.resolve()),
+    preparation_basis = {"schema_version": preparation_schema_for(settings), "source_directory": str(input_dir.resolve()),
                          "registered_source_directory": str(source_root.resolve()),
-                         "sources": source_fingerprint_rows, "settings": PREP_SETTINGS,
+                         "sources": source_fingerprint_rows, "settings": settings,
                          "converter": converter}
     preparation_id = _json_digest(preparation_basis)
-    managed_root = root / PREP_DIR
+    managed_root = root / _managed_dataset_directory(settings)
     managed_root.mkdir(parents=True, exist_ok=True)
     dataset = managed_root / preparation_id
-    cached = _prepared_dataset_valid(dataset, preparation_id, records, preparation_basis)
+    cached = _prepared_dataset_valid(dataset, preparation_id, records, preparation_basis, settings)
     manifest_path = preparation_manifest_path(root)
     if cached:
         current_manifest = dict(cached)
@@ -912,7 +1149,8 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
             output.parent.mkdir(parents=True, exist_ok=True)
             if row["source_format"] in {x.lstrip(".") for x in HEIF_SUFFIXES}:
                 temporary_output = output.with_name(output.name + ".part")
-                requests.append({"source": row["source_path"], "output": str(temporary_output)})
+                requests.append({"source": row["source_path"], "output": str(temporary_output),
+                                 "color_mode": "icc-managed-transform-to-srgb" if _is_srgb_target(settings) else "preserve-source-icc"})
             else:
                 shutil.copy2(row["source_path"], output)
 
@@ -955,17 +1193,19 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
             image_mappings.append(mapping)
 
         manifest = {
-            "schema_version": PREP_SCHEMA,
+            "schema_version": preparation_schema_for(settings),
             "status": "PREPARED",
             "project_id": config["project_id"],
             "source_directory": str(input_dir.resolve()),
             "registered_source_directory": str(source_root.resolve()),
             "effective_image_directory": str(dataset.resolve()),
             "conversion_required": True,
-            "conversion": {"backend": converter, "settings": PREP_SETTINGS,
+            "conversion": {"backend": converter, "settings": settings,
                            "jpeg_quality": JPEG_QUALITY,
-                           "color_handling": "For converted HEIC, the output JPEG ICC profile is decoded and identified; ICC bytes are compared with the libheif-decoded source when present. Display P3 is never treated as DCI-P3. Byte-copied JPEG inputs remain unchanged and are not profile-inspected."},
-            "preparation_settings": PREP_SETTINGS,
+                           "color_handling": ("Converted HEIC pixels use ICC-managed Display P3/sRGB to sRGB conversion; target profile bytes are verified. Byte-copied JPEG inputs remain unchanged and are not profile-inspected."
+                                              if _is_srgb_target(settings) else
+                                              "For converted HEIC, the output JPEG ICC profile is decoded and identified; ICC bytes are compared with the libheif-decoded source when present. Display P3 is never treated as DCI-P3. Byte-copied JPEG inputs remain unchanged and are not profile-inspected.")},
+            "preparation_settings": settings,
             "jpeg_quality": JPEG_QUALITY,
             "preparation_fingerprint": preparation_id,
             "preparation_basis": preparation_basis,
@@ -988,7 +1228,7 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
                 old = json.loads((dataset / DATASET_MANIFEST).read_text(encoding="utf-8"))
             except (OSError, ValueError):
                 old = {}
-            if old.get("schema_version") != PREP_SCHEMA:
+            if old.get("schema_version") != preparation_schema_for(settings):
                 raise BackendError(f"Refusing to replace an unmanaged dataset directory: {dataset}", failure_kind="UNSAFE_OUTPUT")
             stale = managed_root / (".stale-" + preparation_id + "-" + uuid.uuid4().hex)
             os.replace(dataset, stale)
@@ -1033,13 +1273,7 @@ def image_gamut_mismatch(config: dict[str, Any], manifest: dict[str, Any] | None
                 values.append("unknown:missing-profile-name")
         else:
             values.append("unknown:missing-profile-name")
-    configured = None
-    args = config.get("integrations", {}).get("sfm", {}).get("additional_args", [])
-    for index, value in enumerate(args if isinstance(args, list) else []):
-        if value == "--image-gamut" and index + 1 < len(args):
-            configured = str(args[index + 1])
-        elif isinstance(value, str) and value.startswith("--image-gamut="):
-            configured = value.split("=", 1)[1]
+    configured = _configured_image_gamut(config)
     if configured is None:
         return None
     if not converted:
@@ -1051,12 +1285,35 @@ def image_gamut_mismatch(config: dict[str, Any], manifest: dict[str, Any] | None
     if uninspected_jpegs:
         return (f"Configured --image-gamut={configured} cannot be verified for the mixed dataset because "
                 f"{len(uninspected_jpegs)} byte-copied JPEG input(s) have no recorded profile evidence")
-    normalized_config = re.sub(r"[^a-z0-9]", "", configured.casefold())
+    normalized_config = _normalized_gamut(configured)
     normalized_profiles = set(values)
     if "unknown:" in " ".join(values) or len(normalized_profiles) != 1:
         return f"Configured --image-gamut={configured} cannot be verified against mixed or unrecognized derivative ICC profiles: {sorted(normalized_profiles)}"
     profile = next(iter(normalized_profiles))
-    expected = re.sub(r"[^a-z0-9]", "", profile.casefold())
-    if normalized_config != expected:
+    expected = {
+        "rec709": "srgb",
+        "bt709": "srgb",
+        "srgb": "srgb",
+        "displayp3": "display-p3",
+        "dcip3": "dci-p3",
+    }.get(normalized_config, normalized_config)
+    if expected == "srgb":
+        for mapping in converted:
+            details = mapping.get("conversion_validation") or {}
+            color_validation = details.get("color_conversion_validation") or {}
+            verified_srgb = (
+                details.get("icc_profile_validation_status") == "TARGET_SRGB_ICC_PROFILE_BYTES_VERIFIED" and
+                color_validation.get("status") == "PASS" and
+                color_validation.get("target_profile_bytes_verified") is True
+            ) or (
+                details.get("icc_profile_validation_status") == "ICC_PROFILE_BYTES_PRESERVED" and
+                details.get("output_icc_profile_sha256") and
+                _profile_kind(details.get("output_color_profile")) == "srgb"
+            )
+            if verified_srgb and _profile_kind(details.get("output_color_profile")) == "srgb":
+                continue
+            return (f"Configured --image-gamut={configured} requires verified sRGB ICC profiles on every converted image; "
+                    "rerun Engine dataset preparation with the current conversion policy")
+    if expected != profile:
         return f"Configured --image-gamut={configured} does not match the verified derivative color profile {profile}; Display P3 must not be labeled DCI-P3"
     return None
