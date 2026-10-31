@@ -196,8 +196,21 @@ def cmd_status(args) -> int:
         authorizations = state.execution_authorizations()
         from .release_gate import publication_release_status
         publication_release = publication_release_status(root, config, state)
+        sfm_component_acceptance = None
+        sfm_review_history = []
+        if stages.get("sfm", {}).get("status") in {"NEEDS_REVIEW", "COMPLETED", "ADOPTED"}:
+            from .sfm_review import component_acceptance_status
+            try:
+                sfm_component_acceptance = component_acceptance_status(root, config, state)
+            except Exception as exc:
+                sfm_component_acceptance = {"status": "STALE_OR_UNAVAILABLE", "reason": str(exc)}
+            sfm_review_history = [dict(row) for row in state.db.execute(
+                "SELECT review_id,created_at,gate_id,reviewer,decision FROM review_history "
+                "WHERE gate_id LIKE ? ORDER BY review_id DESC", ("sfm-component-acceptance:%",))]
         print(json.dumps({"project_id": config["project_id"], "root": str(root), "overall": overall,
                           "stages": stages, "review_gates": gates, "execution_authorizations": authorizations,
+                          "sfm_component_acceptance": sfm_component_acceptance,
+                          "sfm_component_review_history": sfm_review_history,
                           "publication_release": publication_release,
                           "recent_runs": runs,
                           "resume_eligible": any(x["status"] in {"FAILED", "RUNNING", "INVALIDATED", "BLOCKED"} for x in stages.values()),
@@ -280,6 +293,21 @@ def cmd_review_model(args) -> int:
                          (utc_now(), "fresh-model-selection", reviewer, args.decision.upper(), json.dumps(decision, sort_keys=True)))
         state.db.commit()
         print(json.dumps({"gate_id": "fresh-model-selection", "status": gate_status, "candidate_sha256": candidate["sha256"], "candidate_path": candidate["path"], "run_type": candidate["run_type"], "public_selection_allowed": decision["public_selection_allowed"], "next_step": "run resume to materialize model-selection.json and continue only when navigation and publication prerequisites are configured"}, indent=2))
+        return 0
+    finally:
+        state.close()
+
+
+def cmd_sfm_review(args) -> int:
+    from .sfm_review import review_sfm_component
+    root, config = load_project(args.project)
+    state = ProjectState(root)
+    try:
+        with state.lock():
+            result = review_sfm_component(root, config, state, component_id=args.component,
+                                          decision=args.decision, reviewer=args.reviewer,
+                                          rationale=args.rationale, limitations=args.limitation)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
         return 0
     finally:
         state.close()
@@ -651,6 +679,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--decision", choices=["approve", "reject"], required=True)
     p.add_argument("--reviewer", required=True); p.add_argument("--rationale", required=True)
     p.set_defaults(func=cmd_review_model)
+    p = sub.add_parser("sfm-review", help="Record an artifact-bound decision for one COLMAP reconstruction component")
+    p.add_argument("project"); p.add_argument("--component", required=True, help="Component ID relative to the reconstruction directory, such as 0")
+    p.add_argument("--decision", choices=["accept-experimental-training", "reject", "defer"], required=True)
+    p.add_argument("--reviewer", required=True); p.add_argument("--rationale", required=True)
+    p.add_argument("--limitation", action="append", default=[], help="Unresolved limitation; required once or more for conditional acceptance")
+    p.set_defaults(func=cmd_sfm_review)
     p = sub.add_parser("navigation", help="Assess, generate, validate, inspect, or review navigation geometry")
     nav = p.add_subparsers(dest="navigation_action", required=True)
     for action, help_text in (("assess", "Inspect configured geometry and navigation readiness"),

@@ -11,7 +11,7 @@ import struct
 import subprocess
 import time
 from datetime import datetime, timezone
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
 from .adapters import read_json, sha256_file, write_json
@@ -364,7 +364,10 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
 
 def validate_colmap_directory(sparse_root: Path, image_rows: list[dict], thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
     thresholds = thresholds or {}
-    model_dirs = sorted((p for p in sparse_root.iterdir() if p.is_dir() and p.name.isdigit()), key=lambda p: int(p.name)) if sparse_root.is_dir() else []
+    has_direct_model = all((sparse_root / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin"))
+    model_dirs = ([sparse_root] if has_direct_model else
+                  sorted((p for p in sparse_root.iterdir() if p.is_dir() and p.name.isdigit()), key=lambda p: int(p.name))
+                  if sparse_root.is_dir() else [])
     if not model_dirs:
         raise BackendError(f"No numeric COLMAP model directories exist at {sparse_root}", failure_kind="SFM_INVALID")
     components = []
@@ -965,7 +968,14 @@ def build_training_command(executable: Path, dataset_dir: Path, attempt_dir: Pat
     return command
 
 
-def prepare_training_dataset(attempt_dir: Path, image_dir: Path, reconstruction_dir: Path, *, copy_inputs: bool = False) -> Path:
+def prepare_training_dataset(attempt_dir: Path, image_dir: Path, reconstruction_dir: Path, *, copy_inputs: bool = False,
+                            registered_image_names: list[str] | None = None) -> Path:
+    """Prepare a COLMAP training workspace, optionally materializing only registered views.
+
+    Production fresh-training callers pass the exact image names parsed from the
+    selected component's images.bin. Each image remains at the same relative path
+    that COLMAP records; unrelated source images are never exposed to the backend.
+    """
     dataset = attempt_dir / "dataset"
     if dataset.exists(): raise BackendError(f"Refusing to overwrite training dataset workspace: {dataset}", failure_kind="UNSAFE_OUTPUT")
     dataset.mkdir(mode=0o700)
@@ -973,12 +983,66 @@ def prepare_training_dataset(attempt_dir: Path, image_dir: Path, reconstruction_
     if copy_inputs:
         if any(p.is_symlink() for root in (image_dir, reconstruction_dir) for p in [root, *root.rglob("*")]):
             raise BackendError("Smoke-test inputs may not contain symlinks", failure_kind="INVALID_INPUT")
-        shutil.copytree(image_dir, dataset / "images", copy_function=shutil.copy2)
+        if registered_image_names is None:
+            shutil.copytree(image_dir, dataset / "images", copy_function=shutil.copy2)
         shutil.copytree(reconstruction_dir, dataset / "sparse" / "0", copy_function=shutil.copy2)
     else:
-        (dataset / "images").symlink_to(image_dir.resolve(), target_is_directory=True)
+        if registered_image_names is None:
+            (dataset / "images").symlink_to(image_dir.resolve(), target_is_directory=True)
         (dataset / "sparse" / "0").symlink_to(reconstruction_dir.resolve(), target_is_directory=True)
     if not (dataset / "sparse" / "0" / "images.bin").is_file(): raise BackendError("Training dataset does not resolve to a COLMAP images.bin", failure_kind="SFM_INVALID")
+    if registered_image_names is not None:
+        inventory = image_inventory(image_dir)
+        source_by_name = {row["relative_path"]: row for row in inventory["images"]}
+        normalized_names = []
+        casefold_names = set()
+        for raw_name in registered_image_names:
+            name = str(raw_name)
+            parsed = PurePosixPath(name)
+            if (not name or "\\" in name or parsed.is_absolute() or
+                    any(part in {"", ".", ".."} for part in parsed.parts)):
+                raise BackendError(f"Unsafe COLMAP registered image path: {name!r}", failure_kind="SFM_INVALID")
+            normalized = parsed.as_posix()
+            if normalized != name:
+                raise BackendError(f"COLMAP registered image path is not canonical: {name!r}", failure_kind="SFM_INVALID")
+            folded = normalized.casefold()
+            if folded in casefold_names:
+                raise BackendError(f"Registered image paths collide on a case-insensitive filesystem: {normalized}", failure_kind="SFM_INVALID")
+            casefold_names.add(folded)
+            normalized_names.append(normalized)
+        if len(set(normalized_names)) != len(normalized_names):
+            raise BackendError("COLMAP registered image list contains duplicate paths", failure_kind="SFM_INVALID")
+        missing = sorted(set(normalized_names) - set(source_by_name))
+        if missing:
+            raise BackendError("Selected COLMAP component references images missing from the source dataset",
+                               failure_kind="SFM_INVALID", details={"missing_images": missing[:20]})
+        selected_root = dataset / "images"
+        selected_root.mkdir()
+        root_resolved = selected_root.resolve()
+        for name in normalized_names:
+            source = Path(source_by_name[name]["source_path"]).resolve()
+            if image_dir.resolve() not in source.parents or source.is_symlink() or not source.is_file():
+                raise BackendError(f"Registered image source is not a regular file beneath the configured image directory: {name}",
+                                   failure_kind="INVALID_INPUT")
+            destination = selected_root.joinpath(*PurePosixPath(name).parts)
+            destination.parent.mkdir(parents=True, exist_ok=True)
+            if root_resolved not in destination.parent.resolve().parents and destination.parent.resolve() != root_resolved:
+                raise BackendError(f"Registered image destination escapes the training dataset: {name}", failure_kind="UNSAFE_OUTPUT")
+            if copy_inputs:
+                shutil.copy2(source, destination)
+            else:
+                destination.symlink_to(source)
+        actual_names = sorted(path.relative_to(selected_root).as_posix() for path in selected_root.rglob("*") if path.is_file())
+        if actual_names != sorted(normalized_names):
+            raise BackendError("Materialized training image membership differs from the accepted COLMAP component",
+                               failure_kind="INVALID_INPUT", details={"expected": sorted(normalized_names), "actual": actual_names})
+        for name in normalized_names:
+            source = Path(source_by_name[name]["source_path"]).resolve()
+            target = selected_root.joinpath(*PurePosixPath(name).parts)
+            if not target.is_file() or sha256_file(target) != source_by_name[name]["sha256"]:
+                raise BackendError(f"Materialized registered image failed hash verification: {name}", failure_kind="INVALID_INPUT")
+            if not copy_inputs and (not target.is_symlink() or target.resolve() != source):
+                raise BackendError(f"Registered training image is not a symlink to its verified source: {name}", failure_kind="INVALID_INPUT")
     return dataset
 
 

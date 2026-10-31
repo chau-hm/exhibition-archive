@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from unittest.mock import patch
 
+from exhibition_archive.adapters import sha256_file
 from exhibition_archive.state import ProjectState
 from exhibition_archive.workflow import (AuthorizationRequired, expensive_execution_plan,
                                          execute_fresh_sfm, run_workflow, stage_fingerprint)
@@ -66,9 +67,22 @@ class AuthorizationTests(unittest.TestCase):
         self.assertIn("normalized_command", changed_input)
 
         self.state.set_stage("sfm", "ADOPTED", "sfm-fingerprint", "sfm-digest", None, {})
-        training = self.plan("training")
-        self.config["integrations"]["model"]["iterations"] = 200
-        changed_training = self.plan("training")
+        second_image = self.photos / "two.jpg"
+        second_image.write_bytes(b"synthetic-second-photo-content")
+        scoped_input = {"component_id": "0", "component": {"artifact_tree_sha256": "component-tree"},
+                        "registered_image_names": ["one.jpg", "two.jpg"],
+                        "registered_image_rows": [
+                            {"relative_path": path.name, "source_path": str(path),
+                             "sha256": sha256_file(path)}
+                            for path in (self.image, second_image)
+                        ],
+                        "registered_image_count": 2, "registered_image_membership_sha256": "membership",
+                        "source_image_count": 2, "sfm_snapshot": {"binding_sha256": "snapshot"},
+                        "acceptance": None, "acceptance_required": False, "conditional_scope": False}
+        with patch("exhibition_archive.sfm_review.training_component_scope", return_value=scoped_input):
+            training = self.plan("training")
+            self.config["integrations"]["model"]["iterations"] = 200
+            changed_training = self.plan("training")
         self.assertNotEqual(training["plan_id"], changed_training["plan_id"])
 
     def test_grant_is_one_time_and_stage_scoped(self):

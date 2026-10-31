@@ -162,6 +162,19 @@ class ProjectState:
           (stage_id, str(path), artifact_type, sha256, size, "VALIDATED", json.dumps(provenance, sort_keys=True)))
         self.db.commit()
 
+    def record_review_decision(self, gate_id: str, status: str, *, required: bool,
+                               reviewer: str, decision: str, payload: dict) -> int:
+        """Update the current review gate and append its immutable audit history row."""
+        now = utc_now()
+        with self.db:
+            self.db.execute("""INSERT INTO review_gates(gate_id,status,required,updated_at,decision_json)
+              VALUES(?,?,?,?,?) ON CONFLICT(gate_id) DO UPDATE SET status=excluded.status,
+              required=excluded.required,updated_at=excluded.updated_at,decision_json=excluded.decision_json""",
+              (gate_id, status, int(required), now, json.dumps(payload, sort_keys=True)))
+            cur = self.db.execute("""INSERT INTO review_history(created_at,gate_id,reviewer,decision,payload_json)
+              VALUES(?,?,?,?,?)""", (now, gate_id, reviewer, decision, json.dumps(payload, sort_keys=True)))
+        return int(cur.lastrowid)
+
     def cached_hash(self, path: Path, force: bool = False) -> str:
         import hashlib
         path = path.resolve()

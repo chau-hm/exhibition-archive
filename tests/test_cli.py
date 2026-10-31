@@ -21,6 +21,19 @@ class CliSmokeTests(unittest.TestCase):
         )
         self.assertEqual(result.stdout.strip(), "exhibition-archive 0.1.0")
 
+    def test_sfm_review_cli_exposes_scoped_decisions_and_limitations(self):
+        result = subprocess.run(
+            [str(LAUNCHER), "sfm-review", "--help"],
+            cwd="/private/tmp",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+        self.assertIn("accept-experimental-training", result.stdout)
+        self.assertIn("--component", result.stdout)
+        self.assertIn("--limitation", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -201,6 +201,25 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
                 "mapping_sha256": json_digest(prep_manifest.get("image_mappings", [])),
                 "mapped_image_count": len(prep_manifest.get("image_mappings", [])),
             }
+        if stage_id == "training":
+            model_cfg = integration.get("model", {})
+            selected["training_configuration"] = {k: v for k, v in model_cfg.items() if k != "environment_overrides"}
+            selected["training_environment_overrides_sha256"] = json_digest(model_cfg.get("environment_overrides", {}))
+            if model_cfg.get("mode", "adopt_existing") == "spirula_fresh":
+                from .sfm_review import training_component_scope
+                try:
+                    scope = training_component_scope(root, config, state)
+                    selected["sfm_training_scope"] = {
+                        "status": "CURRENT",
+                        "component_id": scope["component_id"],
+                        "component_artifact_tree_sha256": scope["component"]["artifact_tree_sha256"],
+                        "registered_image_count": scope["registered_image_count"],
+                        "registered_image_membership_sha256": scope["registered_image_membership_sha256"],
+                        "reconstruction_binding_sha256": scope["sfm_snapshot"]["binding_sha256"],
+                        "acceptance_audit_identity": (scope["acceptance"] or {}).get("audit_identity"),
+                    }
+                except (BackendError, KeyError, TypeError, ValueError) as exc:
+                    selected["sfm_training_scope"] = {"status": "BLOCKED", "reason": str(exc)}
     elif stage_id == "viewer_package":
         selected["theme"] = config.get("viewer", {}).get("theme", "dark")
         selected["viewer_title"] = config.get("viewer", {}).get("title", config["project_id"])
@@ -234,10 +253,13 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
     cfg = config.get("integrations", {}).get(group, {})
     if cfg.get("mode", "adopt_existing") != "spirula_fresh":
         raise WorkflowError(f"Stage {stage_id} is configured to adopt existing artifacts and does not need GPU authorization")
+    training_scope = None
     if stage_id == "training":
-        sfm = state.stage("sfm") or {}
-        if sfm.get("status") not in {"COMPLETED", "ADOPTED"}:
-            raise WorkflowError(f"Training authorization requires an accepted SfM stage; current status is {sfm.get('status', 'NOT_STARTED')}")
+        from .sfm_review import training_component_scope
+        try:
+            training_scope = training_component_scope(root, config, state)
+        except BackendError as exc:
+            raise WorkflowError(f"Training authorization requires a current accepted SfM component: {exc}") from exc
         if cfg.get("run_type") not in {"smoke_test", "candidate"}:
             raise WorkflowError("Fresh training requires model.run_type to be explicitly smoke_test or candidate")
         policy = config.get("resource_policy", {})
@@ -270,7 +292,17 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
     gamut_error = image_gamut_mismatch(config, prep_manifest) if stage_id == "sfm" else None
     if gamut_error:
         raise BackendError(gamut_error, failure_kind="INVALID_CONFIGURATION")
-    input_images = sorted(path for path in image_dir.rglob("*") if path.is_file() and path.suffix.casefold() in IMAGE_SUFFIXES) if image_dir.is_dir() else []
+    source_images = sorted(path for path in image_dir.rglob("*") if path.is_file() and path.suffix.casefold() in IMAGE_SUFFIXES) if image_dir.is_dir() else []
+    if stage_id == "training":
+        source_by_name = {row["relative_path"]: row for row in backend_image_inventory(image_dir)["images"]}
+        expected_by_name = {row["relative_path"]: row for row in training_scope["registered_image_rows"]}
+        if set(expected_by_name) - set(source_by_name):
+            raise WorkflowError("Accepted COLMAP component contains names outside the current training image directory")
+        if any(source_by_name[name]["sha256"] != row["sha256"] for name, row in expected_by_name.items()):
+            raise WorkflowError("Accepted registered image hashes differ from the effective training image directory")
+        input_images = [Path(source_by_name[name]["source_path"]) for name in training_scope["registered_image_names"]]
+    else:
+        input_images = source_images
     fingerprint = stage_fingerprint(root, config, state, stage_id, full_hash=True)
     selected_cfg = {k: v for k, v in cfg.items() if k != "environment_overrides"}
     env = cfg.get("environment_overrides", {})
@@ -279,7 +311,11 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
         "project_id": config["project_id"], "stage": stage_id,
         "operation": "fresh_sfm" if stage_id == "sfm" else "fresh_training_candidate",
         "input_fingerprint_sha256": fingerprint,
-        "input_dataset": str(image_dir), "source_image_count": len(input_images),
+        "input_dataset": str(dataset if stage_id == "training" else image_dir),
+        "source_image_directory": str(image_dir),
+        "source_image_count": len(input_images),
+        "source_directory_image_count": len(source_images),
+        "input_image_count": len(input_images),
         "input_image_extensions": sorted({p.suffix.casefold() for p in input_images}),
         "input_dataset_provenance": ({
             "kind": "ENGINE_VERIFIED_HEIC_JPEG_DERIVATIVES",
@@ -307,6 +343,18 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
         "cancellation_and_recovery": "Cancellation retains attempt files and history; retry starts a new attempt. Spirula optimizer-state resume is not claimed or authorized by this plan.",
         "execution_context": {"kind": "operator-initiated-local-cli", "host_sandbox_authorization": "NOT_EXPOSED_TO_ENGINE"},
     }
+    if training_scope:
+        descriptor["sfm_component_scope"] = {
+            "component_id": training_scope["component_id"],
+            "component_artifact_tree_sha256": training_scope["component"]["artifact_tree_sha256"],
+            "registered_image_count": training_scope["registered_image_count"],
+            "registered_image_membership_sha256": training_scope["registered_image_membership_sha256"],
+            "sfm_source_image_count": training_scope["source_image_count"],
+            "training_source_directory_image_count": len(source_images),
+            "excluded_training_source_image_count": len(source_images) - training_scope["registered_image_count"],
+            "reconstruction_binding_sha256": training_scope["sfm_snapshot"]["binding_sha256"],
+            "acceptance": training_scope["acceptance"],
+        }
     descriptor["plan_id"] = json_digest(descriptor)
     return descriptor
 
@@ -619,7 +667,7 @@ def adopt_stage(root: Path, config: dict, state: ProjectState, stage_id: str, ou
         cfg = i["sfm"]
         stats = colmap_binary_counts(project_path(root, config, cfg["directory"]))
         prior = read_json(project_path(root, config, cfg["summary"])) if cfg.get("summary") else {}
-        result = {**stats, "trusted_pose_count": prior.get("sfm_statistics", {}).get("trusted_pose_count"), "pose_outlier_count": prior.get("sfm_statistics", {}).get("pose_outlier_count"), "registered_ratio": prior.get("sfm_statistics", {}).get("registered_ratio"), "adoption_source": cfg.get("description", "Existing COLMAP binary reconstruction"), "adopted_not_executed": True}
+        result = {**stats, "trusted_pose_count": prior.get("sfm_statistics", {}).get("trusted_pose_count"), "pose_outlier_count": prior.get("sfm_statistics", {}).get("pose_outlier_count"), "registered_ratio": prior.get("sfm_statistics", {}).get("registered_ratio"), "adoption_source": cfg.get("description", "Existing COLMAP binary reconstruction"), "adopted_not_executed": True, "sfm_configuration_sha256": json_digest(cfg)}
         target = output_dir / "sfm-summary.json"; write_json(target, result)
         return {"status": "ADOPTED", "artifacts": [target], "details": result}
     if stage_id == "training":
@@ -827,36 +875,79 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
         raise BackendError("model.iterations must be a positive integer", failure_kind="INVALID_CONFIGURATION")
     if cfg["iterations"] > maximum:
         raise BackendError(f"Requested {cfg['iterations']} training iterations exceed the configured cap {maximum}", failure_kind="RESOURCE_LIMIT")
+    from .sfm_review import training_component_scope
+    sfm_scope = training_component_scope(root, config, state)
     sfm_state = state.stage("sfm") or {}
     sfm_details = json.loads(sfm_state.get("details_json") or "{}")
-    quality = sfm_details.get("quality_gate")
-    if sfm_state.get("status") not in {"COMPLETED", "ADOPTED"}:
-        raise BackendError(f"Training is blocked until SfM is accepted; current stage status is {sfm_state.get('status')}", failure_kind="QUALITY_GATE_BLOCKED")
-    if quality in {"SFM_NEEDS_REVIEW", "SFM_INVALID"}:
-        raise BackendError(f"Training is blocked by SfM quality gate {quality}", failure_kind="QUALITY_GATE_BLOCKED")
     sfm_cfg = config.get("integrations", {}).get("sfm", {})
-    if sfm_cfg.get("mode", "adopt_existing") == "spirula_fresh":
-        reconstruction = Path(sfm_details.get("reconstruction_directory", ""))
-    else:
-        reconstruction = project_path(root, config, sfm_cfg.get("directory", ""))
+    reconstruction = Path(sfm_scope["reconstruction_directory"])
     if not reconstruction.is_dir(): raise BackendError(f"Validated COLMAP directory is missing: {reconstruction}", failure_kind="SFM_INVALID")
     image_dir, auto_manifest = effective_training_dataset(root, config)
     _validate_read_only_image_scope(root, config, image_dir)
     dataset_images = backend_image_inventory(image_dir)
+    source_by_name = {row["relative_path"]: row for row in dataset_images["images"]}
+    registered_names = list(sfm_scope["registered_image_names"])
+    missing_registered = sorted(set(registered_names) - set(source_by_name))
+    if missing_registered:
+        raise BackendError("Accepted SfM component references images missing from the effective training dataset",
+                           failure_kind="SFM_INVALID", details={"missing_images": missing_registered[:20]})
+    selected_source_rows = [source_by_name[name] for name in registered_names]
+    sfm_source_by_name = {row["relative_path"]: row for row in sfm_scope["registered_image_rows"]}
+    changed_registered = [name for name in registered_names
+                          if source_by_name[name]["sha256"] != sfm_source_by_name[name]["sha256"]]
+    if changed_registered:
+        raise BackendError("Registered training image hashes differ from the images bound to the SfM acceptance",
+                           failure_kind="SFM_INPUTS_CHANGED", details={"changed_images": changed_registered[:20]})
     auto_manifest_value = (str(preparation_manifest_path(root).relative_to(root)) if auto_manifest else None)
     derivative_provenance = _validate_image_derivative_manifest(
         root, config, image_dir, dataset_images["images"], auto_manifest_value or sfm_cfg.get("derived_image_manifest"))
-    validation_root = reconstruction.parent if reconstruction.name.isdigit() else reconstruction
-    input_validation = validate_colmap_directory(validation_root, dataset_images["images"], sfm_cfg.get("quality_gate", {}))
-    input_quality = input_validation["quality_gate"]
+    sfm_snapshot = sfm_scope["sfm_snapshot"]
+    source_validation = sfm_snapshot["validation"]
+    input_quality = sfm_snapshot["original_quality_gate"]
+    original_warnings = list(sfm_snapshot["original_quality_warnings"])
+    current_warnings = list(sfm_snapshot["current_revalidation_warnings"])
+    current_quality = sfm_snapshot["current_revalidation_quality_gate"]
     allow_warnings = bool(sfm_cfg.get("quality_gate", {}).get("allow_training_with_warnings", False))
-    if input_quality in {"SFM_INVALID", "SFM_NEEDS_REVIEW"} or (input_quality == "SFM_VALID_WITH_WARNINGS" and not allow_warnings):
-        raise BackendError(f"Training input failed current COLMAP validation: {input_quality}", failure_kind="QUALITY_GATE_BLOCKED", details=input_validation)
+    if input_quality == "SFM_INVALID" or current_quality == "SFM_INVALID":
+        raise BackendError("Training input failed current COLMAP validation: SFM_INVALID", failure_kind="QUALITY_GATE_BLOCKED", details=source_validation)
+    if ((sfm_state.get("status") == "NEEDS_REVIEW" or input_quality == "SFM_NEEDS_REVIEW" or
+         current_quality == "SFM_NEEDS_REVIEW" or
+         (input_quality == "SFM_VALID_WITH_WARNINGS" and not allow_warnings) or
+         (current_quality == "SFM_VALID_WITH_WARNINGS" and not allow_warnings)) and sfm_scope["acceptance"] is None):
+        raise BackendError("Training requires a current component-scoped experimental acceptance for this SfM result",
+                           failure_kind="QUALITY_GATE_BLOCKED", details=source_validation)
+    selected_validation = validate_colmap_directory(reconstruction, selected_source_rows, sfm_cfg.get("quality_gate", {}))
+    if selected_validation["quality_gate"] == "SFM_INVALID":
+        raise BackendError("Selected component failed structural COLMAP validation", failure_kind="SFM_INVALID", details=selected_validation)
+    input_validation = {
+        "schema_version": "exhibition-archive.training-input-validation.v1",
+        "quality_gate": input_quality,
+        "warnings": original_warnings,
+        "current_revalidation_quality_gate": current_quality,
+        "current_revalidation_warnings": current_warnings,
+        "source_sfm_validation": source_validation,
+        "selected_component_validation": selected_validation,
+        "selected_component_id": sfm_scope["component_id"],
+        "selected_registered_image_count": sfm_scope["registered_image_count"],
+        "selected_registered_image_membership_sha256": sfm_scope["registered_image_membership_sha256"],
+        "sfm_component_acceptance": sfm_scope["acceptance"],
+        "final_archive_completeness_accepted": False,
+    }
     policy = config.get("resource_policy", {})
     attempt = create_attempt_dir(root, output_path(root, config), "training", execution_id, policy.get("retained_attempt_limit"))
     resources = check_resources(attempt, policy, "training")
     capabilities = discover_environment(cfg.get("executable"), attempt / "backend-discovery")
-    training_dataset = prepare_training_dataset(attempt, image_dir, reconstruction)
+    training_dataset = prepare_training_dataset(attempt, image_dir, reconstruction,
+                                                registered_image_names=registered_names)
+    materialized_images = backend_image_inventory(training_dataset / "images")
+    materialized_names = sorted(row["relative_path"] for row in materialized_images["images"])
+    if materialized_names != sorted(registered_names):
+        raise BackendError("Prepared training dataset does not exactly match the selected COLMAP registered-image membership",
+                           failure_kind="INVALID_INPUT", details={"expected_count": len(registered_names),
+                                                                    "actual_count": len(materialized_names)})
+    selected_formats = materialized_images["formats"]
+    source_names = set(source_by_name)
+    excluded_names = sorted(source_names - set(registered_names))
     run_name = f"{config['project_id']}-attempt-{execution_id:04d}"
     command = build_training_command(Path(capabilities["tool"]["executable"]), training_dataset, attempt, cfg, capabilities, run_name)
     env_overrides = cfg.get("environment_overrides", {})
@@ -866,7 +957,34 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     write_json(private_environment_path, env_overrides)
     try: private_environment_path.chmod(0o600)
     except OSError: pass
-    training_manifest = {"schema_version": "exhibition-archive.backend-input-manifest.v1", "project_id": config["project_id"], "source_directory": str(image_dir.resolve()), "image_count": dataset_images["image_count"], "formats": dataset_images["formats"], "images": dataset_images["images"], "image_derivative_provenance": derivative_provenance, "reconstruction_directory": str(reconstruction.resolve()), "sfm_output_digest": sfm_state.get("output_digest"), "dataset_links": {"images": str((training_dataset / "images").resolve()), "sparse/0": str((training_dataset / "sparse/0").resolve())}, "run_type": cfg["run_type"], "source_photos_modified": False}
+    selected_identity = [{"image_id": row["image_id"], "sha256": row["sha256"]} for row in selected_source_rows]
+    training_manifest = {
+        "schema_version": "exhibition-archive.backend-input-manifest.v2",
+        "project_id": config["project_id"],
+        "source_directory": str(image_dir.resolve()),
+        "source_image_count": dataset_images["image_count"],
+        "source_image_inventory_sha256": json_digest([{"relative_path": row["relative_path"], "sha256": row["sha256"]}
+                                                        for row in dataset_images["images"]]),
+        "image_count": len(selected_source_rows),
+        "registered_image_count": len(selected_source_rows),
+        "registered_image_names": registered_names,
+        "registered_image_membership_sha256": sfm_scope["registered_image_membership_sha256"],
+        "excluded_source_image_count": len(excluded_names),
+        "excluded_source_images": [{"relative_path": name, "sha256": source_by_name[name]["sha256"]} for name in excluded_names],
+        "formats": selected_formats,
+        "images": selected_source_rows,
+        "image_derivative_provenance": derivative_provenance,
+        "reconstruction_directory": str(reconstruction.resolve()),
+        "sfm_component_id": sfm_scope["component_id"],
+        "sfm_component_artifact_tree_sha256": sfm_scope["component"]["artifact_tree_sha256"],
+        "sfm_reconstruction_binding_sha256": sfm_scope["sfm_snapshot"]["binding_sha256"],
+        "sfm_output_digest": sfm_state.get("output_digest"),
+        "sfm_component_acceptance": sfm_scope["acceptance"],
+        "dataset_links": {"images": str((training_dataset / "images").resolve()),
+                          "sparse/0": str((training_dataset / "sparse/0").resolve())},
+        "run_type": cfg["run_type"],
+        "source_photos_modified": False,
+    }
     manifest_path = attempt / "training-input-manifest.json"
     write_json(manifest_path, training_manifest)
     input_validation_path = attempt / "training-input-validation.json"
@@ -886,8 +1004,11 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     model_validation.update({"producer": "Spirula", "producer_version": capabilities["tool"]["version"], "attempt_id": attempt.name,
                              "run_type": cfg["run_type"], "smoke_test_marker": "SMOKE_TEST_MODEL" if cfg["run_type"] == "smoke_test" else None,
                              "training_configuration": {k:v for k,v in cfg.items() if k not in {"environment_overrides"}},
-                             "source_dataset_identity": hashlib.sha256(json.dumps([{"image_id": x["image_id"], "sha256": x["sha256"]} for x in dataset_images["images"]], sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
-                             "sfm_input_identity": sfm_state.get("output_digest"), "public_selection_allowed": False})
+                             "source_dataset_identity": hashlib.sha256(json.dumps(selected_identity, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+                             "sfm_input_identity": sfm_scope["sfm_snapshot"]["binding_sha256"],
+                             "sfm_component_id": sfm_scope["component_id"],
+                             "sfm_component_acceptance_audit_identity": (sfm_scope["acceptance"] or {}).get("audit_identity"),
+                             "public_selection_allowed": False})
     model_path = candidates[0]
     validation_path = attempt / "model-validation.json"
     write_json(validation_path, model_validation)
@@ -906,7 +1027,15 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
                   "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "checkpoint_resume_execution_status": "NOT_TESTED",
                   "discovered_checkpoints": checkpoints,
                   "model": model_validation, "input_manifest": str(manifest_path.resolve()), "input_validation_report": str(input_validation_path.resolve()),
-                  "sfm_input_quality_gate": input_validation["quality_gate"], "image_derivative_provenance": derivative_provenance,
+                  "sfm_input_quality_gate": input_validation["quality_gate"],
+                  "sfm_input_warnings": input_validation["warnings"],
+                  "sfm_current_revalidation_quality_gate": input_validation["current_revalidation_quality_gate"],
+                  "sfm_current_revalidation_warnings": input_validation["current_revalidation_warnings"],
+                  "sfm_component_id": sfm_scope["component_id"],
+                  "sfm_component_acceptance_audit_identity": (sfm_scope["acceptance"] or {}).get("audit_identity"),
+                  "training_registered_image_count": len(selected_source_rows),
+                  "training_source_directory_image_count": dataset_images["image_count"],
+                  "image_derivative_provenance": derivative_provenance,
                   "training_dataset_workspace": str(training_dataset.resolve()),
                   "environment_overrides_private_record": str(private_environment_path.resolve()),
                   "limitations": ["This output is a technical smoke/candidate artifact, not a curator-approved exhibition model.", "Training loss, convergence and visual fidelity were not evaluated by the orchestration backend.", "Optimizer-state resume is advertised by CLI help but has not been executed or integrated."]}
@@ -914,7 +1043,7 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     artifacts = [model_path, validation_path, run_path, manifest_path, input_validation_path, attempt / "command.json", attempt / "spirula.log"]
     return {"status": "COMPLETED", "artifacts": artifacts,
             "artifact_types": {str(path): ("3dgs-ply" if path.suffix.casefold() == ".ply" else ("text" if path.suffix == ".log" else "json")) for path in artifacts},
-            "details": {"model_status": run_report["model_status"], "run_type": cfg["run_type"], "public_selection_allowed": False, "model_path": str(model_path.resolve()), "model_sha256": model_validation["sha256"], "gaussian_count": model_validation["gaussian_count"], "file_bytes": model_validation["file_bytes"], "validation_path": str(validation_path.resolve()), "training_run_path": str(run_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "backend_version": capabilities["tool"]["version"], "training_iterations_requested": cfg["iterations"], "training_progress": "FINAL_EXIT_ONLY; intermediate progress is available only in the log", "checkpoint_resume_execution_status": "NOT_TESTED", "discovered_checkpoints": checkpoints}}
+            "details": {"model_status": run_report["model_status"], "run_type": cfg["run_type"], "public_selection_allowed": False, "model_path": str(model_path.resolve()), "model_sha256": model_validation["sha256"], "gaussian_count": model_validation["gaussian_count"], "file_bytes": model_validation["file_bytes"], "validation_path": str(validation_path.resolve()), "training_run_path": str(run_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "backend_version": capabilities["tool"]["version"], "training_iterations_requested": cfg["iterations"], "training_progress": "FINAL_EXIT_ONLY; intermediate progress is available only in the log", "checkpoint_resume_execution_status": "NOT_TESTED", "discovered_checkpoints": checkpoints, "sfm_component_id": sfm_scope["component_id"], "sfm_component_acceptance_audit_identity": (sfm_scope["acceptance"] or {}).get("audit_identity"), "training_registered_image_count": len(selected_source_rows), "training_source_directory_image_count": dataset_images["image_count"]}}
 
 
 def fresh_evaluation_stage(root: Path, config: dict, state: ProjectState, output_dir: Path) -> dict:
@@ -1035,11 +1164,27 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
         if sid == "sfm" and auto_preparation_required(root, config):
             deps.append("sfm_dataset_prep")
         missing_deps = [x for x in deps if stages.get(x, {}).get("status") not in {"COMPLETED", "ADOPTED"}]
+        training_scope = None
+        if sid == "training" and configured_mode == "spirula_fresh":
+            from .sfm_review import training_component_scope
+            try:
+                training_scope = training_component_scope(root, config, state)
+                if "sfm" in missing_deps:
+                    missing_deps.remove("sfm")
+            except BackendError as exc:
+                readiness = f"BLOCKED_SFM_ACCEPTANCE_REQUIRED:{exc}"
         if missing_deps:
-            if not (sid == "sfm" and auto_preparation_required(root, config) and "sfm_dataset_prep" in missing_deps):
+            if sid == "training" and readiness.startswith("BLOCKED_SFM_ACCEPTANCE_REQUIRED:"):
+                other_missing = [item for item in missing_deps if item != "sfm"]
+                if other_missing:
+                    readiness += "; WAITING:" + ",".join(other_missing)
+            elif not (sid == "sfm" and auto_preparation_required(root, config) and "sfm_dataset_prep" in missing_deps):
                 readiness = "WAITING:" + ",".join(missing_deps)
             else:
                 readiness = "BLOCKED_DATASET_PREPARATION_REQUIRED"
+        if sid == "training" and training_scope and readiness in {"READY_BACKEND_DRY_RUN", "READY"}:
+            readiness = ("READY_EXPERIMENTAL_TRAINING_WITH_SCOPED_ACCEPTANCE"
+                         if training_scope["acceptance_required"] else "READY_BACKEND_DRY_RUN")
         row = {**stage, "deps": deps, "execution_mode": mode, "readiness": readiness, "current_status": stages.get(sid, {}).get("status", "PENDING")}
         if planned_command is not None: row["planned_command"] = planned_command
         result.append(row)
@@ -1102,6 +1247,12 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                "status": "RUNNING", "stages": {}, "adopted": [], "completed": [], "needs_review": [],
                "blocked": [], "skipped": [], "failed": None}
     authorization_ids = authorization_ids or []
+    scoped_sfm_training = None
+    if not package_only and _integration_mode(config, "training") == "spirula_fresh":
+        from .sfm_review import training_acceptance_for_run
+        current_training_scope = training_acceptance_for_run(root, config, state)
+        if current_training_scope and current_training_scope["conditional_scope"]:
+            scoped_sfm_training = current_training_scope
     try:
         for stage in STAGES:
             sid = stage["id"]
@@ -1121,7 +1272,23 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 state.end_run(run_id, summary["status"], summary)
                 return summary
             blocked = [dep for dep in stage["deps"] if state.stage(dep) is None or state.stage(dep)["status"] not in {"COMPLETED", "ADOPTED"}]
+            if sid == "training" and "sfm" in blocked and _integration_mode(config, "training") == "spirula_fresh":
+                from .sfm_review import training_acceptance_for_run
+                scoped_sfm_training = training_acceptance_for_run(root, config, state)
+                if scoped_sfm_training and scoped_sfm_training["conditional_scope"]:
+                    blocked.remove("sfm")
             if blocked:
+                if sid == "navigation" and "sfm" in blocked and scoped_sfm_training:
+                    summary["skipped"].append(sid)
+                    summary["stages"][sid] = "SKIPPED_OUTSIDE_SFM_ACCEPTANCE_SCOPE"
+                    continue
+                if sid == "evaluation" and scoped_sfm_training:
+                    message = "The SfM decision permits experimental training only; evaluation and later archive stages require their own current review scope."
+                    summary["status"] = "NEEDS_REVIEW"
+                    summary["blocked"].append({"stage": sid, "reason": message, "authorization_required": False})
+                    summary["stop_reason"] = message
+                    state.end_run(run_id, summary["status"], summary)
+                    return summary
                 if package_only:
                     message = f"Package-only mode is blocked by incomplete prerequisites: {blocked}"
                     summary["status"] = "BLOCKED_PACKAGE_PREREQUISITE"
@@ -1145,8 +1312,31 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
             fp = stage_fingerprint(root, config, state, sid,
                                    full_hash=force_hash or fresh_backend_stage or sid == "sfm_dataset_prep")
             prior = state.stage(sid)
+            if sid == "sfm" and prior and prior.get("status") == "NEEDS_REVIEW" and prior.get("input_fingerprint") == fp:
+                from .sfm_review import training_acceptance_for_run
+                scoped_sfm_training = training_acceptance_for_run(root, config, state)
+                if scoped_sfm_training and scoped_sfm_training["conditional_scope"]:
+                    summary["stages"][sid] = "RETAINED_NEEDS_REVIEW_WITH_TRAINING_SCOPE"
+                    summary["needs_review"].append(sid)
+                    continue
+                message = "The current SfM result remains NEEDS_REVIEW. Record a component decision with sfm-review or explicitly replan a corrected SfM execution."
+                summary["status"] = "NEEDS_REVIEW"
+                summary["stages"][sid] = "NEEDS_REVIEW"
+                summary["needs_review"].append(sid)
+                summary["blocked"].append({"stage": sid, "reason": message, "authorization_required": False})
+                summary["stop_reason"] = message
+                state.end_run(run_id, summary["status"], summary)
+                return summary
             if prior and prior.get("input_fingerprint") == fp and prior.get("status") in {"COMPLETED", "ADOPTED"} and _stage_artifacts_valid(state, sid, stage_root):
-                summary["skipped"].append(sid); summary["stages"][sid] = "SKIPPED_VALID_CACHE"; continue
+                summary["skipped"].append(sid); summary["stages"][sid] = "SKIPPED_VALID_CACHE"
+                if sid == "training" and scoped_sfm_training:
+                    message = "The accepted SfM scope permits experimental training only; downstream model evaluation, navigation, archive packaging, and publication remain outside this run."
+                    summary["status"] = "NEEDS_REVIEW"
+                    summary["stop_reason"] = message
+                    summary["blocked"].append({"stage": "evaluation", "reason": message, "authorization_required": False})
+                    state.end_run(run_id, summary["status"], summary)
+                    return summary
+                continue
             if sid == "navigation" and prior and prior.get("input_fingerprint") == fp and prior.get("status") == "NEEDS_REVIEW":
                 summary["stages"][sid] = "NEEDS_REVIEW"
                 summary["needs_review"].append(sid)
@@ -1238,6 +1428,13 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                         continue
                     summary["stop_reason"] = f"Stopped before dependent work because {sid} requires human review."
                     state.end_run(run_id, "NEEDS_REVIEW", summary)
+                    return summary
+                if sid == "training" and scoped_sfm_training:
+                    message = "The accepted SfM scope permits experimental training only; downstream model evaluation, navigation, archive packaging, and publication remain outside this run."
+                    summary["status"] = "NEEDS_REVIEW"
+                    summary["stop_reason"] = message
+                    summary["blocked"].append({"stage": "evaluation", "reason": message, "authorization_required": False})
+                    state.end_run(run_id, summary["status"], summary)
                     return summary
             except AuthorizationRequired as exc:
                 execution_row = state.execution(execution_id) or {}
