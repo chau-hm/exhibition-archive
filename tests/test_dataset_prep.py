@@ -384,7 +384,7 @@ class DatasetPreparationTests(unittest.TestCase):
 
         cases = [
             ("capture-24mp.heic", (5712, 4284), 1),
-            ("capture-48mp.heic", (8064, 6048), 3),
+            ("capture-12mp.heic", (4032, 3024), 3),
         ]
         icc_profile = ImageCms.ImageCmsProfile(ImageCms.createProfile("sRGB")).tobytes()
         for index, (name, size, orientation) in enumerate(cases):
