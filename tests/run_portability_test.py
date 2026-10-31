@@ -51,10 +51,12 @@ def main(argv=None):
     assert resumed["stages"]["viewer_package"] == "COMPLETED"
     assert resumed["stages"]["archive_package"] == "COMPLETED"
     assert resumed["stages"]["verification"] == "COMPLETED"
+    archive_manifest = json.loads((workspace / "deliverable" / "archive" / "manifest.json").read_text(encoding="utf-8"))
+    assert any(item["path"] == "sfm-dataset-preparation.json" for item in archive_manifest["contents"])
     packaged = command("package", workspace)
-    assert packaged["mode"] == "package_only" and len(packaged["skipped"]) == 10, packaged
+    assert packaged["mode"] == "package_only" and len(packaged["skipped"]) == 11 and "sfm_dataset_prep" in packaged["skipped"], packaged
     repeated = command("run", workspace)
-    assert len(repeated["skipped"]) == 10, repeated
+    assert len(repeated["skipped"]) == 11 and "sfm_dataset_prep" in repeated["skipped"], repeated
     command("config-set", workspace, "--key", "viewer.theme", "--value", '"light"')
     light_state = command("status", workspace)
     invalidated = {key for key, value in light_state["stages"].items() if value["status"] == "INVALIDATED"}

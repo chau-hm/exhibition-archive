@@ -25,6 +25,16 @@ python3 -m venv .venv
 
 For a Codex session opened at this repository, repository-scoped Skill discovery uses the checked-in .agents/skills/exhibition-archive link. The one authoritative Skill source is skills/exhibition-archive. Type /skills to inspect available Skills or explicitly invoke $exhibition-archive.
 
+## Spirula and HEIC datasets
+
+Spirula Studio is an external, separately installed dependency for fresh reconstruction or Gaussian training. Its GUI application includes the CLI executable, so a separate CLI installer is normally unnecessary. On macOS, the executable can be at `/Applications/Spirula Studio.app/Contents/MacOS/spirula`; configure `integrations.sfm.executable` and `integrations.model.executable` to the installed executable or a compatible `spirula` on `PATH`.
+
+The Engine can run safe source inventory and capture preflight without Spirula installed. When fresh Spirula SfM selects a source folder containing HEIC/HEIF, `run --full-hash` prepares a verified JPEG dataset under `derived/spirula-jpeg/<preparation-hash>/` and records source-to-output hashes in `derived/sfm-dataset-preparation.json`. Existing JPEGs are copied byte-for-byte. On macOS the converter uses Apple ImageIO through the packaged Swift helper; it writes JPEG quality 95, normalizes orientation, carries and checks available source EXIF, and refuses conversion when essential camera make/model/focal data cannot be verified. No metadata-stripping fallback is used. The original photo folder remains read-only.
+
+For converted HEIC images, ImageIO checks source ICC bytes when present and otherwise compares decoded profile names; byte-copied JPEGs are not profile-inspected. The Engine does not relabel Display P3 as DCI-P3 or claim measured colorimetric fidelity. A configured `--image-gamut` is blocked when profiles in a mixed dataset cannot be verified. HEIC intake on non-macOS hosts currently stops with a visible converter-unavailable error. Review [the dataset preparation guide](docs/heic-dataset-preparation.md) for the run, plan, cache, and external-derivative workflow.
+
+Fresh reconstruction and training still require a configured compatible backend and separate explicit authorization for each costly stage's current full-hash plan. Safe conversion only prepares inputs; it does not start reconstruction or training.
+
 ## First project
 
 Keep the source photographs read-only and create a separate project workspace. Copy the generic example and edit project ID, source path, output path, publication policy, and optional integrations for the exhibition:
@@ -54,7 +64,7 @@ The example config is a template; it may describe fresh backends, which remain g
 - Use verify --full-hash for integrity. verify --public-release additionally requires current human publication and rights approval.
 - Do not deploy automatically. A local package is not authorization to publish.
 
-See docs/installation.md, docs/workflow.md, docs/gpu-authorization.md, docs/navigation-review.md, docs/publishing.md, and docs/pilot-onboarding.md.
+See docs/installation.md, docs/workflow.md, docs/heic-dataset-preparation.md, docs/gpu-authorization.md, docs/navigation-review.md, docs/publishing.md, and docs/pilot-onboarding.md.
 
 ## Development
 

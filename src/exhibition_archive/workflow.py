@@ -14,12 +14,17 @@ from .backends import (BackendError, IMAGE_SUFFIXES, build_sfm_command, build_tr
                        check_resources, create_attempt_dir, discover_environment, discover_model_files,
                        execute_process, finalize_attempt_record, finalize_stage_attempt, image_inventory as backend_image_inventory, prepare_training_dataset,
                        validate_colmap_directory, validate_gaussian_ply)
+from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_preparation_required,
+                           effective_sfm_dataset, effective_training_dataset, raw_sfm_image_directory,
+                           image_gamut_mismatch, preparation_manifest_path,
+                           prepare_spirula_dataset, validate_preparation_stage_outputs)
 from .state import ProjectState, utc_now
 
 
 STAGES = [
     {"id": "photo_inventory", "deps": [], "inputs": ["original photographs", "Phase2EU inventory if supplied"], "outputs": ["source inventory and hashes"], "mode": "execute locally", "resource": "I/O bound"},
     {"id": "capture_preflight", "deps": ["photo_inventory"], "inputs": ["image inventory", "optional SfM and region evidence"], "outputs": ["quality and capture-risk report"], "mode": "adopt or image-only adapter", "resource": "low / I/O bound"},
+    {"id": "sfm_dataset_prep", "deps": ["photo_inventory", "capture_preflight"], "inputs": ["registered source inventory", "HEIC files when fresh Spirula SfM requires JPEG"], "outputs": ["verified effective image dataset and source-to-derivative manifest"], "mode": "safe local preparation; no backend execution", "resource": "I/O and CPU bound when HEIC is present"},
     {"id": "artwork_association", "deps": ["photo_inventory", "capture_preflight"], "inputs": ["image inventory", "optional geometry and review state"], "outputs": ["inventory, observations, association graph"], "mode": "adopt or configured Phase2EV adapter", "resource": "low when adopted"},
     {"id": "sfm", "deps": ["photo_inventory"], "inputs": ["source images or existing COLMAP reconstruction"], "outputs": ["validated cameras, registered images, sparse points and provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "high when freshly executed"},
     {"id": "navigation", "deps": ["sfm"], "inputs": ["trusted camera poses, geometry evidence, coordinate frame and review decisions"], "outputs": ["versioned navigation proposal or approved artifact"], "mode": "adopt_existing or generate_from_sfm", "resource": "low"},
@@ -108,7 +113,10 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
     integration = config.get("integrations", {})
     selected: dict[str, Any] = {"project_id": config["project_id"], "stage": stage_id}
     definition = next(x for x in STAGES if x["id"] == stage_id)
-    selected["dependencies"] = {dep: ({k: state.stage(dep).get(k) for k in ("status", "input_fingerprint", "output_digest")} if state.stage(dep) else None) for dep in definition["deps"]}
+    dependencies = list(definition["deps"])
+    if stage_id == "sfm" and auto_preparation_required(root, config):
+        dependencies.append("sfm_dataset_prep")
+    selected["dependencies"] = {dep: ({k: state.stage(dep).get(k) for k in ("status", "input_fingerprint", "output_digest")} if state.stage(dep) else None) for dep in dependencies}
     paths_by_stage = {
         "photo_inventory": [integration.get("preflight", {}).get("image_inventory")],
         "capture_preflight": [integration.get("preflight", {}).get(x) for x in ("summary", "risk_register", "recapture_recommendations")] + [integration.get("sfm", {}).get("directory")],
@@ -154,12 +162,41 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
         source_dir = project_path(root, config, config["source"]["photo_directory"])
         suffixes = IMAGE_SUFFIXES
         selected["source_files"] = [fingerprint_file(state, file, full_hash) for file in sorted(source_dir.rglob("*") if source_dir.is_dir() else []) if file.is_file() and file.suffix.casefold() in suffixes]
-    if stage_id in {"sfm", "training"}:
+    if stage_id == "sfm_dataset_prep":
         sfm_cfg = integration.get("sfm", {})
-        model_cfg = integration.get("model", {})
-        raw_images = (sfm_cfg.get("image_directory") if stage_id == "sfm" else model_cfg.get("image_directory")) or sfm_cfg.get("image_directory") or config["source"]["photo_directory"]
-        image_dir = project_path(root, config, raw_images)
+        image_dir = project_path(root, config, sfm_cfg.get("image_directory", config["source"]["photo_directory"]))
+        selected["source"] = config["source"]
+        selected["preparation_settings"] = {"jpeg_quality": 95, "orientation": "normalized-and-tag-flattened", "color": "ImageIO-profile-preserving"}
+        selected["implementation_files"] = [
+            fingerprint_file(state, Path(__file__).with_name("dataset_prep.py"), full_hash),
+            fingerprint_file(state, Path(__file__).with_name("imageio_heic.swift"), full_hash),
+        ]
+        selected["input_images"] = [fingerprint_file(state, file, full_hash)
+                                     for file in sorted(image_dir.rglob("*") if image_dir.is_dir() else [])
+                                     if file.is_file() and file.suffix.casefold() in IMAGE_SUFFIXES]
+        selected["sfm_configuration"] = sfm_cfg
+    if stage_id in {"sfm", "training"}:
+        try:
+            if stage_id == "sfm":
+                image_dir, prep_manifest = effective_sfm_dataset(root, config, validate_files=full_hash)
+            else:
+                image_dir, prep_manifest = effective_training_dataset(root, config)
+        except DatasetPreparationRequired:
+            image_dir = raw_sfm_image_directory(root, config) if stage_id == "sfm" else project_path(
+                root, config, integration.get("model", {}).get("image_directory",
+                    integration.get("sfm", {}).get("image_directory", config["source"]["photo_directory"])))
+            prep_manifest = None
+            selected["dataset_preparation_required"] = True
         selected["selected_input_images"] = [fingerprint_file(state, file, full_hash) for file in sorted(image_dir.rglob("*")) if file.is_file() and file.suffix.casefold() in IMAGE_SUFFIXES] if image_dir.is_dir() else [{"path": str(image_dir), "exists": False}]
+        if prep_manifest:
+            prep_path = preparation_manifest_path(root)
+            selected["dataset_preparation"] = {
+                "manifest_path": str(prep_path.resolve()),
+                "manifest_sha256": sha256_file(prep_path),
+                "preparation_fingerprint": prep_manifest.get("preparation_fingerprint"),
+                "mapping_sha256": json_digest(prep_manifest.get("image_mappings", [])),
+                "mapped_image_count": len(prep_manifest.get("image_mappings", [])),
+            }
     elif stage_id == "viewer_package":
         selected["theme"] = config.get("viewer", {}).get("theme", "dark")
         selected["viewer_title"] = config.get("viewer", {}).get("title", config["project_id"])
@@ -175,7 +212,7 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
     elif stage_id == "verification":
         selected["upstream"] = {s: ({k: state.stage(s).get(k) for k in ("status", "input_fingerprint", "output_digest")} if state.stage(s) else None) for s in ("viewer_package", "archive_package")}
     else:
-        selected["config_group"] = integration.get({"photo_inventory":"preflight", "capture_preflight":"preflight", "artwork_association":"artwork", "sfm":"sfm", "training":"model", "evaluation":"evaluation", "navigation":"navigation"}.get(stage_id, ""), {})
+        selected["config_group"] = integration.get({"photo_inventory":"preflight", "capture_preflight":"preflight", "sfm_dataset_prep":"sfm", "artwork_association":"artwork", "sfm":"sfm", "training":"model", "evaluation":"evaluation", "navigation":"navigation"}.get(stage_id, ""), {})
     return json_digest(selected)
 
 
@@ -211,15 +248,13 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
     attempt = output_path(root, config) / "backend-runs" / stage_id / "<next-unique-attempt>"
     input_cfg = config.get("integrations", {}).get("sfm", {})
     if stage_id == "sfm":
-        raw_images = cfg.get("image_directory", config["source"]["photo_directory"])
-        image_dir = project_path(root, config, raw_images)
+        image_dir, prep_manifest = effective_sfm_dataset(root, config, validate_files=True)
         command = build_sfm_command(executable, image_dir, attempt / "workspace", cfg, backend)
         limits = {**config.get("resource_policy", {}), "timeout_seconds": cfg.get("timeout_seconds", config.get("resource_policy", {}).get("sfm_timeout_seconds"))}
         quality_gates = cfg.get("quality_gate", {})
         backend_capabilities = backend.get("sfm", {})
     else:
-        raw_images = cfg.get("image_directory", input_cfg.get("image_directory", config["source"]["photo_directory"]))
-        image_dir = project_path(root, config, raw_images)
+        image_dir, prep_manifest = effective_training_dataset(root, config)
         dataset = attempt / "<prepared-dataset>"
         command = build_training_command(executable, dataset, attempt, cfg, backend,
                                          f"{config['project_id']}-<next-execution-id>")
@@ -228,6 +263,9 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
                   "iterations": cfg.get("iterations")}
         quality_gates = {"sfm_quality_gate": input_cfg.get("quality_gate", {}), "training": cfg.get("quality_gate", {})}
         backend_capabilities = backend.get("training", {})
+    gamut_error = image_gamut_mismatch(config, prep_manifest) if stage_id == "sfm" else None
+    if gamut_error:
+        raise BackendError(gamut_error, failure_kind="INVALID_CONFIGURATION")
     input_images = sorted(path for path in image_dir.rglob("*") if path.is_file() and path.suffix.casefold() in IMAGE_SUFFIXES) if image_dir.is_dir() else []
     fingerprint = stage_fingerprint(root, config, state, stage_id, full_hash=True)
     selected_cfg = {k: v for k, v in cfg.items() if k != "environment_overrides"}
@@ -239,6 +277,21 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
         "input_fingerprint_sha256": fingerprint,
         "input_dataset": str(image_dir), "source_image_count": len(input_images),
         "input_image_extensions": sorted({p.suffix.casefold() for p in input_images}),
+        "input_dataset_provenance": ({
+            "kind": "ENGINE_VERIFIED_HEIC_JPEG_DERIVATIVES",
+            "manifest_path": str(preparation_manifest_path(root).resolve()),
+            "manifest_sha256": sha256_file(preparation_manifest_path(root)),
+            "preparation_fingerprint": prep_manifest.get("preparation_fingerprint"),
+            "mapped_image_count": len(prep_manifest.get("image_mappings", [])),
+            "mapping_sha256": json_digest(prep_manifest.get("image_mappings", [])),
+            "source_directory": prep_manifest.get("source_directory"),
+            "converter": prep_manifest.get("conversion", {}).get("backend"),
+            "color_handling": prep_manifest.get("conversion", {}).get("color_handling"),
+        } if prep_manifest else {
+            "kind": "CONFIGURED_IMAGE_DIRECTORY",
+            "source_directory": str(image_dir),
+            "explicit_derived_image_manifest": input_cfg.get("derived_image_manifest"),
+        }),
         "backend": {"executable": str(executable), "version": backend.get("tool", {}).get("version"),
                     "capabilities": backend_capabilities},
         "normalized_command": command,
@@ -621,6 +674,9 @@ def _validate_read_only_image_scope(root: Path, config: dict, image_dir: Path) -
     source_dir = project_path(root, config, config["source"]["photo_directory"]).resolve()
     resolved = image_dir.resolve()
     within_originals = resolved == source_dir or source_dir in resolved.parents
+    managed_root = (root / "derived" / "spirula-jpeg").resolve()
+    within_engine_managed = (managed_root in resolved.parents and
+                             (resolved / DATASET_MANIFEST).is_file())
     within_registered_derived = False
     for raw in config.get("source", {}).get("derived_image_directories", []):
         declared = Path(raw).expanduser()
@@ -630,7 +686,7 @@ def _validate_read_only_image_scope(root: Path, config: dict, image_dir: Path) -
         if root.resolve() in allowed.parents and (resolved == allowed or allowed in resolved.parents):
             within_registered_derived = True
             break
-    if not within_originals and not within_registered_derived:
+    if not within_originals and not within_registered_derived and not within_engine_managed:
         raise BackendError(f"Fresh SfM image directory must be inside the configured read-only source photo directory: {resolved}", failure_kind="INVALID_INPUT")
     if not resolved.is_dir():
         raise BackendError(f"Fresh SfM image directory is missing: {resolved}", failure_kind="INVALID_INPUT")
@@ -677,10 +733,15 @@ def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir:
     cfg = config.get("integrations", {}).get("sfm", {})
     if _integration_mode(config, "sfm") != "spirula_fresh":
         return adopt_stage(root, config, state, "sfm", output_dir)
-    image_dir = project_path(root, config, cfg.get("image_directory", config["source"]["photo_directory"]))
+    image_dir, auto_manifest = effective_sfm_dataset(root, config, validate_files=True)
     _validate_read_only_image_scope(root, config, image_dir)
     dataset = backend_image_inventory(image_dir)
-    derivative_provenance = _validate_image_derivative_manifest(root, config, image_dir, dataset["images"], cfg.get("derived_image_manifest"))
+    auto_manifest_value = (str(preparation_manifest_path(root).relative_to(root)) if auto_manifest else None)
+    derivative_provenance = _validate_image_derivative_manifest(
+        root, config, image_dir, dataset["images"], auto_manifest_value or cfg.get("derived_image_manifest"))
+    gamut_error = image_gamut_mismatch(config, auto_manifest)
+    if gamut_error:
+        raise BackendError(gamut_error, failure_kind="INVALID_CONFIGURATION")
     policy = config.get("resource_policy", {})
     attempt = create_attempt_dir(root, output_path(root, config), "sfm", execution_id, policy.get("retained_attempt_limit"))
     resources = check_resources(attempt, policy, "sfm")
@@ -735,7 +796,7 @@ def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir:
         artifact_discovery_status="FOUND_VALIDATED", validation_result={"status": "PASSED_STRUCTURAL_VALIDATION", "quality_gate": quality, "backend_partial_output": partial_output, "validation_path": str(validation_path.resolve())},
         recovery_guidance="Spirula reported partial output; inspect the validated components and warnings before deciding whether a new authorized attempt is justified." if partial_output else "The process completed; downstream training remains blocked if the production SfM quality gate requires review.")
     primary = validation["components"][0]
-    summary = {"schema_version": "exhibition-archive.sfm-summary.v2", "project_id": config["project_id"], "backend": "spirula", "backend_version": capabilities["tool"]["version"], "execution_status": "COMPLETED_WITH_PARTIAL_OUTPUT" if partial_output else "COMPLETED", "backend_partial_output": partial_output, "quality_gate": quality, "registered_image_count": primary["registered_image_count"], "source_image_count": dataset["image_count"], "registered_image_ratio": validation["registered_image_ratio"], "camera_count": primary["camera_count"], "camera_pose_count": primary["registered_image_count"], "camera_distribution": primary["camera_distribution"], "sparse_point_count": primary["sparse_point_count"], "component_count": validation["component_count"], "mean_track_length": primary["mean_track_length"], "mean_point_reprojection_error_px": primary["mean_point_reprojection_error_px"], "warnings": validation["warnings"], "reconstruction_directory": validation["primary_component"], "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "command": command, "environment_overrides_private_record": str(private_environment_path.resolve()), "resource_check": resources, "source_photo_hashes_recorded": True, "produced_file_count": len(produced), "limitations": ["Technical COLMAP integrity does not guarantee a suitable 3DGS training set or faithful artwork reconstruction.", "Camera-center coordinates are arbitrary non-metric SfM units and do not by themselves establish artwork-surface coverage or visitor-safe navigation.", "The installed help does not enumerate all accepted source image formats; this run records what Spirula actually accepts."]}
+    summary = {"schema_version": "exhibition-archive.sfm-summary.v2", "project_id": config["project_id"], "backend": "spirula", "backend_version": capabilities["tool"]["version"], "execution_status": "COMPLETED_WITH_PARTIAL_OUTPUT" if partial_output else "COMPLETED", "backend_partial_output": partial_output, "quality_gate": quality, "registered_image_count": primary["registered_image_count"], "source_image_count": dataset["image_count"], "registered_image_ratio": validation["registered_image_ratio"], "camera_count": primary["camera_count"], "camera_pose_count": primary["registered_image_count"], "camera_distribution": primary["camera_distribution"], "sparse_point_count": primary["sparse_point_count"], "component_count": validation["component_count"], "mean_track_length": primary["mean_track_length"], "mean_point_reprojection_error_px": primary["mean_point_reprojection_error_px"], "warnings": validation["warnings"], "reconstruction_directory": validation["primary_component"], "effective_image_directory": str(image_dir.resolve()), "image_derivative_provenance": derivative_provenance, "input_manifest": str(input_manifest_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "command": command, "environment_overrides_private_record": str(private_environment_path.resolve()), "resource_check": resources, "source_photo_hashes_recorded": True, "produced_file_count": len(produced), "limitations": ["Technical COLMAP integrity does not guarantee a suitable 3DGS training set or faithful artwork reconstruction.", "Camera-center coordinates are arbitrary non-metric SfM units and do not by themselves establish artwork-surface coverage or visitor-safe navigation.", "The installed help does not enumerate all accepted source image formats; this run records what Spirula actually accepts."]}
     summary_path = output_dir / "sfm-summary.json"
     write_json(summary_path, summary)
     artifacts = [summary_path, validation_path, input_manifest_path, attempt / "command.json", attempt / "spirula.log"]
@@ -774,10 +835,12 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     else:
         reconstruction = project_path(root, config, sfm_cfg.get("directory", ""))
     if not reconstruction.is_dir(): raise BackendError(f"Validated COLMAP directory is missing: {reconstruction}", failure_kind="SFM_INVALID")
-    image_dir = project_path(root, config, cfg.get("image_directory", sfm_cfg.get("image_directory", config["source"]["photo_directory"])))
+    image_dir, auto_manifest = effective_training_dataset(root, config)
     _validate_read_only_image_scope(root, config, image_dir)
     dataset_images = backend_image_inventory(image_dir)
-    derivative_provenance = _validate_image_derivative_manifest(root, config, image_dir, dataset_images["images"], sfm_cfg.get("derived_image_manifest"))
+    auto_manifest_value = (str(preparation_manifest_path(root).relative_to(root)) if auto_manifest else None)
+    derivative_provenance = _validate_image_derivative_manifest(
+        root, config, image_dir, dataset_images["images"], auto_manifest_value or sfm_cfg.get("derived_image_manifest"))
     validation_root = reconstruction.parent if reconstruction.name.isdigit() else reconstruction
     input_validation = validate_colmap_directory(validation_root, dataset_images["images"], sfm_cfg.get("quality_gate", {}))
     input_quality = input_validation["quality_gate"]
@@ -900,7 +963,11 @@ def _stage_artifacts_valid(state: ProjectState, stage_id: str, output_dir: Path)
         return False
     try:
         paths = json.loads(executions["details_json"]).get("artifacts", [])
-        return bool(paths) and all(Path(x).is_file() for x in paths)
+        if not paths or not all(Path(x).is_file() for x in paths):
+            return False
+        if stage_id == "sfm_dataset_prep":
+            return validate_preparation_stage_outputs(state.root, json.loads((state.root / "project.json").read_text(encoding="utf-8")))
+        return True
     except Exception:
         return False
 
@@ -927,16 +994,22 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
                     attempt_id = "<next-unique-attempt>"
                     attempt = output_path(root, config) / "backend-runs" / sid / attempt_id
                     if sid == "sfm":
-                        images = project_path(root, config, group_cfg.get("image_directory", config["source"]["photo_directory"]))
+                        images, prep_manifest = effective_sfm_dataset(root, config)
+                        gamut_error = image_gamut_mismatch(config, prep_manifest)
+                        if gamut_error:
+                            raise BackendError(gamut_error, failure_kind="INVALID_CONFIGURATION")
                         planned_command = build_sfm_command(executable, images, attempt / "workspace", group_cfg, backend or {"sfm": {"auto_arguments": ["--max-image-size"]}})
                         if not images.is_dir(): readiness = "BLOCKED_IMAGE_DIRECTORY_MISSING"
                     else:
+                        effective_training_dataset(root, config)
                         model_caps = backend or {"training": {"presets": [group_cfg.get("preset", "3dgs")], "arguments": ["--train-resolution-divisor", "--device", "--steps-per-save", "--save-only-latest-checkpoint", "--save-full-checkpoint", "--disable-viewer", "--keep-viewer-alive"]}}
                         dataset_placeholder = attempt / "dataset"
                         planned_command = build_training_command(executable, dataset_placeholder, attempt, group_cfg, model_caps, f"{config['project_id']}-{attempt_id}")
                         if "iterations" not in group_cfg or "max_training_iterations" not in config.get("resource_policy", {}): readiness = "BLOCKED_EXPLICIT_ITERATION_CAP_REQUIRED"
                         elif group_cfg["iterations"] > config["resource_policy"]["max_training_iterations"]: readiness = "BLOCKED_ITERATION_CAP_EXCEEDED"
                     if planned_command and readiness == "READY": readiness = "READY_BACKEND_DRY_RUN"
+                except DatasetPreparationRequired as exc:
+                    readiness = f"BLOCKED_DATASET_PREPARATION_REQUIRED:{exc}"
                 except (BackendError, KeyError, TypeError, ValueError) as exc:
                     readiness = f"BLOCKED_BACKEND_CONFIGURATION:{exc}"
             if sid == "navigation" and has_cfg and configured_mode == "generate_from_sfm":
@@ -946,13 +1019,23 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
                     readiness = "REVIEW_REQUIRED_FLOOR_PLANE_NOT_CONFIGURED"
                 else:
                     readiness = "READY_GENERATE_PROPOSAL_REQUIRES_REVIEW"
+        elif sid == "sfm_dataset_prep":
+            mode = "LOCAL"
+            readiness = ("READY_SAFE_PREPARATION" if auto_preparation_required(root, config)
+                         else "READY_NO_CONVERSION_REQUIRED")
         else:
             mode = "LOCAL"
             readiness = "READY"
-        missing_deps = [x for x in stage["deps"] if stages.get(x, {}).get("status") not in {"COMPLETED", "ADOPTED"}]
+        deps = list(stage["deps"])
+        if sid == "sfm" and auto_preparation_required(root, config):
+            deps.append("sfm_dataset_prep")
+        missing_deps = [x for x in deps if stages.get(x, {}).get("status") not in {"COMPLETED", "ADOPTED"}]
         if missing_deps:
-            readiness = "WAITING:" + ",".join(missing_deps)
-        row = {**stage, "execution_mode": mode, "readiness": readiness, "current_status": stages.get(sid, {}).get("status", "PENDING")}
+            if not (sid == "sfm" and auto_preparation_required(root, config) and "sfm_dataset_prep" in missing_deps):
+                readiness = "WAITING:" + ",".join(missing_deps)
+            else:
+                readiness = "BLOCKED_DATASET_PREPARATION_REQUIRED"
+        row = {**stage, "deps": deps, "execution_mode": mode, "readiness": readiness, "current_status": stages.get(sid, {}).get("status", "PENDING")}
         if planned_command is not None: row["planned_command"] = planned_command
         result.append(row)
     return result
@@ -960,6 +1043,11 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
 
 def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str, output_dir: Path, execution_id: int, fail_at: str | None = None, force_hash: bool = False,
                    authorization_plan_id: str | None = None) -> dict:
+    if stage_id == "sfm_dataset_prep":
+        inventory = read_json(output_dir / "source-index.json")
+        result = prepare_spirula_dataset(root, config, inventory)
+        manifest = Path(result["manifest_path"])
+        return {"status": "COMPLETED", "artifacts": [manifest], "details": result["details"]}
     if stage_id in {"photo_inventory", "capture_preflight", "artwork_association", "sfm", "training", "evaluation", "navigation"}:
         if stage_id == "sfm": return execute_fresh_sfm(root, config, state, output_dir, execution_id, authorization_plan_id)
         if stage_id == "training": return execute_fresh_training(root, config, state, output_dir, execution_id, authorization_plan_id)
@@ -1013,6 +1101,10 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
         for stage in STAGES:
             sid = stage["id"]
             if package_only and sid not in {"viewer_package", "archive_package", "verification"}:
+                if sid == "sfm_dataset_prep" and not auto_preparation_required(root, config):
+                    summary["skipped"].append(sid)
+                    summary["stages"][sid] = "SKIPPED_NOT_REQUIRED_FOR_CURRENT_INPUT"
+                    continue
                 fp = stage_fingerprint(root, config, state, sid, full_hash=force_hash)
                 prior = state.stage(sid)
                 if prior and prior.get("input_fingerprint") == fp and prior.get("status") in {"COMPLETED", "ADOPTED"} and _stage_artifacts_valid(state, sid, stage_root):
@@ -1045,7 +1137,8 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 summary["stages"][sid] = "BLOCKED"; summary["failed"] = {"stage": sid, "error": message}
                 raise WorkflowError(f"Stage {sid} blocked: {message}")
             fresh_backend_stage = sid in {"sfm", "training"} and _integration_mode(config, sid) == "spirula_fresh"
-            fp = stage_fingerprint(root, config, state, sid, full_hash=force_hash or fresh_backend_stage)
+            fp = stage_fingerprint(root, config, state, sid,
+                                   full_hash=force_hash or fresh_backend_stage or sid == "sfm_dataset_prep")
             prior = state.stage(sid)
             if prior and prior.get("input_fingerprint") == fp and prior.get("status") in {"COMPLETED", "ADOPTED"} and _stage_artifacts_valid(state, sid, stage_root):
                 summary["skipped"].append(sid); summary["stages"][sid] = "SKIPPED_VALID_CACHE"; continue
@@ -1203,6 +1296,9 @@ def build_archive(root: Path, config: dict, state: ProjectState, output_dir: Pat
                 continue
             raise WorkflowError(f"Archive input missing: {source}")
         shutil.copy2(source, temp / target_name)
+    prep_manifest = preparation_manifest_path(root)
+    if prep_manifest.is_file():
+        shutil.copy2(prep_manifest, temp / "sfm-dataset-preparation.json")
     if _navigation_mode(config) == "generate_from_sfm":
         navigation_details = json.loads((state.stage("navigation") or {}).get("details_json") or "{}")
         for target_name, key in (("navigation/proposal.json", "proposal_path"), ("navigation/approved.json", "approved_artifact")):
@@ -1218,6 +1314,9 @@ def build_archive(root: Path, config: dict, state: ProjectState, output_dir: Pat
         "schema_version": "exhibition-archive.provenance.v1", "project_id": config["project_id"],
         "source": {"photo_directory": config["source"]["photo_directory"], "originals_modified": False},
         "sfm": config.get("integrations", {}).get("sfm", {}),
+        "image_dataset_preparation": ({"manifest": "sfm-dataset-preparation.json",
+                                        "sha256": sha256_file(temp / "sfm-dataset-preparation.json")}
+                                       if (temp / "sfm-dataset-preparation.json").is_file() else None),
         "model": read_json(temp / "model-selection.json"),
         "navigation": {"envelope_id": read_json(temp / "navigation-summary.json").get("envelope_id"), "source_files": read_json(temp / "navigation-summary.json").get("source_files")},
         "viewer_runtime": {"name": "PlayCanvas GSplat Viewer", "version": "2.23.0", "license_file_in_package": "../website/vendor/LICENSE.txt"},
