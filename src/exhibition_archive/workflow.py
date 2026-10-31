@@ -709,8 +709,15 @@ def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir:
     sparse_root = output / "sparse"
     validation = validate_colmap_directory(sparse_root, dataset["images"], cfg.get("quality_gate", {}))
     quality = validation["quality_gate"]
+    partial_output = bool(execution.get("partial_output", False))
+    if partial_output:
+        validation["warnings"].append("SPIRULA_REPORTED_PARTIAL_OUTPUT")
+        if quality == "SFM_VALID":
+            quality = "SFM_VALID_WITH_WARNINGS"
+            validation["quality_gate"] = quality
+        validation["backend_partial_output"] = True
     if quality == "SFM_INVALID":
-        raise BackendError("Spirula exited successfully but the COLMAP reconstruction failed integrity/quality validation", failure_kind="SFM_INVALID", details=validation)
+        raise BackendError("Spirula output failed COLMAP reconstruction integrity/quality validation", failure_kind="SFM_INVALID", details=validation)
     allow_warnings = bool(cfg.get("quality_gate", {}).get("allow_training_with_warnings", False))
     review_required = quality == "SFM_NEEDS_REVIEW" or (quality == "SFM_VALID_WITH_WARNINGS" and not allow_warnings)
     if quality == "SFM_VALID_WITH_WARNINGS" and allow_warnings:
@@ -721,14 +728,14 @@ def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir:
     for path in sorted(output.rglob("*")):
         if path.is_file() and not path.is_symlink():
             produced.append({"relative_path": path.relative_to(attempt).as_posix(), "size_bytes": path.stat().st_size, "category": "sparse-model" if "sparse" in path.parts else "sfm-intermediate"})
-    command_record.update({"ended_at_utc": utc_now(), "exit_code": execution["exit_code"], "elapsed_seconds": execution["elapsed_seconds"], "produced_files": produced, "quality_gate": quality, "output_directory": str(output.resolve()), "reconstruction_directory": validation["primary_component"]})
+    command_record.update({"ended_at_utc": utc_now(), "exit_code": execution["exit_code"], "elapsed_seconds": execution["elapsed_seconds"], "produced_files": produced, "quality_gate": quality, "backend_partial_output": partial_output, "output_directory": str(output.resolve()), "reconstruction_directory": validation["primary_component"]})
     write_json(attempt / "command.json", command_record)
-    finalize_attempt_record(attempt, "SUCCEEDED", exit_code=execution["exit_code"], pid=execution["pid"],
+    finalize_attempt_record(attempt, "PARTIAL_OUTPUT" if partial_output else "SUCCEEDED", exit_code=execution["exit_code"], pid=execution["pid"],
         log_path=execution["log_path"], elapsed_seconds=execution["elapsed_seconds"],
-        artifact_discovery_status="FOUND_VALIDATED", validation_result={"status": "PASSED_STRUCTURAL_VALIDATION", "quality_gate": quality, "validation_path": str(validation_path.resolve())},
-        recovery_guidance="The process completed; downstream training remains blocked if the production SfM quality gate requires review.")
+        artifact_discovery_status="FOUND_VALIDATED", validation_result={"status": "PASSED_STRUCTURAL_VALIDATION", "quality_gate": quality, "backend_partial_output": partial_output, "validation_path": str(validation_path.resolve())},
+        recovery_guidance="Spirula reported partial output; inspect the validated components and warnings before deciding whether a new authorized attempt is justified." if partial_output else "The process completed; downstream training remains blocked if the production SfM quality gate requires review.")
     primary = validation["components"][0]
-    summary = {"schema_version": "exhibition-archive.sfm-summary.v2", "project_id": config["project_id"], "backend": "spirula", "backend_version": capabilities["tool"]["version"], "execution_status": "COMPLETED", "quality_gate": quality, "registered_image_count": primary["registered_image_count"], "source_image_count": dataset["image_count"], "registered_image_ratio": validation["registered_image_ratio"], "camera_count": primary["camera_count"], "camera_pose_count": primary["registered_image_count"], "camera_distribution": primary["camera_distribution"], "sparse_point_count": primary["sparse_point_count"], "component_count": validation["component_count"], "mean_track_length": primary["mean_track_length"], "mean_point_reprojection_error_px": primary["mean_point_reprojection_error_px"], "warnings": validation["warnings"], "reconstruction_directory": validation["primary_component"], "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "command": command, "environment_overrides_private_record": str(private_environment_path.resolve()), "resource_check": resources, "source_photo_hashes_recorded": True, "produced_file_count": len(produced), "limitations": ["Technical COLMAP integrity does not guarantee a suitable 3DGS training set or faithful artwork reconstruction.", "Camera-center coordinates are arbitrary non-metric SfM units and do not by themselves establish artwork-surface coverage or visitor-safe navigation.", "The installed help does not enumerate all accepted source image formats; this run records what Spirula actually accepts."]}
+    summary = {"schema_version": "exhibition-archive.sfm-summary.v2", "project_id": config["project_id"], "backend": "spirula", "backend_version": capabilities["tool"]["version"], "execution_status": "COMPLETED_WITH_PARTIAL_OUTPUT" if partial_output else "COMPLETED", "backend_partial_output": partial_output, "quality_gate": quality, "registered_image_count": primary["registered_image_count"], "source_image_count": dataset["image_count"], "registered_image_ratio": validation["registered_image_ratio"], "camera_count": primary["camera_count"], "camera_pose_count": primary["registered_image_count"], "camera_distribution": primary["camera_distribution"], "sparse_point_count": primary["sparse_point_count"], "component_count": validation["component_count"], "mean_track_length": primary["mean_track_length"], "mean_point_reprojection_error_px": primary["mean_point_reprojection_error_px"], "warnings": validation["warnings"], "reconstruction_directory": validation["primary_component"], "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "command": command, "environment_overrides_private_record": str(private_environment_path.resolve()), "resource_check": resources, "source_photo_hashes_recorded": True, "produced_file_count": len(produced), "limitations": ["Technical COLMAP integrity does not guarantee a suitable 3DGS training set or faithful artwork reconstruction.", "Camera-center coordinates are arbitrary non-metric SfM units and do not by themselves establish artwork-surface coverage or visitor-safe navigation.", "The installed help does not enumerate all accepted source image formats; this run records what Spirula actually accepts."]}
     summary_path = output_dir / "sfm-summary.json"
     write_json(summary_path, summary)
     artifacts = [summary_path, validation_path, input_manifest_path, attempt / "command.json", attempt / "spirula.log"]

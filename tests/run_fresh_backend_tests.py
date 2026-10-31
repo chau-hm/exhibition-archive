@@ -52,7 +52,9 @@ elif args[:2] == ["sfm", "auto"]:
         time.sleep(float(os.environ["FAKE_SFM_SLEEP"]))
     image_dir = pathlib.Path(args[2])
     output = pathlib.Path(args[args.index("-o") + 1])
-    images = sorted(p.name for p in image_dir.iterdir() if p.suffix.casefold() == ".jpg")
+    all_images = sorted(p.name for p in image_dir.iterdir() if p.suffix.casefold() == ".jpg")
+    partial_sfm = os.environ.get("FAKE_SFM_PARTIAL")
+    images = all_images[:6] if partial_sfm else all_images
     sparse = output / "sparse" / "0"
     sparse.mkdir(parents=True)
     (output / "features").mkdir()
@@ -71,9 +73,13 @@ elif args[:2] == ["sfm", "auto"]:
     with (sparse / "points3D.bin").open("wb") as f:
         f.write(struct.pack("<Q", len(tracks)))
         for j, track in enumerate(tracks):
-            f.write(struct.pack("<Q3d3BdQ", j + 1, j * 0.1, j * 0.2, 1.0, 180, 190, 200, 0.25, len(track)))
+            reprojection_error = 2.5 if partial_sfm else 0.25
+            f.write(struct.pack("<Q3d3BdQ", j + 1, j * 0.1, j * 0.2, 1.0, 180, 190, 200, reprojection_error, len(track)))
             for image_id, point2d in track:
                 f.write(struct.pack("<ii", image_id, point2d))
+    if partial_sfm:
+        print("controlled fake partial SfM output", file=sys.stderr)
+        sys.exit(3)
 elif args and args[0] == "train":
     if os.environ.get("FAKE_TRAIN_FAIL"):
         print("controlled fake training failure", file=sys.stderr)
@@ -195,6 +201,7 @@ def _start_authorized_backend(workspace: Path, stage: str, stdout_path: Path) ->
 
 
 def _project_fixture(root: Path, *, fail_sfm: bool = False, sleep_sfm: float | None = None,
+                     partial_sfm: bool = False,
                      fail_training: bool = False, sleep_training: float | None = None,
                      no_model: bool = False, corrupt_ply: bool = False,
                      nonfinite_scale: bool = False,
@@ -245,7 +252,7 @@ def _project_fixture(root: Path, *, fail_sfm: bool = False, sleep_sfm: float | N
                 "quality_gate": {"minimum_registered_ratio": 1.0, "minimum_registered_images": 8,
                                  "maximum_mean_point_reprojection_error_px": 2.0},
                 "additional_args": sfm_extra_args or [],
-                "environment_overrides": ({"FAKE_SFM_FAIL": "1"} if fail_sfm else {}) | ({"FAKE_SFM_SLEEP": str(sleep_sfm)} if sleep_sfm is not None else {})},
+                "environment_overrides": ({"FAKE_SFM_FAIL": "1"} if fail_sfm else {}) | ({"FAKE_SFM_PARTIAL": "1"} if partial_sfm else {}) | ({"FAKE_SFM_SLEEP": str(sleep_sfm)} if sleep_sfm is not None else {})},
         "model": {"mode": "spirula_fresh", "executable": str(fake), "run_type": run_type,
                   "preset": "3dgs", "iterations": 12, "resolution_divisor": 8, "steps_per_save": 12,
                   "image_directory": "derived/spatial-camera-exports" if derived_inputs else str(photos.resolve()),
@@ -334,6 +341,28 @@ def main() -> None:
     assert failed_sfm_record["exit_code"] == 17 and failed_sfm_record["log_path"] == str(Path(failed_execution[2]).resolve())
     retry_output = run("resume", failure_workspace, expect=1)
     assert "reached the configured bound" in retry_output
+
+    # Spirula exit code 3 means it wrote a partial reconstruction. Preserve and
+    # validate it for human review instead of classifying it as a lost attempt.
+    partial_workspace, _ = _project_fixture(dest / "partial-sfm-path", partial_sfm=True)
+    partial_result = json.loads(run("run", partial_workspace))
+    assert "sfm" in partial_result["needs_review"], partial_result
+    assert partial_result["stages"]["sfm"] == "NEEDS_REVIEW", partial_result
+    partial_status = json.loads(run("status", partial_workspace))
+    assert partial_status["stages"]["sfm"]["status"] == "NEEDS_REVIEW"
+    partial_details = json.loads(partial_status["stages"]["sfm"]["details_json"])
+    assert partial_details["quality_gate"] == "SFM_NEEDS_REVIEW"
+    assert partial_details["registered_image_count"] == 6
+    assert partial_details["source_image_count"] == 8
+    assert partial_details["backend_partial_output"] is True
+    partial_attempt = Path(partial_details["attempt_directory"])
+    partial_record = json.loads((partial_attempt / "command.json").read_text())
+    assert partial_record["terminal_state"] == "PARTIAL_OUTPUT"
+    assert partial_record["exit_code"] == 3
+    partial_validation = json.loads((partial_attempt / "sfm-validation.json").read_text())
+    assert partial_validation["backend_partial_output"] is True
+    assert "SPIRULA_REPORTED_PARTIAL_OUTPUT" in partial_validation["warnings"]
+    assert (partial_attempt / "workspace/sparse/0/points3D.bin").is_file()
 
     # Deterministic pre-launch guards: unsupported flags, insufficient source
     # images, and insufficient free space fail before any backend PID is set.
@@ -511,6 +540,7 @@ def main() -> None:
                  "fresh_evaluation_human_gate": "PASS", "valid_stage_cache_reuse": "PASS",
                  "bounded_failure_persistence": "PASS", "unsupported_flag_guard": "PASS", "invalid_input_guard": "PASS",
                  "disk_shortage_guard": "PASS", "training_failure_preserves_sfm": "PASS", "missing_model_rejected": "PASS",
+                 "spirula_exit_3_partial_sfm_retained_and_review_gated": "PASS",
                  "corrupt_model_rejected": "PASS", "nonfinite_gaussian_attributes_rejected": "PASS", "smoke_model_rejected_for_public_selection": "PASS",
                  "explicit_candidate_handoff": "PASS; model-selection.json consumes registered artifact; navigation still blocks packaging",
                  "fresh_model_training_does_not_depend_on_navigation_review": "PASS; training/evaluation complete while viewer packaging remains blocked without navigation",

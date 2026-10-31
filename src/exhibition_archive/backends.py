@@ -813,7 +813,8 @@ def execute_process(
             log_path=log_path, elapsed_seconds=elapsed)
         raise BackendError(message, failure_kind="UNEXPECTED_EXCEPTION", details={"exit_code": returncode, "log_path": str(log_path)}) from exc
     elapsed = round(time.monotonic()-started, 2)
-    if returncode != 0:
+    partial_sfm_output = stage_id == "sfm" and returncode == 3
+    if returncode != 0 and not partial_sfm_output:
         cancelled = returncode in {-signal.SIGTERM, -signal.SIGKILL, 128+signal.SIGTERM, 128+signal.SIGINT}
         kind = "CANCELLED" if cancelled else "NONZERO_EXIT"
         terminal = "CANCELLED" if cancelled else "NONZERO_EXIT"
@@ -825,11 +826,13 @@ def execute_process(
         state.update_stage_execution(execution_id, details={"process_state": terminal, "ended_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "exit_code": returncode, "elapsed_seconds": elapsed, "checkpoint_candidates": checkpoints})
         raise BackendError(message, failure_kind=kind, details={"exit_code": returncode, "elapsed_seconds": elapsed, "pid": process.pid, "log_path": str(log_path)})
     checkpoints = discover_checkpoints(checkpoint_root) if checkpoint_root else []
-    finalize_attempt_record(log_path.parent, "SUCCEEDED", exit_code=returncode, pid=process.pid, log_path=log_path,
-        elapsed_seconds=elapsed, artifact_discovery_status="PENDING", validation_result={"status": "PENDING"},
-        details={"checkpoint_candidates": checkpoints})
-    state.update_stage_execution(execution_id, details={"process_state": "SUCCEEDED", "ended_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "exit_code": returncode, "elapsed_seconds": elapsed, "checkpoint_candidates": checkpoints})
-    return {"pid": process.pid, "exit_code": returncode, "elapsed_seconds": elapsed, "log_path": str(log_path.resolve()), "command": command, "workdir": str(cwd.resolve()), "progress": "UNKNOWN_NOT_REPORTED_BY_BACKEND"}
+    terminal_state = "PARTIAL_OUTPUT" if partial_sfm_output else "SUCCEEDED"
+    validation_status = "PENDING_PARTIAL_OUTPUT_VALIDATION" if partial_sfm_output else "PENDING"
+    finalize_attempt_record(log_path.parent, terminal_state, exit_code=returncode, pid=process.pid, log_path=log_path,
+        elapsed_seconds=elapsed, artifact_discovery_status="PENDING", validation_result={"status": validation_status},
+        details={"checkpoint_candidates": checkpoints, "backend_partial_output": partial_sfm_output})
+    state.update_stage_execution(execution_id, details={"process_state": terminal_state, "ended_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "exit_code": returncode, "elapsed_seconds": elapsed, "checkpoint_candidates": checkpoints, "backend_partial_output": partial_sfm_output})
+    return {"pid": process.pid, "exit_code": returncode, "elapsed_seconds": elapsed, "log_path": str(log_path.resolve()), "command": command, "workdir": str(cwd.resolve()), "progress": "UNKNOWN_NOT_REPORTED_BY_BACKEND", "partial_output": partial_sfm_output}
 
 
 def cancel_execution(execution: dict[str, Any], grace_seconds: float = 8.0) -> dict[str, Any]:
