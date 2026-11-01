@@ -10,7 +10,7 @@ from typing import Any
 
 from .adapters import colmap_binary_counts, ply_identity, read_json, sha256_file, validate_navigation, write_json
 from .navigation import generate_navigation, read_colmap_reconstruction, render_navigation_review_html
-from .backends import (BackendError, IMAGE_SUFFIXES, build_sfm_command, build_training_command,
+from .backends import (BackendError, CHECKPOINT_REPLACEMENT_OVERLAP_ASSUMPTION, IMAGE_SUFFIXES, build_sfm_command, build_training_command,
                        check_resources, create_attempt_dir, discover_checkpoints, discover_environment, discover_model_files,
                        execute_process, finalize_attempt_record, finalize_stage_attempt, image_inventory as backend_image_inventory, prepare_training_dataset,
                        validate_colmap_directory, validate_gaussian_ply)
@@ -147,20 +147,27 @@ def training_resume_identity(root: Path, config: dict, model_cfg: dict) -> tuple
                         "selection_semantics": "ADVISORY_MTIME; Spirula --resume selects its own latest checkpoint"}
 
 
-def validate_training_resource_policy(config: dict, model_cfg: dict) -> dict[str, int]:
+def validate_training_resource_policy(config: dict, model_cfg: dict) -> dict[str, Any]:
     policy = config.get("resource_policy", {})
     maximum = policy.get("max_training_iterations")
     timeout = model_cfg.get("timeout_seconds", policy.get("training_timeout_seconds"))
     minimum_disk = policy.get("minimum_free_disk_bytes_training")
     replacement_reserve = policy.get("checkpoint_replacement_reserve_bytes")
+    replacement_reserve_basis = policy.get("checkpoint_replacement_reserve_basis", "NOT_RECORDED")
     values = {"max_training_iterations": maximum, "training_timeout_seconds": timeout,
               "minimum_free_disk_bytes_training": minimum_disk,
               "checkpoint_replacement_reserve_bytes": replacement_reserve}
     if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in values.values()):
         raise WorkflowError("Fresh training requires positive max_training_iterations, training timeout, minimum_free_disk_bytes_training, and checkpoint_replacement_reserve_bytes")
+    if (not isinstance(replacement_reserve_basis, str) or
+            replacement_reserve_basis not in {"OPERATOR_PROVISIONED", "MEASURED", "NOT_RECORDED"}):
+        raise WorkflowError("resource_policy.checkpoint_replacement_reserve_basis must be OPERATOR_PROVISIONED, MEASURED, or NOT_RECORDED")
     if not isinstance(model_cfg.get("iterations"), int) or isinstance(model_cfg.get("iterations"), bool) or not 1 <= model_cfg["iterations"] <= maximum:
         raise WorkflowError("Fresh training iterations must be positive and at or below max_training_iterations")
-    return {key: int(value) for key, value in values.items()}
+    return {**{key: int(value) for key, value in values.items()},
+            "checkpoint_replacement_reserve_basis": replacement_reserve_basis,
+            "checkpoint_replacement_overlap_assumption": CHECKPOINT_REPLACEMENT_OVERLAP_ASSUMPTION,
+            "minimum_required_at_launch_bytes": int(minimum_disk) + int(replacement_reserve)}
 
 
 def fingerprint_file(state: ProjectState, path: Path, force: bool = False) -> dict:
@@ -363,7 +370,10 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
                   "max_training_iterations": config.get("resource_policy", {}).get("max_training_iterations"),
                   "iterations": cfg.get("iterations"),
                   "minimum_free_disk_bytes_training": training_limits["minimum_free_disk_bytes_training"],
-                  "checkpoint_replacement_reserve_bytes": training_limits["checkpoint_replacement_reserve_bytes"]}
+                  "checkpoint_replacement_reserve_bytes": training_limits["checkpoint_replacement_reserve_bytes"],
+                  "checkpoint_replacement_reserve_basis": training_limits["checkpoint_replacement_reserve_basis"],
+                  "checkpoint_replacement_overlap_assumption": training_limits["checkpoint_replacement_overlap_assumption"],
+                  "minimum_required_at_launch_bytes": training_limits["minimum_required_at_launch_bytes"]}
         quality_gates = {"sfm_quality_gate": input_cfg.get("quality_gate", {}), "training": cfg.get("quality_gate", {})}
         backend_capabilities = backend.get("training", {})
     gamut_error = image_gamut_mismatch(config, prep_manifest) if stage_id == "sfm" else None
@@ -419,6 +429,10 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
         "checkpoint_policy": ({"steps_per_save": cfg.get("steps_per_save", 100),
                                "save_only_latest_checkpoint": cfg.get("save_only_latest_checkpoint", True),
                                "save_full_checkpoint": cfg.get("save_full_checkpoint", True),
+                               "checkpoint_replacement_reserve_bytes": training_limits["checkpoint_replacement_reserve_bytes"],
+                               "checkpoint_replacement_reserve_basis": training_limits["checkpoint_replacement_reserve_basis"],
+                               "checkpoint_replacement_overlap_assumption": training_limits["checkpoint_replacement_overlap_assumption"],
+                               "minimum_required_at_launch_bytes": training_limits["minimum_required_at_launch_bytes"],
                                "retention_owner": "SPIRULA_BACKEND"} if stage_id == "training" else None),
         "resume_checkpoint_identity": resume_identity,
         "reuse": {"valid_cached_result": False, "policy": "valid cache is reused before authorization is checked"},
@@ -1041,6 +1055,10 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     checkpoint_policy = {"steps_per_save": cfg.get("steps_per_save", 100),
                          "save_only_latest_checkpoint": cfg.get("save_only_latest_checkpoint", True),
                          "save_full_checkpoint": cfg.get("save_full_checkpoint", True),
+                         "checkpoint_replacement_reserve_bytes": training_limits["checkpoint_replacement_reserve_bytes"],
+                         "checkpoint_replacement_reserve_basis": training_limits["checkpoint_replacement_reserve_basis"],
+                         "checkpoint_replacement_overlap_assumption": training_limits["checkpoint_replacement_overlap_assumption"],
+                         "minimum_required_at_launch_bytes": training_limits["minimum_required_at_launch_bytes"],
                          "retention_owner": "SPIRULA_BACKEND"}
     env_overrides = cfg.get("environment_overrides", {})
     if not isinstance(env_overrides, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env_overrides.items()):

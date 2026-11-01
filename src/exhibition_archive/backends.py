@@ -19,6 +19,7 @@ from .adapters import read_json, sha256_file, write_json
 
 IMAGE_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".heic", ".heif", ".bmp", ".avif"}
 RAW_IMAGE_SUFFIXES = {".dng", ".cr2", ".cr3", ".nef", ".arw", ".raf", ".rw2"}
+CHECKPOINT_REPLACEMENT_OVERLAP_ASSUMPTION = "OLD_AND_NEW_FULL_CHECKPOINTS_MAY_COEXIST"
 COLMAP_CAMERA_PARAMETER_COUNTS = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12, 7: 5, 8: 4, 9: 5, 10: 12, 11: 16}
 PLY_TYPES = {
     "char": ("b", 1), "int8": ("b", 1), "uchar": ("B", 1), "uint8": ("B", 1),
@@ -248,15 +249,21 @@ def check_resources(path: Path, policy: dict[str, Any], stage: str) -> dict[str,
         raise BackendError("Training disk floor and checkpoint replacement reserve must be integer byte counts", failure_kind="INVALID_CONFIGURATION")
     minimum = int(policy.get(stage_key, default_minimum))
     replacement_reserve = int(policy.get("checkpoint_replacement_reserve_bytes", 0)) if stage == "training" else 0
+    replacement_reserve_basis = policy.get("checkpoint_replacement_reserve_basis", "NOT_RECORDED") if stage == "training" else None
+    if stage == "training" and (not isinstance(replacement_reserve_basis, str) or
+                                 replacement_reserve_basis not in {"OPERATOR_PROVISIONED", "MEASURED", "NOT_RECORDED"}):
+        raise BackendError("resource_policy.checkpoint_replacement_reserve_basis must be OPERATOR_PROVISIONED, MEASURED, or NOT_RECORDED", failure_kind="INVALID_CONFIGURATION")
     if ((stage == "training" and (minimum < 1 or replacement_reserve < 1)) or
             (stage != "training" and minimum < 0)):
         raise BackendError("Training disk floor and checkpoint replacement reserve must both be positive", failure_kind="INVALID_CONFIGURATION")
     launch_minimum = minimum + replacement_reserve
     usage = shutil.disk_usage(path)
     if usage.free < launch_minimum:
-        raise BackendError(f"Insufficient free disk space for {stage}: {usage.free} bytes free, {launch_minimum} required", failure_kind="RESOURCE_LIMIT", details={"free_bytes": usage.free, "minimum_runtime_free_bytes": minimum, "checkpoint_replacement_reserve_bytes": replacement_reserve, "minimum_required_bytes": launch_minimum})
+        raise BackendError(f"Insufficient free disk space for {stage}: {usage.free} bytes free, {launch_minimum} required", failure_kind="RESOURCE_LIMIT", details={"free_bytes": usage.free, "minimum_runtime_free_bytes": minimum, "checkpoint_replacement_reserve_bytes": replacement_reserve, "checkpoint_replacement_reserve_basis": replacement_reserve_basis, "checkpoint_replacement_overlap_assumption": CHECKPOINT_REPLACEMENT_OVERLAP_ASSUMPTION, "minimum_required_bytes": launch_minimum, "minimum_required_at_launch_bytes": launch_minimum})
     return {"free_bytes_before": usage.free, "minimum_required_bytes": minimum,
             "checkpoint_replacement_reserve_bytes": replacement_reserve,
+            "checkpoint_replacement_reserve_basis": replacement_reserve_basis,
+            "checkpoint_replacement_overlap_assumption": CHECKPOINT_REPLACEMENT_OVERLAP_ASSUMPTION,
             "minimum_required_at_launch_bytes": launch_minimum,
             "filesystem_total_bytes": usage.total, "checked_path": str(path.resolve())}
 
@@ -583,6 +590,27 @@ def discover_checkpoints(root: Path) -> list[dict[str, Any]]:
     return rows
 
 
+def _checkpoint_recovery_report(before: list[dict[str, Any]], after: list[dict[str, Any]],
+                                stop_signal: str) -> dict[str, Any]:
+    """Report checkpoint candidates observed around a safe stop without claiming resume validity."""
+    before_identity = {(row["path"], row.get("size_bytes"), row.get("mtime_ns")) for row in before}
+    changed = [row for row in after
+               if (row["path"], row.get("size_bytes"), row.get("mtime_ns")) not in before_identity]
+    return {
+        "checkpoint_saved_during_stop": bool(changed),
+        "checkpoint_candidate_present_after_stop": bool(after),
+        "checkpoint_candidates_before_stop": before,
+        "checkpoint_candidates_after_stop": after,
+        "new_or_changed_checkpoint_candidates": changed,
+        "checkpoint_candidate_detection": "PATH_SIZE_MTIME_ONLY",
+        "resumable_checkpoint_saved": "UNKNOWN_NOT_VALIDATED",
+        "resumability_validation": "NOT_PERFORMED",
+        "candidate_validity": "UNKNOWN_AFTER_FORCE_KILL" if stop_signal.startswith("SIGKILL") else "NOT_BACKEND_VALIDATED",
+        "stop_signal": stop_signal,
+        "checkpoint_cleanup_performed": False,
+    }
+
+
 def finalize_attempt_record(
     attempt_dir: Path,
     terminal_state: str,
@@ -769,6 +797,8 @@ def execute_process(
                             f"{stage_id} stopped because free disk space fell below the configured safe floor ({free_bytes} < {minimum_free_disk_bytes} bytes)",
                             failure_kind="RESOURCE_LIMIT",
                             details={"free_bytes": free_bytes, "minimum_runtime_free_bytes": minimum_free_disk_bytes,
+                                     "runtime_disk_floor_exceeded": True,
+                                     "checkpoint_candidates_before_stop": checkpoints,
                                      "checkpoint_candidates_at_stop": checkpoints,
                                      "checkpoint_cleanup_performed": False, "stop_signal": "SIGTERM_THEN_SIGKILL_IF_NEEDED"})
                 if timeout_seconds and now-started > timeout_seconds:
@@ -817,14 +847,30 @@ def execute_process(
         raise BackendError("Execution cancelled by the operator", failure_kind="CANCELLED",
                            details={"pid": process.pid if process is not None else None, "exit_code": returncode, "log_path": str(log_path)}) from exc
     except BackendError as exc:
+        stop_signal = "PROCESS_NOT_LAUNCHED" if process is None else "PROCESS_ALREADY_EXITED"
         if process is not None and process.poll() is None:
-            try: os.killpg(process.pid, signal.SIGTERM)
-            except (ProcessLookupError, OSError): pass
+            try:
+                os.killpg(process.pid, signal.SIGTERM)
+                stop_signal = "SIGTERM_SENT"
+            except ProcessLookupError:
+                stop_signal = "PROCESS_EXITED_BEFORE_SIGTERM"
+            except OSError:
+                stop_signal = "SIGTERM_FAILED"
             try: process.wait(timeout=8)
             except subprocess.TimeoutExpired:
-                try: os.killpg(process.pid, signal.SIGKILL)
-                except (ProcessLookupError, OSError): pass
+                try:
+                    os.killpg(process.pid, signal.SIGKILL)
+                    stop_signal = "SIGKILL_AFTER_SIGTERM_TIMEOUT"
+                except ProcessLookupError:
+                    stop_signal = "PROCESS_EXITED_BEFORE_SIGKILL"
+                except OSError:
+                    stop_signal = "SIGKILL_FAILED_AFTER_SIGTERM_TIMEOUT"
                 process.wait()
+        if exc.details.get("runtime_disk_floor_exceeded") and checkpoint_root is not None:
+            checkpoints_before = exc.details.get("checkpoint_candidates_before_stop", [])
+            checkpoints_after = discover_checkpoints(checkpoint_root)
+            exc.details.update(_checkpoint_recovery_report(checkpoints_before, checkpoints_after, stop_signal))
+            exc.details["free_bytes_at_stop_request"] = exc.details.get("free_bytes")
         returncode = process.returncode if process is not None else returncode
         elapsed = round(time.monotonic()-started, 2)
         terminal = {"TIMEOUT": "TIMED_OUT", "CANCELLED": "CANCELLED", "PROCESS_LAUNCH_FAILED": "PROCESS_LAUNCH_FAILED"}.get(exc.failure_kind, "EXECUTION_FAILED")

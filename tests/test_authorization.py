@@ -34,7 +34,8 @@ def project_config(root: Path, *, smoke: bool = False) -> dict:
         "resource_policy": {"max_training_iterations": 1000, "sfm_timeout_seconds": 120,
                             "training_timeout_seconds": 300, "minimum_free_disk_bytes": 1,
                             "minimum_free_disk_bytes_training": 1,
-                            "checkpoint_replacement_reserve_bytes": 1},
+                            "checkpoint_replacement_reserve_bytes": 8 * 1024**3,
+                            "checkpoint_replacement_reserve_basis": "OPERATOR_PROVISIONED"},
         **({"diagnostic_policy": {"mode": "SMOKE_TEST_ONLY"}} if smoke else {}),
     }
 
@@ -84,6 +85,14 @@ class AuthorizationTests(unittest.TestCase):
                         "acceptance": None, "acceptance_required": False, "conditional_scope": False}
         with patch("exhibition_archive.sfm_review.training_component_scope", return_value=scoped_input):
             training = self.plan("training")
+            self.assertEqual(training["resource_limits"]["checkpoint_replacement_reserve_basis"], "OPERATOR_PROVISIONED")
+            self.assertEqual(training["resource_limits"]["minimum_required_at_launch_bytes"], 1 + 8 * 1024**3)
+            self.assertEqual(training["checkpoint_policy"]["checkpoint_replacement_overlap_assumption"],
+                             "OLD_AND_NEW_FULL_CHECKPOINTS_MAY_COEXIST")
+            self.config["resource_policy"]["checkpoint_replacement_reserve_basis"] = "MEASURED"
+            reclassified_training = self.plan("training")
+            self.assertNotEqual(training["plan_id"], reclassified_training["plan_id"])
+            self.config["resource_policy"]["checkpoint_replacement_reserve_basis"] = "OPERATOR_PROVISIONED"
             self.config["integrations"]["model"]["iterations"] = 200
             changed_training = self.plan("training")
         self.assertNotEqual(training["plan_id"], changed_training["plan_id"])

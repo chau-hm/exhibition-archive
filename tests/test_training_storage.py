@@ -6,6 +6,7 @@ import json
 import sqlite3
 import sys
 import tempfile
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import patch
@@ -114,7 +115,8 @@ class TrainingCheckpointTests(unittest.TestCase):
             path = Path(temp)
             usage = shutil._ntuple_diskusage(total=1000, used=800, free=200)
             policy = {"minimum_free_disk_bytes_training": 100,
-                      "checkpoint_replacement_reserve_bytes": 101}
+                      "checkpoint_replacement_reserve_bytes": 101,
+                      "checkpoint_replacement_reserve_basis": "OPERATOR_PROVISIONED"}
             with patch("exhibition_archive.backends.shutil.disk_usage", return_value=usage):
                 with self.assertRaises(BackendError) as caught:
                     check_resources(path, policy, "training")
@@ -126,6 +128,9 @@ class TrainingCheckpointTests(unittest.TestCase):
                 checked = check_resources(path, policy, "training")
             self.assertEqual(checked["minimum_required_at_launch_bytes"], 201)
             self.assertEqual(checked["minimum_required_bytes"], 100)
+            self.assertEqual(checked["checkpoint_replacement_reserve_basis"], "OPERATOR_PROVISIONED")
+            self.assertEqual(checked["checkpoint_replacement_overlap_assumption"],
+                             "OLD_AND_NEW_FULL_CHECKPOINTS_MAY_COEXIST")
 
     def test_runtime_low_disk_safe_stops_without_deleting_recovery_checkpoint(self):
         with tempfile.TemporaryDirectory() as temp:
@@ -145,8 +150,60 @@ class TrainingCheckpointTests(unittest.TestCase):
                                     checkpoint_root=output, minimum_free_disk_bytes=100)
             self.assertEqual(caught.exception.failure_kind, "RESOURCE_LIMIT")
             self.assertFalse(caught.exception.details["checkpoint_cleanup_performed"])
+            self.assertFalse(caught.exception.details["checkpoint_saved_during_stop"])
+            self.assertTrue(caught.exception.details["checkpoint_candidate_present_after_stop"])
+            self.assertEqual(caught.exception.details["resumability_validation"], "NOT_PERFORMED")
             self.assertTrue(checkpoint.is_file())
-            self.assertEqual(read_json(attempt / "command.json")["error_classification"], "RESOURCE_LIMIT")
+            record = read_json(attempt / "command.json")
+            self.assertEqual(record["error_classification"], "RESOURCE_LIMIT")
+            self.assertFalse(record["terminal_details"]["checkpoint_saved_during_stop"])
+
+    def test_runtime_disk_stop_reports_checkpoint_written_during_sigterm_shutdown(self):
+        with tempfile.TemporaryDirectory() as temp:
+            attempt = Path(temp) / "attempt"
+            output = attempt / "outputs"
+            output.mkdir(parents=True)
+            ready = attempt / "backend-ready"
+            checkpoint = output / "run" / "checkpoint-5000.pth"
+            write_json(attempt / "command.json", {"stage": "training"})
+            log_path = attempt / "spirula.log"
+            usage = shutil._ntuple_diskusage(total=1000, used=950, free=50)
+            script = (
+                "import pathlib, signal, sys, time\n"
+                "ready, checkpoint = pathlib.Path(sys.argv[1]), pathlib.Path(sys.argv[2])\n"
+                "def save_then_exit(_signal, _frame):\n"
+                "    checkpoint.parent.mkdir(parents=True, exist_ok=True)\n"
+                "    checkpoint.write_bytes(b'checkpoint-saved-on-stop')\n"
+                "    raise SystemExit(0)\n"
+                "signal.signal(signal.SIGTERM, save_then_exit)\n"
+                "ready.write_text('ready')\n"
+                "time.sleep(10)\n"
+            )
+
+            def low_disk_after_handler_ready(_path):
+                deadline = time.monotonic() + 3
+                while not ready.exists() and time.monotonic() < deadline:
+                    time.sleep(0.01)
+                return usage
+
+            with patch("exhibition_archive.backends.shutil.disk_usage", side_effect=low_disk_after_handler_ready):
+                with self.assertRaises(BackendError) as caught:
+                    execute_process(_StateStub(), 2, "training",
+                                    [sys.executable, "-c", script, str(ready), str(checkpoint)],
+                                    attempt, log_path, timeout_seconds=20, poll_interval=0.1,
+                                    checkpoint_root=output, minimum_free_disk_bytes=100)
+
+            details = caught.exception.details
+            self.assertEqual(details["stop_signal"], "SIGTERM_SENT")
+            self.assertTrue(details["checkpoint_saved_during_stop"])
+            self.assertTrue(details["checkpoint_candidate_present_after_stop"])
+            self.assertEqual(details["resumable_checkpoint_saved"], "UNKNOWN_NOT_VALIDATED")
+            self.assertEqual(details["resumability_validation"], "NOT_PERFORMED")
+            self.assertEqual(details["candidate_validity"], "NOT_BACKEND_VALIDATED")
+            self.assertEqual(checkpoint.read_bytes(), b"checkpoint-saved-on-stop")
+            record = read_json(attempt / "command.json")
+            self.assertTrue(record["terminal_details"]["checkpoint_saved_during_stop"])
+            self.assertFalse(record["terminal_details"]["checkpoint_cleanup_performed"])
 
 
 class StorageReportTests(unittest.TestCase):

@@ -30,7 +30,7 @@ The installed console script can be run from any working directory. The reposito
 
 Copy examples/fresh-run.project.example.json to a project-specific location, then edit its values. Paths in project manifests are interpreted relative to the project workspace unless they are absolute. Keep original photos read-only and store workflow SQLite state, logs, intermediate outputs, and website output in an external workspace.
 
-The example is intentionally not ready for fresh training. Before planning or authorizing training, measure the target backend's checkpoint replacement requirement and set a positive `resource_policy.checkpoint_replacement_reserve_bytes`; the Engine blocks training plans when this measurement is missing.
+The example is intentionally not ready for fresh training. Before planning or authorizing training, set positive `minimum_free_disk_bytes_training` and `checkpoint_replacement_reserve_bytes` values. The replacement reserve is explicit operator-provisioned headroom or a measured value; a previous checkpoint measurement is not required. Record its source with `checkpoint_replacement_reserve_basis` (`OPERATOR_PROVISIONED` or `MEASURED`). At launch the Engine requires the runtime free-disk floor plus this reserve to allow the old and new full checkpoints to coexist temporarily. The reserve is a safety budget, not a checkpoint-size prediction.
 
 ~~~bash
 "$EXHIBITION_ARCHIVE_ENGINE" init --config /data/gallery/project.json --workspace /data/gallery/workspace
