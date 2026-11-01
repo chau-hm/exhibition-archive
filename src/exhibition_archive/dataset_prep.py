@@ -1113,6 +1113,43 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
     if not contains_heif(input_dir):
         return _write_not_required(root, config, "NO_CONVERSION_REQUIRED", input_dir, source_inventory)
 
+    manifest_path = preparation_manifest_path(root)
+    if manifest_path.exists():
+        try:
+            existing_manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError) as exc:
+            raise BackendError("Existing preparation manifest is unreadable; refusing implicit replacement",
+                               failure_kind="STALE_DATASET_PREPARATION") from exc
+        expected_schema = preparation_schema_for(preparation_settings_for(config))
+        supported_schemas = {PREP_SCHEMA, SRGB_PREP_SCHEMA, "exhibition-archive.spirula-image-dataset.v1"}
+        if existing_manifest.get("status") == "PREPARED" and existing_manifest.get("schema_version") not in supported_schemas:
+            raise BackendError("Existing preparation manifest has an unsupported schema; refusing implicit replacement",
+                               failure_kind="STALE_DATASET_PREPARATION")
+        if existing_manifest.get("status") == "PREPARED" and existing_manifest.get("schema_version") == expected_schema:
+            previous_settings = existing_manifest.get("preparation_settings")
+            current_settings = preparation_settings_for(config)
+            if not isinstance(previous_settings, dict):
+                raise BackendError("Existing preparation manifest lacks its recorded settings; refusing implicit replacement",
+                                   failure_kind="STALE_DATASET_PREPARATION")
+            if previous_settings == current_settings:
+                # The historical manifest remains authoritative when its
+                # current source and derived bytes still verify. A converter
+                # identity upgrade alone must not generate replacement files.
+                dataset, manifest = effective_sfm_dataset(root, config, validate_files=True)
+                if not manifest:
+                    raise BackendError("Existing preparation manifest did not resolve to a verified HEIC dataset",
+                                       failure_kind="STALE_DATASET_PREPARATION")
+                mappings = manifest.get("image_mappings", [])
+                return {"status": "COMPLETED", "manifest_path": manifest_path,
+                        "effective_image_directory": dataset,
+                        "details": {"conversion_required": True, "cache_reused": True,
+                                    "source_image_count": manifest.get("image_count", len(mappings)),
+                                    "converted_heif_count": manifest.get("converted_heif_count", 0),
+                                    "copied_unchanged_count": manifest.get("copied_unchanged_count", 0),
+                                    "manifest_path": str(manifest_path.resolve()),
+                                    "preparation_fingerprint": manifest.get("preparation_fingerprint"),
+                                    "converter": manifest.get("conversion", {}).get("backend")}}
+
     source_root = _project_path(root, config["source"]["photo_directory"])
     if input_dir != source_root and source_root not in input_dir.parents:
         raise BackendError("HEIC sources selected for fresh SfM are outside the registered source inventory", failure_kind="INVALID_INPUT")
@@ -1137,7 +1174,6 @@ def prepare_spirula_dataset(root: Path, config: dict[str, Any],
     managed_root.mkdir(parents=True, exist_ok=True)
     dataset = managed_root / preparation_id
     cached = _prepared_dataset_valid(dataset, preparation_id, records, preparation_basis, settings)
-    manifest_path = preparation_manifest_path(root)
     if cached:
         current_manifest = dict(cached)
         current_manifest["effective_image_directory"] = str(dataset.resolve())

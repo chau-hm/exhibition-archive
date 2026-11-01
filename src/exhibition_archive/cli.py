@@ -15,7 +15,7 @@ from . import __version__
 from .adapters import read_json, write_json
 from .state import ProjectState, utc_now
 from .workflow import (STAGES, WorkflowError, expensive_execution_plan, load_project, output_path,
-                       plan, project_path, run_workflow, stage_fingerprint)
+                       plan, project_path, reconcile_interrupted_execution, run_workflow, stage_fingerprint)
 from .navigation import approve_navigation_artifact, validate_navigation_artifact
 from .adapters import sha256_file, validate_navigation
 
@@ -218,6 +218,24 @@ def cmd_status(args) -> int:
                           "website": str(out / "website"), "archive": str(out / "archive"),
                           "next_action": next((json.loads(v.get("details_json") or "{}").get("reason") for k, v in stages.items()
                                                if v.get("status") == "BLOCKED"), None)}, indent=2))
+        return 0
+    finally:
+        state.close()
+
+
+def cmd_reconcile_interrupted(args) -> int:
+    root, config = load_project(args.project)
+    state = ProjectState(root)
+    try:
+        result = reconcile_interrupted_execution(
+            root, config, state,
+            run_id=args.run_id,
+            execution_id=args.execution_id,
+            exit_code=args.exit_code,
+            evidence=args.evidence,
+            confirm_no_active_processes=args.confirm_no_active_processes,
+        )
+        print(json.dumps(result, indent=2))
         return 0
     finally:
         state.close()
@@ -648,6 +666,15 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true")
     p.add_argument("--authorization-id", action="append", default=[], help="One-time grant returned by authorize; repeat for separately approved stages")
     p.set_defaults(func=cmd_run, resume=True)
+    p = sub.add_parser("reconcile-interrupted", help="Reconcile one confirmed interrupted HEIC preparation without retrying it")
+    p.add_argument("project")
+    p.add_argument("--run-id", type=int, required=True)
+    p.add_argument("--execution-id", type=int, required=True)
+    p.add_argument("--exit-code", type=int, required=True, help="Recorded nonzero exit code from the interrupted Engine process")
+    p.add_argument("--evidence", required=True, help="Process-inactivity check and interruption evidence to retain in history")
+    p.add_argument("--confirm-no-active-processes", action="store_true", required=True,
+                   help="Confirm no Engine, backend, or preparation-helper process remains active")
+    p.set_defaults(func=cmd_reconcile_interrupted)
     p = sub.add_parser("status", help="Inspect durable workflow state and resume eligibility")
     p.add_argument("project"); p.set_defaults(func=cmd_status)
     p = sub.add_parser("storage-report", help="Measure project storage classes and list non-destructive cleanup candidates")

@@ -45,6 +45,21 @@ class CliSmokeTests(unittest.TestCase):
         )
         self.assertIn("usage: exhibition-archive storage-report", result.stdout)
 
+    def test_interrupted_execution_reconciliation_requires_explicit_process_confirmation(self):
+        result = subprocess.run(
+            [str(LAUNCHER), "reconcile-interrupted", "--help"],
+            cwd="/private/tmp",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+        self.assertIn("--run-id", result.stdout)
+        self.assertIn("--execution-id", result.stdout)
+        self.assertIn("--exit-code", result.stdout)
+        self.assertIn("--evidence", result.stdout)
+        self.assertIn("--confirm-no-active-processes", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

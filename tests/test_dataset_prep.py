@@ -11,11 +11,13 @@ from pathlib import Path
 from unittest.mock import patch
 
 from exhibition_archive import dataset_prep
+from exhibition_archive import workflow
 from exhibition_archive.adapters import sha256_file, write_json
 from exhibition_archive.backends import BackendError
 from exhibition_archive.state import ProjectState
 from exhibition_archive.workflow import (_validate_read_only_image_scope,
-                                         expensive_execution_plan, run_workflow, stage_fingerprint)
+                                         WorkflowError, expensive_execution_plan, reconcile_interrupted_execution,
+                                         run_workflow, stage_fingerprint)
 
 
 BACKEND = {
@@ -423,37 +425,20 @@ class DatasetPreparationTests(unittest.TestCase):
                  patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
                 _validate_read_only_image_scope(self.root, self.config, first["effective_image_directory"])
                 first_plan = expensive_execution_plan(self.root, self.config, state, "sfm", backend_info=BACKEND)
+            self.assertTrue(first_plan["plan_id"])
 
             heic.write_bytes(b"heic-original-v2")
             inventory = write_inventory(self.root, self.photos)
-            second = self.prepare_with_test_converter(inventory)
-            self.assertNotEqual(first["details"]["preparation_fingerprint"], second["details"]["preparation_fingerprint"])
             with patch.object(dataset_prep, "heif_converter_identity", return_value=FAKE_CONVERTER), \
+                 patch.object(dataset_prep, "_run_heif_convert_batch",
+                              side_effect=AssertionError("stale derivatives must not be replaced implicitly")), \
                  patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
-                second_plan = expensive_execution_plan(self.root, self.config, state, "sfm", backend_info=BACKEND)
-            self.assertNotEqual(first_plan["plan_id"], second_plan["plan_id"])
-            self.assertEqual(second_plan["input_dataset"], str(second["effective_image_directory"]))
-            self.assertEqual(second_plan["input_dataset_provenance"]["kind"], "ENGINE_VERIFIED_HEIC_JPEG_DERIVATIVES")
-            self.assertEqual(second_plan["normalized_command"][3], str(second["effective_image_directory"]))
-            with patch.object(dataset_prep, "heif_converter_identity", return_value=FAKE_CONVERTER), \
-                 patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
-                effective_training = dataset_prep.effective_training_dataset(self.root, self.config)[0]
-            self.assertEqual(effective_training, second["effective_image_directory"])
-            self.config["integrations"]["model"]["image_directory"] = str(self.root / "different-training-images")
-            with patch.object(dataset_prep, "heif_converter_identity", return_value=FAKE_CONVERTER), \
-                 patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
-                with self.assertRaises(BackendError):
+                with self.assertRaisesRegex(BackendError, "Registered source image changed"):
+                    dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
+                with self.assertRaisesRegex(BackendError, "Registered source image changed"):
+                    expensive_execution_plan(self.root, self.config, state, "sfm", backend_info=BACKEND)
+                with self.assertRaisesRegex(BackendError, "Registered source image changed"):
                     dataset_prep.effective_training_dataset(self.root, self.config)
-
-            changed_settings = {**dataset_prep.PREP_SETTINGS, "test_conversion_revision": 2}
-            with patch.object(dataset_prep, "PREP_SETTINGS", changed_settings), \
-                 patch.object(dataset_prep, "heif_converter_identity", return_value=FAKE_CONVERTER), \
-                 patch.object(dataset_prep, "_run_heif_convert_batch", side_effect=fake_batch), \
-                 patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
-                third = dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
-                third_plan = expensive_execution_plan(self.root, self.config, state, "sfm", backend_info=BACKEND)
-            self.assertNotEqual(second["details"]["preparation_fingerprint"], third["details"]["preparation_fingerprint"])
-            self.assertNotEqual(second_plan["plan_id"], third_plan["plan_id"])
         finally:
             state.close()
 
@@ -473,11 +458,18 @@ class DatasetPreparationTests(unittest.TestCase):
                            "pixel_validator": {"name": "Pillow", "version": "newer Pillow"},
                            "color_management": {"engine": "LittleCMS", "version": "newer LittleCMS",
                                                 "target_srgb_icc_sha256": "a" * 64}}
+        manifest_path = Path(prepared["manifest_path"])
+        manifest_hash = sha256_file(manifest_path)
         with patch.object(dataset_prep, "heif_converter_identity", return_value=newer_toolchain) as current_identity, \
+             patch.object(dataset_prep, "_run_heif_convert_batch", side_effect=AssertionError("valid historical data must not be regenerated")), \
              patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
             effective, manifest = dataset_prep.effective_sfm_dataset(self.root, self.config)
+            reused = dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
         self.assertEqual(effective, dataset)
         self.assertEqual(manifest["preparation_basis"]["converter"], historical_converter)
+        self.assertTrue(reused["details"]["cache_reused"])
+        self.assertEqual(reused["effective_image_directory"], dataset)
+        self.assertEqual(sha256_file(manifest_path), manifest_hash)
         current_identity.assert_not_called()
 
         state = ProjectState(self.root)
@@ -497,9 +489,12 @@ class DatasetPreparationTests(unittest.TestCase):
         derived = next(path for path in dataset.rglob("*.jpg") if path.is_file())
         derived.write_bytes(derived.read_bytes() + b"changed")
         with patch.object(dataset_prep, "heif_converter_identity", return_value=newer_toolchain) as current_identity, \
+             patch.object(dataset_prep, "_run_heif_convert_batch", side_effect=AssertionError("stale data must fail closed")), \
              patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
             with self.assertRaisesRegex(BackendError, "changed after verification"):
                 dataset_prep.effective_sfm_dataset(self.root, self.config)
+            with self.assertRaisesRegex(BackendError, "changed after verification"):
+                dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
         current_identity.assert_not_called()
 
     def test_failed_conversion_discards_staging_and_preserves_originals(self):
@@ -546,6 +541,200 @@ class DatasetPreparationTests(unittest.TestCase):
             self.assertEqual(state.stage("sfm")["status"], "BLOCKED")
             self.assertEqual(state.db.execute("SELECT COUNT(*) FROM stage_executions WHERE stage_id='sfm'").fetchone()[0], 0)
             self.assertEqual(state.db.execute("SELECT COUNT(*) FROM stage_executions WHERE stage_id='training'").fetchone()[0], 0)
+        finally:
+            state.close()
+
+    def test_workflow_reuses_historical_preparation_and_retains_accepted_sfm(self):
+        workflow_converter = patch("exhibition_archive.workflow.heif_converter_identity",
+                                   return_value=FAKE_CONVERTER)
+        workflow_converter.start()
+        self.addCleanup(workflow_converter.stop)
+        (self.photos / "one.heic").write_bytes(b"heic-one")
+        (self.photos / "two.heic").write_bytes(b"heic-two")
+        state = ProjectState(self.root)
+        current_plan = {"plan_id": "fixture-training-plan", "backend": {},
+                        "input_dataset": "managed-verified-data", "source_image_count": 2,
+                        "resource_limits": {}}
+        try:
+            with patch.object(dataset_prep, "heif_converter_identity", return_value=FAKE_CONVERTER), \
+                 patch.object(dataset_prep, "_run_heif_convert_batch", side_effect=fake_batch), \
+                 patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)), \
+                 patch("exhibition_archive.workflow.expensive_execution_plan", return_value=current_plan), \
+                 patch("exhibition_archive.workflow.execute_fresh_sfm", side_effect=AssertionError("SfM must not execute")), \
+                 patch("exhibition_archive.workflow.execute_fresh_training", side_effect=AssertionError("training must not execute")):
+                first = run_workflow(self.root, self.config, state)
+            self.assertEqual(first["status"], "AUTHORIZATION_REQUIRED")
+            self.assertEqual(state.stage("sfm_dataset_prep")["status"], "COMPLETED")
+            prep = state.stage("sfm_dataset_prep")
+            self.assertTrue(workflow._stage_artifacts_valid(state, "sfm_dataset_prep", self.root / "output" / "work"))
+            historical_fp = "historical-preparation-toolchain-fingerprint"
+            state.set_stage("sfm_dataset_prep", "COMPLETED", historical_fp, prep["output_digest"],
+                            prep["last_execution_id"], json.loads(prep["details_json"]))
+
+            sfm_fp = stage_fingerprint(self.root, self.config, state, "sfm", full_hash=True)
+            accepted_run = state.start_run("fixture-accepted-sfm")
+            sfm_execution = state.start_stage(accepted_run, "sfm", sfm_fp, False, {"fixture": True})
+            state.finish_stage(sfm_execution, "NEEDS_REVIEW", "fixture-component-output", {"fixture": True})
+            state.set_stage("sfm", "NEEDS_REVIEW", sfm_fp, "fixture-component-output", sfm_execution,
+                            {"fixture": True})
+            state.end_run(accepted_run, "NEEDS_REVIEW", {"fixture": True})
+
+            newer_toolchain = {**FAKE_CONVERTER, "version": "libheif test 2",
+                               "pixel_validator": {"name": "Pillow", "version": "newer Pillow"}}
+            with patch.object(dataset_prep, "heif_converter_identity", return_value=newer_toolchain) as current_identity, \
+                 patch.object(dataset_prep, "_run_heif_convert_batch", side_effect=AssertionError("historical derivatives must not be regenerated")), \
+                 patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)), \
+                 patch("exhibition_archive.sfm_review.training_acceptance_for_run",
+                       return_value={"conditional_scope": True}), \
+                 patch("exhibition_archive.workflow.expensive_execution_plan", return_value=current_plan), \
+                 patch("exhibition_archive.workflow.execute_fresh_sfm", side_effect=AssertionError("accepted SfM must not rerun")), \
+                 patch("exhibition_archive.workflow.execute_fresh_training", side_effect=AssertionError("training requires a new grant")):
+                second = run_workflow(self.root, self.config, state, resume=True)
+            current_identity.assert_not_called()
+            self.assertEqual(second["status"], "AUTHORIZATION_REQUIRED")
+            self.assertEqual(second["stages"]["sfm_dataset_prep"], "SKIPPED_VALID_CACHE")
+            self.assertEqual(second["stages"]["sfm"], "RETAINED_NEEDS_REVIEW_WITH_TRAINING_SCOPE")
+            self.assertEqual(second["blocked"][0]["stage"], "training")
+            self.assertEqual(state.stage("sfm_dataset_prep")["input_fingerprint"], historical_fp)
+            self.assertEqual(state.db.execute(
+                "SELECT COUNT(*) FROM stage_executions WHERE stage_id='sfm_dataset_prep'"
+            ).fetchone()[0], 1)
+            self.assertEqual(state.db.execute(
+                "SELECT COUNT(*) FROM stage_executions WHERE stage_id='sfm'"
+            ).fetchone()[0], 1)
+            self.assertEqual(state.db.execute(
+                "SELECT COUNT(*) FROM stage_executions WHERE stage_id='training'"
+            ).fetchone()[0], 0)
+        finally:
+            state.close()
+
+    def test_keyboard_interrupt_records_interrupted_execution_and_run(self):
+        workflow_converter = patch("exhibition_archive.workflow.heif_converter_identity",
+                                   return_value=FAKE_CONVERTER)
+        workflow_converter.start()
+        self.addCleanup(workflow_converter.stop)
+        (self.photos / "one.heic").write_bytes(b"heic-one")
+        state = ProjectState(self.root)
+        original_execute_stage = workflow._execute_stage
+
+        def interrupt_preparation(root, config, state, stage_id, *args, **kwargs):
+            if stage_id == "sfm_dataset_prep":
+                raise KeyboardInterrupt
+            return original_execute_stage(root, config, state, stage_id, *args, **kwargs)
+
+        try:
+            with patch.object(workflow, "_execute_stage", side_effect=interrupt_preparation), \
+                 self.assertRaises(KeyboardInterrupt):
+                run_workflow(self.root, self.config, state)
+            run = state.db.execute("SELECT * FROM workflow_runs ORDER BY run_id DESC LIMIT 1").fetchone()
+            execution = state.db.execute(
+                "SELECT * FROM stage_executions WHERE stage_id='sfm_dataset_prep' ORDER BY execution_id DESC LIMIT 1"
+            ).fetchone()
+            details = json.loads(execution["details_json"])
+            self.assertEqual(run["status"], "INTERRUPTED")
+            self.assertEqual(execution["status"], "INTERRUPTED")
+            self.assertEqual(details["exit_code"], 130)
+            self.assertEqual(details["process_state"], "INTERRUPTED")
+            self.assertEqual(state.stage("sfm_dataset_prep")["status"], "FAILED")
+            self.assertEqual(state.db.execute(
+                "SELECT COUNT(*) FROM stage_executions WHERE stage_id IN ('sfm','training')"
+            ).fetchone()[0], 0)
+        finally:
+            state.close()
+
+    def test_reconcile_interrupted_preparation_restores_only_verified_history(self):
+        heic = self.photos / "one.heic"
+        heic.write_bytes(b"heic-one")
+        inventory = write_inventory(self.root, self.photos)
+        prepared = self.prepare_with_test_converter(inventory)
+        manifest_path = Path(prepared["manifest_path"]).resolve()
+        state = ProjectState(self.root)
+        try:
+            prior_run = state.start_run("fixture-preparation")
+            prior_execution = state.start_stage(prior_run, "sfm_dataset_prep", "historical-fingerprint", False, {})
+            artifact_hash = sha256_file(manifest_path)
+            digest = workflow.json_digest([{"path": str(manifest_path),
+                                            "sha256": artifact_hash}])
+            artifact_details = {"status": "COMPLETED", "details": prepared["details"],
+                                "artifacts": [str(manifest_path)]}
+            state.add_artifact("sfm_dataset_prep", manifest_path, "json", artifact_hash,
+                               manifest_path.stat().st_size, {"fixture": True})
+            state.finish_stage(prior_execution, "COMPLETED", digest, artifact_details)
+            state.set_stage("sfm_dataset_prep", "COMPLETED", "historical-fingerprint", digest,
+                            prior_execution, prepared["details"])
+            state.end_run(prior_run, "COMPLETED", {"fixture": True})
+
+            resume_run = state.start_run("resume")
+            interrupted_execution = state.start_stage(resume_run, "sfm_dataset_prep", "new-engine-fingerprint",
+                                                       False, {"stage_contract": {"id": "sfm_dataset_prep"}})
+            state.set_stage("sfm_dataset_prep", "RUNNING", "new-engine-fingerprint", None,
+                            interrupted_execution, {"resume": True})
+            state.create_execution_authorization("fixture-training-grant", self.config["project_id"],
+                                                 "training", "fixture-plan", {"plan_id": "fixture-plan"},
+                                                 "fixture reviewer", "preserve in recovery fixture",
+                                                 "2099-01-01T00:00:00Z")
+            auth_before = state.execution_authorization("fixture-training-grant")
+            state.record_review_decision(
+                "sfm-component-acceptance:0", "ACCEPTED_FOR_EXPERIMENTAL_TRAINING", required=True,
+                reviewer="fixture reviewer", decision="ACCEPT_EXPERIMENTAL_TRAINING",
+                payload={"decision": "ACCEPT_EXPERIMENTAL_TRAINING", "fixture": True},
+            )
+            review_before = dict(state.db.execute(
+                "SELECT * FROM review_gates WHERE gate_id='sfm-component-acceptance:0'"
+            ).fetchone())
+            review_history_before = state.db.execute(
+                "SELECT COUNT(*) FROM review_history WHERE gate_id='sfm-component-acceptance:0'"
+            ).fetchone()[0]
+
+            before = state.db.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0]
+            with self.assertRaisesRegex(WorkflowError, "Local stage execution is still recorded as RUNNING"):
+                run_workflow(self.root, self.config, state, resume=True)
+            self.assertEqual(state.db.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0], before)
+            self.assertEqual(state.execution(interrupted_execution)["status"], "RUNNING")
+            with self.assertRaisesRegex(WorkflowError, "Confirm that no Engine"):
+                reconcile_interrupted_execution(
+                    self.root, self.config, state, run_id=resume_run,
+                    execution_id=interrupted_execution, exit_code=130,
+                    evidence="fixture process check", confirm_no_active_processes=False,
+                )
+            self.assertEqual(state.db.execute("SELECT COUNT(*) FROM workflow_runs").fetchone()[0], before)
+            with state.lock():
+                with self.assertRaisesRegex(WorkflowError, "lock is held"):
+                    reconcile_interrupted_execution(
+                        self.root, self.config, state, run_id=resume_run,
+                        execution_id=interrupted_execution, exit_code=130,
+                        evidence="fixture process check", confirm_no_active_processes=True,
+                    )
+
+            result = reconcile_interrupted_execution(
+                self.root, self.config, state, run_id=resume_run,
+                execution_id=interrupted_execution, exit_code=130,
+                evidence="pgrep found no Engine/backend/preparation helper; parent exited with code 130",
+                confirm_no_active_processes=True,
+            )
+            reconciled = state.execution(interrupted_execution)
+            details = json.loads(reconciled["details_json"])
+            self.assertEqual(result["status"], "RECONCILED_INTERRUPTED")
+            self.assertEqual(result["stage_status"], "COMPLETED")
+            self.assertEqual(result["restored_validated_execution_id"], prior_execution)
+            self.assertEqual(reconciled["status"], "INTERRUPTED")
+            self.assertEqual(details["exit_code"], 130)
+            self.assertIn("pgrep found no Engine", details["interruption_evidence"])
+            self.assertEqual(state.stage("sfm_dataset_prep")["last_execution_id"], prior_execution)
+            self.assertEqual(state.stage("sfm_dataset_prep")["status"], "COMPLETED")
+            self.assertEqual(state.db.execute(
+                "SELECT status FROM workflow_runs WHERE run_id=?", (resume_run,)
+            ).fetchone()[0], "INTERRUPTED")
+            self.assertEqual(state.execution_authorization("fixture-training-grant"), auth_before)
+            self.assertEqual(dict(state.db.execute(
+                "SELECT * FROM review_gates WHERE gate_id='sfm-component-acceptance:0'"
+            ).fetchone()), review_before)
+            self.assertEqual(state.db.execute(
+                "SELECT COUNT(*) FROM review_history WHERE gate_id='sfm-component-acceptance:0'"
+            ).fetchone()[0], review_history_before)
+            self.assertEqual(state.db.execute(
+                "SELECT COUNT(*) FROM stage_executions WHERE run_id=?", (resume_run,)
+            ).fetchone()[0], 1)
         finally:
             state.close()
 

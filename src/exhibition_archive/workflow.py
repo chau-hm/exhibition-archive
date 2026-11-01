@@ -13,6 +13,7 @@ from .navigation import generate_navigation, read_colmap_reconstruction, render_
 from .backends import (BackendError, CHECKPOINT_REPLACEMENT_OVERLAP_ASSUMPTION, IMAGE_SUFFIXES, build_sfm_command, build_training_command,
                        check_resources, create_attempt_dir, discover_checkpoints, discover_environment, discover_model_files,
                        execute_process, finalize_attempt_record, finalize_stage_attempt, image_inventory as backend_image_inventory, prepare_training_dataset,
+                       process_alive,
                        validate_colmap_directory, validate_gaussian_ply)
 from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_preparation_required,
                            contains_heif, heif_converter_identity,
@@ -1202,22 +1203,212 @@ def fresh_evaluation_stage(root: Path, config: dict, state: ProjectState, output
     return {"status": report_status, "artifacts": artifacts, "details": report}
 
 
+def _stage_execution_artifacts_valid(root: Path, config: dict, state: ProjectState, stage_id: str,
+                                     execution: dict, *, expected_output_digest: str | None = None) -> bool:
+    """Validate one historical execution's artifact records without trusting its current stage pointer."""
+    if execution.get("status") not in {"COMPLETED", "ADOPTED"}:
+        return False
+    output_digest = execution.get("output_digest")
+    if not output_digest or (expected_output_digest is not None and output_digest != expected_output_digest):
+        return False
+    try:
+        details = json.loads(execution.get("details_json") or "{}")
+        paths = [Path(value).resolve() for value in details.get("artifacts", [])]
+        if not paths or not all(path.is_file() for path in paths):
+            return False
+        relative_digest_rows = []
+        absolute_digest_rows = []
+        for path in paths:
+            artifact = state.db.execute(
+                "SELECT sha256,size_bytes,status FROM artifacts WHERE stage_id=? AND path=?",
+                (stage_id, str(path)),
+            ).fetchone()
+            if not artifact or artifact["status"] != "VALIDATED":
+                return False
+            actual_sha256 = sha256_file(path)
+            if actual_sha256 != artifact["sha256"] or path.stat().st_size != artifact["size_bytes"]:
+                return False
+            absolute_digest_rows.append({"path": str(path), "sha256": actual_sha256})
+            try:
+                relative_path = path.relative_to(Path(root).resolve())
+            except ValueError:
+                relative_path = None
+            if relative_path is not None:
+                relative_digest_rows.append({"path": relative_path.as_posix(), "sha256": actual_sha256})
+        if (json_digest(absolute_digest_rows) != output_digest and
+                (not relative_digest_rows or json_digest(relative_digest_rows) != output_digest)):
+            return False
+        if stage_id == "sfm_dataset_prep" and not validate_preparation_stage_outputs(root, config):
+            return False
+        return True
+    except Exception:
+        return False
+
+
 def _stage_artifacts_valid(state: ProjectState, stage_id: str, output_dir: Path) -> bool:
     row = state.stage(stage_id)
     if not row or row.get("status") not in {"COMPLETED", "ADOPTED"}:
         return False
-    executions = state.db.execute("SELECT details_json FROM stage_executions WHERE execution_id=?", (row.get("last_execution_id"),)).fetchone()
-    if not executions:
+    execution_row = state.db.execute("SELECT * FROM stage_executions WHERE execution_id=?",
+                                     (row.get("last_execution_id"),)).fetchone()
+    if not execution_row:
         return False
-    try:
-        paths = json.loads(executions["details_json"]).get("artifacts", [])
-        if not paths or not all(Path(x).is_file() for x in paths):
+    execution = dict(execution_row)
+    if stage_id == "sfm_dataset_prep":
+        try:
+            config = json.loads((state.root / "project.json").read_text(encoding="utf-8"))
+        except (OSError, ValueError):
             return False
-        if stage_id == "sfm_dataset_prep":
-            return validate_preparation_stage_outputs(state.root, json.loads((state.root / "project.json").read_text(encoding="utf-8")))
-        return True
+        return _stage_execution_artifacts_valid(state.root, config, state, stage_id, execution,
+                                                expected_output_digest=row.get("output_digest"))
+    try:
+        paths = json.loads(execution.get("details_json") or "{}").get("artifacts", [])
+        return bool(paths) and all(Path(path).is_file() for path in paths)
     except Exception:
         return False
+
+
+def _interruption_details(details: dict, *, exit_code: int, evidence: str,
+                          exit_code_source: str, reconciled: bool) -> dict:
+    result = dict(details)
+    result.update({
+        "process_state": "INTERRUPTED",
+        "exit_code": exit_code,
+        "exit_code_source": exit_code_source,
+        "interruption_evidence": evidence,
+        "reconciled_at_utc": utc_now(),
+        "error": "Workflow execution was interrupted; no automatic retry or process reattachment was attempted.",
+    })
+    if reconciled:
+        result["reconciliation"] = "OPERATOR_CONFIRMED_INACTIVE_PROCESS"
+    return result
+
+
+def _mark_active_run_interrupted(state: ProjectState, run_id: int, summary: dict) -> None:
+    run = state.db.execute("SELECT status FROM workflow_runs WHERE run_id=?", (run_id,)).fetchone()
+    if not run or run["status"] != "RUNNING":
+        return
+    evidence = "Python KeyboardInterrupt; conventional SIGINT exit code 130."
+    for row in state.db.execute("SELECT * FROM stage_executions WHERE run_id=? AND status='RUNNING'",
+                                (run_id,)).fetchall():
+        execution = dict(row)
+        details = _interruption_details(json.loads(execution.get("details_json") or "{}"),
+                                        exit_code=130, evidence=evidence,
+                                        exit_code_source="python_keyboard_interrupt", reconciled=False)
+        state.finish_stage(execution["execution_id"], "INTERRUPTED", None, details, details["error"])
+        stage = state.stage(execution["stage_id"])
+        if stage and stage.get("last_execution_id") == execution["execution_id"]:
+            state.set_stage(execution["stage_id"], "FAILED", execution.get("input_fingerprint"), None,
+                            execution["execution_id"], details)
+        summary.setdefault("interrupted_executions", []).append({
+            "execution_id": execution["execution_id"], "stage_id": execution["stage_id"],
+            "exit_code": 130,
+        })
+    summary["status"] = "INTERRUPTED"
+    summary.setdefault("interruption_evidence", evidence)
+    state.end_run(run_id, "INTERRUPTED", summary)
+
+
+def reconcile_interrupted_execution(root: Path, config: dict, state: ProjectState, *,
+                                    run_id: int, execution_id: int, exit_code: int,
+                                    evidence: str, confirm_no_active_processes: bool) -> dict:
+    """Reconcile one orphaned execution without retrying it or discarding valid prior cache."""
+    if not isinstance(exit_code, int) or isinstance(exit_code, bool) or not 1 <= exit_code <= 255:
+        raise WorkflowError("Interrupted-execution recovery requires a nonzero process exit code from 1 through 255")
+    if not isinstance(evidence, str) or not evidence.strip():
+        raise WorkflowError("Interrupted-execution recovery requires recorded process-check and interruption evidence")
+    if not confirm_no_active_processes:
+        raise WorkflowError("Confirm that no Engine, backend, or preparation-helper process remains active before recovery")
+
+    try:
+        lock_context = state.lock()
+        lock_context.__enter__()
+    except BlockingIOError as exc:
+        raise WorkflowError("The project workflow lock is held; an Engine process may still be active") from exc
+    try:
+        run_row = state.db.execute("SELECT * FROM workflow_runs WHERE run_id=?", (run_id,)).fetchone()
+        execution = state.execution(execution_id)
+        if not run_row or run_row["status"] != "RUNNING":
+            raise WorkflowError(f"Workflow run {run_id} is not recorded as RUNNING")
+        if not execution or execution.get("run_id") != run_id or execution.get("status") != "RUNNING":
+            raise WorkflowError(f"Execution {execution_id} is not a RUNNING execution in workflow run {run_id}")
+        if execution.get("stage_id") != "sfm_dataset_prep":
+            raise WorkflowError(
+                "This recovery path is limited to interrupted local HEIC preparation; "
+                "fresh SfM and training use their backend-specific reconciliation paths."
+            )
+        stage = state.stage(execution["stage_id"])
+        if not stage or stage.get("status") != "RUNNING" or stage.get("last_execution_id") != execution_id:
+            raise WorkflowError("The requested execution is not the current RUNNING stage attempt")
+        other_running = state.db.execute(
+            "SELECT execution_id,run_id,stage_id FROM stage_executions WHERE status='RUNNING' AND execution_id!=?",
+            (execution_id,),
+        ).fetchone()
+        if other_running:
+            raise WorkflowError(
+                f"Another workflow execution remains RUNNING: {other_running['execution_id']} "
+                f"(run {other_running['run_id']}, stage {other_running['stage_id']})"
+            )
+        if execution.get("pid"):
+            command = json.loads(execution.get("command_json") or "[]")
+            expected = command[0] if command else None
+            if process_alive(int(execution["pid"]), expected):
+                raise WorkflowError(f"Recorded process {execution['pid']} is still active; refusing recovery")
+
+        details = _interruption_details(json.loads(execution.get("details_json") or "{}"),
+                                        exit_code=exit_code, evidence=evidence.strip(),
+                                        exit_code_source="operator_reported", reconciled=True)
+        state.finish_stage(execution_id, "INTERRUPTED", None, details, details["error"])
+
+        restored_execution = None
+        if execution["stage_id"] == "sfm_dataset_prep":
+            candidates = state.db.execute(
+                "SELECT * FROM stage_executions WHERE stage_id=? AND execution_id<? "
+                "AND status IN ('COMPLETED','ADOPTED') ORDER BY execution_id DESC",
+                (execution["stage_id"], execution_id),
+            ).fetchall()
+            for candidate_row in candidates:
+                candidate = dict(candidate_row)
+                if _stage_execution_artifacts_valid(root, config, state, execution["stage_id"], candidate):
+                    restored_execution = candidate
+                    break
+
+        if restored_execution:
+            prior_details = json.loads(restored_execution.get("details_json") or "{}")
+            state.set_stage(execution["stage_id"], restored_execution["status"],
+                            restored_execution.get("input_fingerprint"),
+                            restored_execution.get("output_digest"),
+                            restored_execution["execution_id"], prior_details.get("details", {}))
+        else:
+            state.set_stage(execution["stage_id"], "FAILED", execution.get("input_fingerprint"), None,
+                            execution_id, details)
+
+        summary = json.loads(run_row["summary_json"] or "{}")
+        summary.update({
+            "status": "INTERRUPTED",
+            "reconciliation": {
+                "execution_id": execution_id,
+                "stage_id": execution["stage_id"],
+                "exit_code": exit_code,
+                "exit_code_source": "operator_reported",
+                "evidence": evidence.strip(),
+                "restored_validated_execution_id": (restored_execution or {}).get("execution_id"),
+                "automatic_retry": False,
+            },
+        })
+        state.end_run(run_id, "INTERRUPTED", summary)
+        return {
+            "status": "RECONCILED_INTERRUPTED",
+            "run_id": run_id,
+            "execution_id": execution_id,
+            "stage_id": execution["stage_id"],
+            "exit_code": exit_code,
+            "stage_status": restored_execution["status"] if restored_execution else "FAILED",
+            "restored_validated_execution_id": (restored_execution or {}).get("execution_id"),
+            "automatic_retry": False,
+        }
+    finally:
+        lock_context.__exit__(None, None, None)
 
 
 def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool = False) -> list[dict]:
@@ -1358,6 +1549,14 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
         if status and status.get("status") == "RUNNING": active.append({"stage": sid, **status})
     if active:
         raise WorkflowError(f"Fresh backend process is still running; inspect status/logs or cancel it before another run: {active}")
+    local_running = [stage["id"] for stage in STAGES
+                     if stage["id"] not in {"sfm", "training"}
+                     and (state.stage(stage["id"]) or {}).get("status") == "RUNNING"]
+    if local_running:
+        raise WorkflowError(
+            f"Local stage execution is still recorded as RUNNING: {local_running}. "
+            "Verify that its process has exited and reconcile the interrupted execution before resuming."
+        )
     run_id = state.start_run("package" if package_only else ("resume" if resume else "run"))
     stage_root = output_path(root, config) / "work"
     stage_root.mkdir(parents=True, exist_ok=True)
@@ -1445,6 +1644,17 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 summary["stop_reason"] = message
                 state.end_run(run_id, summary["status"], summary)
                 return summary
+            if (sid == "sfm_dataset_prep" and auto_preparation_required(root, config) and prior and
+                    prior.get("status") in {"COMPLETED", "ADOPTED"}):
+                if _stage_artifacts_valid(state, sid, stage_root):
+                    summary["skipped"].append(sid)
+                    summary["stages"][sid] = "SKIPPED_VALID_CACHE"
+                    continue
+                raise BackendError(
+                    "Previously completed HEIC preparation no longer passes source, derivative, or artifact-hash validation. "
+                    "Refusing to replace it implicitly; inspect the stale evidence and explicitly reset the stage after correcting inputs.",
+                    failure_kind="STALE_DATASET_PREPARATION",
+                )
             if prior and prior.get("input_fingerprint") == fp and prior.get("status") in {"COMPLETED", "ADOPTED"} and _stage_artifacts_valid(state, sid, stage_root):
                 summary["skipped"].append(sid); summary["stages"][sid] = "SKIPPED_VALID_CACHE"
                 if sid == "training" and scoped_sfm_training:
@@ -1554,6 +1764,9 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                     summary["blocked"].append({"stage": "evaluation", "reason": message, "authorization_required": False})
                     state.end_run(run_id, summary["status"], summary)
                     return summary
+            except KeyboardInterrupt:
+                _mark_active_run_interrupted(state, run_id, summary)
+                raise
             except AuthorizationRequired as exc:
                 execution_row = state.execution(execution_id) or {}
                 details = json.loads(execution_row.get("details_json") or "{}")
@@ -1580,6 +1793,9 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
         summary["status"] = "COMPLETED"
         state.end_run(run_id, "COMPLETED", summary)
         return summary
+    except KeyboardInterrupt:
+        _mark_active_run_interrupted(state, run_id, summary)
+        raise
     except Exception:
         state.end_run(run_id, "FAILED", summary)
         raise
