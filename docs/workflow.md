@@ -20,12 +20,13 @@ A run may stop safely at a missing input, invalid or stale artifact, quality war
 
 An SfM result with `SFM_NEEDS_REVIEW` remains in that durable state until it is recomputed or otherwise resolved. A reviewer may record a component-scoped decision without rewriting the stage state:
 
-```text
-exhibition-archive status <project>
-exhibition-archive sfm-review <project> --component 0 --decision accept-experimental-training \
+```bash
+export EXHIBITION_ARCHIVE_ENGINE=/absolute/path/to/exhibition-archive/.venv/bin/exhibition-archive
+"$EXHIBITION_ARCHIVE_ENGINE" status <project>
+"$EXHIBITION_ARCHIVE_ENGINE" sfm-review <project> --component 0 --decision accept-experimental-training \
   --reviewer "Reviewer name" --rationale "Why this component is suitable for an experiment" \
   --limitation "Unresolved coverage or quality limitation"
-exhibition-archive plan <project> --full-hash
+"$EXHIBITION_ARCHIVE_ENGINE" plan <project> --full-hash
 ```
 
 The component ID is its relative COLMAP directory name (for example, `0` for `sparse/0`). The command also supports `--decision reject` and `--decision defer`. Every decision requires a reviewer and rationale. Conditional acceptance requires one or more explicit `--limitation` entries.

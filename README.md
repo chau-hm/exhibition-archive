@@ -15,12 +15,14 @@ The Engine does not determine legal rights, approve curatorial decisions, certif
 
 ## Install
 
-Requires Python 3.11 or later. The package has no Python runtime dependencies.
+Requires uv and Python 3.11 or later; use Python 3.12 for development and validation. Pillow is installed from the project's declared runtime dependencies.
 
 ~~~bash
-python3 -m venv .venv
-.venv/bin/python -m pip install -e .
+uv python find 3.12
+uv venv .venv --python 3.12
+uv sync --locked --python .venv/bin/python
 .venv/bin/exhibition-archive --help
+export EXHIBITION_ARCHIVE_ENGINE="$PWD/.venv/bin/exhibition-archive"
 ~~~
 
 For a Codex session opened at this repository, repository-scoped Skill discovery uses the checked-in .agents/skills/exhibition-archive link. The one authoritative Skill source is skills/exhibition-archive. Type /skills to inspect available Skills or explicitly invoke $exhibition-archive.
@@ -47,9 +49,9 @@ cp examples/fresh-run.project.example.json /path/to/new-project/project.json
 Then initialize and inspect the durable plan and status:
 
 ~~~bash
-exhibition-archive init --config /path/to/new-project/project.json --workspace /path/to/new-project/workspace
-exhibition-archive plan /path/to/new-project/workspace --full-hash
-exhibition-archive status /path/to/new-project/workspace
+"$EXHIBITION_ARCHIVE_ENGINE" init --config /path/to/new-project/project.json --workspace /path/to/new-project/workspace
+"$EXHIBITION_ARCHIVE_ENGINE" plan /path/to/new-project/workspace --full-hash
+"$EXHIBITION_ARCHIVE_ENGINE" status /path/to/new-project/workspace
 ~~~
 
 The example config is a template; it may describe fresh backends, which remain gated. Do not authorize a backend until its exact plan and limits have been reviewed.
@@ -69,9 +71,10 @@ See docs/installation.md, docs/workflow.md, docs/heic-dataset-preparation.md, do
 ## Development
 
 ~~~bash
-python -m unittest discover -s tests -v
-python tests/run_portability_test.py
-python tests/run_fresh_backend_tests.py
+PYTHONPATH=src .venv/bin/python -m pytest tests -q
+PYTHONPATH=src .venv/bin/python -m unittest discover -s tests -v
+PYTHONPATH=src .venv/bin/python tests/run_portability_test.py
+PYTHONPATH=src .venv/bin/python tests/run_fresh_backend_tests.py
 ~~~
 
 Generated test workspaces and evidence are written under the ignored .local/ directory. Browser acceptance uses a real browser harness and is recorded separately from geometry/unit and synthetic backend tests. See docs/release for migration and release evidence.

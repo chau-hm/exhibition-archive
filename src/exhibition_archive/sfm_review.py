@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import uuid
-from pathlib import Path, PurePosixPath
+from pathlib import Path
 from typing import Any
 from urllib.parse import quote
 
@@ -10,7 +10,6 @@ from .adapters import sha256_file
 from .backends import BackendError, image_inventory, validate_colmap_directory
 from .dataset_prep import effective_sfm_dataset
 from .state import utc_now
-
 
 GATE_PREFIX = "sfm-component-acceptance:"
 ACCEPT_DECISION = "ACCEPT_EXPERIMENTAL_TRAINING"

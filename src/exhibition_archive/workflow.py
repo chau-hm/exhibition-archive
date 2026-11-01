@@ -878,7 +878,6 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     from .sfm_review import training_component_scope
     sfm_scope = training_component_scope(root, config, state)
     sfm_state = state.stage("sfm") or {}
-    sfm_details = json.loads(sfm_state.get("details_json") or "{}")
     sfm_cfg = config.get("integrations", {}).get("sfm", {})
     reconstruction = Path(sfm_scope["reconstruction_directory"])
     if not reconstruction.is_dir(): raise BackendError(f"Validated COLMAP directory is missing: {reconstruction}", failure_kind="SFM_INVALID")

@@ -8,13 +8,25 @@ from pathlib import Path
 from unittest.mock import patch
 
 from exhibition_archive.adapters import sha256_file, write_json
-from exhibition_archive.backends import BackendError, prepare_training_dataset, validate_colmap_directory, image_inventory
-from exhibition_archive.sfm_review import (component_acceptance_status, review_sfm_component,
-                                           training_component_scope)
+from exhibition_archive.backends import (
+    BackendError,
+    image_inventory,
+    prepare_training_dataset,
+    validate_colmap_directory,
+)
+from exhibition_archive.sfm_review import (
+    component_acceptance_status,
+    review_sfm_component,
+    training_component_scope,
+)
 from exhibition_archive.state import ProjectState
-from exhibition_archive.workflow import (expensive_execution_plan, json_digest, plan,
-                                         run_workflow, stage_fingerprint)
-
+from exhibition_archive.workflow import (
+    expensive_execution_plan,
+    json_digest,
+    plan,
+    run_workflow,
+    stage_fingerprint,
+)
 
 BACKEND = {
     "tool": {"executable": "/opt/test/spirula", "version": "test-1.2"},

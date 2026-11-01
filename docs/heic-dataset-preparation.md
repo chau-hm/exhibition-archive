@@ -8,18 +8,20 @@ HEIC conversion requires the external `heif-convert` command from [libheif](http
 
 ~~~bash
 brew install libheif
-python3 -m pip install -e .
+uv venv .venv --python 3.12
+uv sync --locked --python .venv/bin/python
 heif-convert --version
-python3 -c 'import PIL; from PIL import ImageCms; print("Pillow", PIL.__version__, "LittleCMS", ImageCms.core.littlecms_version)'
+.venv/bin/python -c 'import PIL; from PIL import ImageCms; print("Pillow", PIL.__version__, "LittleCMS", ImageCms.core.littlecms_version)'
 ~~~
 
-On Linux, install the distribution package that provides `heif-convert` (often `libheif-examples`) and install the Engine with `python3 -m pip install -e .`. HEIC preparation fails visibly with `CONVERTER_UNAVAILABLE` when the command or Pillow is missing. The error includes the macOS installation command. Spirula is not needed for intake or conversion.
+From the Engine checkout, first create `.venv` with `uv venv .venv --python 3.12` if needed, then run `uv sync --locked --python .venv/bin/python`. On Linux, install the distribution package that provides `heif-convert` (often `libheif-examples`). HEIC preparation fails visibly with `CONVERTER_UNAVAILABLE` when the command or Pillow is missing. The error includes the macOS installation command. Spirula is not needed for intake or conversion.
 
 With a configured project whose read-only source directory is registered in `source.photo_directory`, run safe intake and then inspect the current backend plan:
 
 ~~~bash
-exhibition-archive run /path/to/workspace --full-hash
-exhibition-archive plan /path/to/workspace --full-hash
+export EXHIBITION_ARCHIVE_ENGINE="/absolute/path/to/exhibition-archive/.venv/bin/exhibition-archive"
+"$EXHIBITION_ARCHIVE_ENGINE" run /path/to/workspace --full-hash
+"$EXHIBITION_ARCHIVE_ENGINE" plan /path/to/workspace --full-hash
 ~~~
 
 The `run` command inventories source files, performs capture preflight, and prepares the JPEG dataset when fresh Spirula SfM is selected and HEIC/HEIF files are present. It can then stop at the normal SfM authorization boundary. Review the full-hash plan before separately authorizing a fresh SfM attempt. Training has its own plan and authorization boundary.
@@ -41,11 +43,13 @@ The transformed dataset is versioned separately at `derived/spirula-jpeg-srgb-v1
 Install the updated Engine in the environment used by the exhibition session, confirm libheif and Pillow/LittleCMS versions, and regenerate safely:
 
 ~~~bash
-python3 -m pip install -e /Users/homan/repo/exhibition-archive
+cd /Users/homan/repo/exhibition-archive
+uv sync --locked --python .venv/bin/python
 heif-convert --version
-python3 -c 'import PIL; from PIL import ImageCms; print("Pillow", PIL.__version__, "LittleCMS", ImageCms.core.littlecms_version)'
-exhibition-archive run /path/to/Lumo/workspace --full-hash
-exhibition-archive plan /path/to/Lumo/workspace --full-hash
+.venv/bin/python -c 'import PIL; from PIL import ImageCms; print("Pillow", PIL.__version__, "LittleCMS", ImageCms.core.littlecms_version)'
+export EXHIBITION_ARCHIVE_ENGINE="$PWD/.venv/bin/exhibition-archive"
+"$EXHIBITION_ARCHIVE_ENGINE" run /path/to/Lumo/workspace --full-hash
+"$EXHIBITION_ARCHIVE_ENGINE" plan /path/to/Lumo/workspace --full-hash
 ~~~
 
 The `run` step is safe local preparation and stops before any fresh SfM or training execution. Confirm that the manifest reports schema v3, the `spirula-jpeg-srgb-v1` effective image directory, the selected `--image-gamut Rec.709`, and one mapping per registered original. For every converted HEIC, check `pixel_content_validation.status` and `color_conversion_validation.status` are `PASS`, `source_color_profile` is Display P3, `output_color_profile` is sRGB, `icc_profile_validation_status` is `TARGET_SRGB_ICC_PROFILE_BYTES_VERIFIED`, `output_orientation` is 1, and camera/focal metadata is retained. Confirm the plan uses this same effective image directory and its normalized command contains `--image-gamut Rec.709`. Stop if any image is missing, black, lacks metadata, or has a profile mismatch. The previous Lumo JPEG dataset and SfM plan are invalid; do not use or authorize them. Review the new full-hash SfM plan separately before any fresh SfM approval. Training still requires its own later plan and approval.
