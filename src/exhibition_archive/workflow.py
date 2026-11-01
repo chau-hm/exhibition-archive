@@ -5,7 +5,7 @@ import json
 import os
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .adapters import colmap_binary_counts, ply_identity, read_json, sha256_file, validate_navigation, write_json
@@ -1876,6 +1876,114 @@ def build_archive(root: Path, config: dict, state: ProjectState, output_dir: Pat
     return {"status": "COMPLETED", "artifacts": [archive / "manifest.json", archive / "provenance.json"], "details": {"file_count": len(manifest["contents"]) + 1, "source_photographs_bundled": False, "metadata_only_source_index": True}}
 
 
+def verify_website_package_index(website: Path, index: dict) -> tuple[list[dict], list[str]]:
+    """Verify a complete, path-safe v2 static website file index."""
+    checks: list[dict] = []
+    failures: list[str] = []
+    if not isinstance(index, dict):
+        return checks, ["Website package index must be a JSON object"]
+    if index.get("schema_version") != "exhibition-archive.website-index.v2":
+        failures.append("Website package index schema is missing or unsupported")
+    entries = index.get("files")
+    if not isinstance(entries, list):
+        return checks, failures + ["Website package index files must be a list"]
+
+    listed: set[str] = set()
+    total_bytes = 0
+    root = website.resolve()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            failures.append("Website package index contains a non-object file entry")
+            continue
+        raw_path = entry.get("path")
+        safe = isinstance(raw_path, str) and bool(raw_path) and "\\" not in raw_path
+        relative = PurePosixPath(raw_path) if safe else PurePosixPath("invalid")
+        safe = safe and not relative.is_absolute() and all(part not in {"", ".", ".."} for part in relative.parts)
+        if raw_path == "config/package-index.json":
+            safe = False
+        candidate = website.joinpath(*relative.parts) if safe else root / "__invalid_manifest_entry__"
+        target = candidate.resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            safe = False
+        if isinstance(raw_path, str) and raw_path in listed:
+            safe = False
+            failures.append(f"Website package index contains a duplicate path: {raw_path}")
+        if safe and isinstance(raw_path, str):
+            listed.add(raw_path)
+        exists = safe and not candidate.is_symlink() and target.is_file()
+        actual_size = target.stat().st_size if exists else None
+        size_ok = isinstance(entry.get("size_bytes"), int) and not isinstance(entry.get("size_bytes"), bool) and entry["size_bytes"] >= 0 and actual_size == entry.get("size_bytes")
+        digest_ok = exists and isinstance(entry.get("sha256"), str) and bool(re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])) and sha256_file(target) == entry.get("sha256")
+        ok = bool(exists and size_ok and digest_ok)
+        checks.append({"website_path": raw_path, "ok": ok})
+        if not ok:
+            failures.append(f"Website package checksum/path validation failed: {raw_path}")
+        if isinstance(entry.get("size_bytes"), int) and not isinstance(entry.get("size_bytes"), bool) and entry["size_bytes"] >= 0:
+            total_bytes += entry["size_bytes"]
+
+    package_index_path = website / "config" / "package-index.json"
+    actual_paths = {p.relative_to(website).as_posix() for p in website.rglob("*") if p.is_file() and p != package_index_path}
+    if listed != actual_paths:
+        missing = sorted(actual_paths - listed)
+        extra = sorted(listed - actual_paths)
+        if missing:
+            failures.append(f"Website package index omits payload files: {', '.join(missing[:8])}")
+        if extra:
+            failures.append(f"Website package index lists files that are not in the package: {', '.join(extra[:8])}")
+    if not isinstance(index.get("file_count"), int) or isinstance(index.get("file_count"), bool) or index["file_count"] != len(entries):
+        failures.append("Website package index file_count does not match its file list")
+    if not isinstance(index.get("total_bytes"), int) or isinstance(index.get("total_bytes"), bool) or index["total_bytes"] != total_bytes:
+        failures.append("Website package index total_bytes does not match its file list")
+    return checks, failures
+
+
+def _website_reference_failures(website: Path) -> list[str]:
+    """Resolve static HTML, CSS, and JavaScript references within the package."""
+    failures: list[str] = []
+    root = website.resolve()
+    attribute = re.compile(r"(?:href|src)\s*=\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
+    script_ref = re.compile(r"(?:from\s+|import(?:\s+|\s*\()|fetch\s*\()\s*['\"]([^'\"]+)['\"]")
+    css_ref = re.compile(r"url\(\s*['\"]?([^'\")]+)", re.IGNORECASE)
+    for source in website.rglob("*"):
+        if not source.is_file() or source.suffix.casefold() not in {".html", ".js", ".css"}:
+            continue
+        content = source.read_text(encoding="utf-8", errors="replace")
+        if source.suffix.casefold() == ".js":
+            content = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+            content = re.sub(r"(?m)^\s*//.*$", "", content)
+        refs: list[str] = []
+        if source.suffix.casefold() == ".html":
+            refs.extend(attribute.findall(content))
+        if source.suffix.casefold() == ".js":
+            refs.extend(script_ref.findall(content))
+        if source.suffix.casefold() == ".css":
+            refs.extend(css_ref.findall(content))
+        for raw in refs:
+            value = raw.strip()
+            if not value or value.startswith(("#", "data:", "mailto:", "tel:", "javascript:")):
+                continue
+            if value.startswith(("http://", "https://", "//")):
+                failures.append(f"Public asset has an external dependency: {source.relative_to(website)} -> {value}")
+                continue
+            path_part = value.split("?", 1)[0].split("#", 1)[0]
+            if path_part.startswith("/"):
+                failures.append(f"Public asset uses a root-absolute reference: {source.relative_to(website)} -> {value}")
+                continue
+            target = (source.parent / path_part).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                failures.append(f"Public asset reference escapes package: {source.relative_to(website)} -> {value}")
+                continue
+            if target.is_dir():
+                target = target / "index.html"
+            if not target.is_file():
+                failures.append(f"Public asset reference is missing: {source.relative_to(website)} -> {value}")
+    return failures
+
+
 def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectState | None = None, force_hash: bool = False) -> dict:
     output_root = output_path(root, config)
     website, archive = output_root / "website", output_root / "archive"
@@ -1916,7 +2024,7 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
     for p in public_files:
         if p.suffix.casefold() in {".json", ".html", ".js", ".css", ".md", ".txt"}:
             public_text.append((p, p.read_text(encoding="utf-8", errors="replace")))
-    forbidden = ["/Users/", "/private/", str(project_path(root, config, config["source"]["photo_directory"]))]
+    forbidden = ["/Users/", "/private/", "localhost", "127.0.0.1", str(project_path(root, config, config["source"]["photo_directory"]))]
     for path, content in public_text:
         for marker in forbidden:
             if marker and marker in content:
@@ -1930,18 +2038,13 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         failures.append("Website package index is missing")
     else:
         package_index = read_json(package_index_path)
-        for entry in package_index.get("files", []):
-            relative = Path(entry.get("path", ""))
-            target = (website / relative).resolve()
-            try:
-                target.relative_to(website.resolve())
-                safe_path = not relative.is_absolute() and ".." not in relative.parts
-            except ValueError:
-                safe_path = False
-            ok = safe_path and target.is_file() and target.stat().st_size == entry.get("size_bytes") and sha256_file(target) == entry.get("sha256")
-            checks.append({"website_path": entry.get("path"), "ok": ok})
-            if not ok:
-                failures.append(f"Website package checksum/path validation failed: {entry.get('path')}")
+        package_checks, package_failures = verify_website_package_index(website, package_index)
+        checks.extend(package_checks)
+        failures.extend(package_failures)
+        if package_index.get("project_id") != config.get("project_id"):
+            failures.append("Website package index project_id does not match the configured project")
+        if package_index.get("model_sha256") != expected_hash:
+            failures.append("Website package index model_sha256 does not match the selected baseline")
     app_path, html_path = website / "viewer" / "app.js", website / "viewer" / "index.html"
     if app_path.is_file() and html_path.is_file():
         app_text = app_path.read_text(encoding="utf-8", errors="replace")
@@ -1949,6 +2052,21 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         absolute_asset = re.compile(r"(?:href|src)\s*=\s*['\"]\/|from\s+['\"]\/|fetch\(['\"]\/(?:api|assets)\/|['\"]\/assets/")
         if absolute_asset.search(app_text) or absolute_asset.search(html_text):
             failures.append("Static viewer contains a root-absolute asset/API path and may fail under a nested deployment path")
+    failures.extend(_website_reference_failures(website))
+    health_path = website / "api" / "health.json"
+    if health_path.is_file():
+        health = read_json(health_path)
+        content_url = health.get("contentUrl")
+        content_target = (website / "viewer" / content_url).resolve() if isinstance(content_url, str) and content_url and "\\" not in content_url else None
+        try:
+            if content_target is None:
+                raise ValueError("missing or unsafe relative model URL")
+            content_target.relative_to(website.resolve())
+            content_ok = not content_url.startswith("/") and "://" not in content_url and content_target.is_file()
+        except ValueError:
+            content_ok = False
+        if not content_ok:
+            failures.append("Website health metadata does not resolve its model through a portable relative URL")
     navigation_doc = website / "config" / "navigation.json"
     if navigation_doc.is_file():
         navigation = read_json(navigation_doc)
