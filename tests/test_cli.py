@@ -34,6 +34,17 @@ class CliSmokeTests(unittest.TestCase):
         self.assertIn("--component", result.stdout)
         self.assertIn("--limitation", result.stdout)
 
+    def test_storage_report_cli_is_available(self):
+        result = subprocess.run(
+            [str(LAUNCHER), "storage-report", "--help"],
+            cwd="/private/tmp",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+        self.assertIn("usage: exhibition-archive storage-report", result.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

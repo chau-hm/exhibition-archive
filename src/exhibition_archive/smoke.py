@@ -231,6 +231,10 @@ def preflight_smoke_training(root: Path, config: dict, *, operator_authorized: b
     command = build_training_command(Path(capabilities["tool"]["executable"]), dataset, placeholder,
         {**model_cfg, "data_format": "colmap", "image_dir": "images", "colmap_recon_dir": "sparse/0"},
         capabilities, run_name)
+    checkpoint_policy = {"steps_per_save": model_cfg.get("steps_per_save", 100),
+                         "save_only_latest_checkpoint": model_cfg.get("save_only_latest_checkpoint", True),
+                         "save_full_checkpoint": model_cfg.get("save_full_checkpoint", True),
+                         "retention_owner": "SPIRULA_BACKEND"}
     report = {
         "schema_version": "phase2ez.training-readiness.v1", "policy": "SMOKE_TEST_ONLY",
         "status": "READY_TO_LAUNCH", "generated_at_utc": utc_now(),
@@ -240,7 +244,7 @@ def preflight_smoke_training(root: Path, config: dict, *, operator_authorized: b
         "trainer": {"executable": capabilities["tool"]["executable"], "version": capabilities["tool"]["version"],
             "preset": model_cfg["preset"], "iterations": model_cfg["iterations"], "hard_iteration_cap": MAX_SMOKE_ITERATIONS,
             "resolution_divisor": model_cfg["resolution_divisor"], "steps_per_save": model_cfg["steps_per_save"],
-            "device": device, "command_template": command},
+            "checkpoint_policy": checkpoint_policy, "device": device, "command_template": command},
         "production_sfm_status": "SFM_NEEDS_REVIEW", "production_quality_thresholds_changed": False,
         "production_quality_gate_bypassed": False, "available_disk_bytes": resources["free_bytes_before"],
         "minimum_free_disk_bytes": resources["minimum_required_bytes"], "resource_check": resources,
@@ -295,6 +299,10 @@ def run_smoke_training(root: Path, config: dict, state: ProjectState, *, operato
         command = build_training_command(Path(capabilities["tool"]["executable"]), dataset, attempt,
             {**model_cfg, "data_format": "colmap", "image_dir": "images", "colmap_recon_dir": "sparse/0"},
             capabilities, run_name)
+        checkpoint_policy = {"steps_per_save": model_cfg.get("steps_per_save", 100),
+                             "save_only_latest_checkpoint": model_cfg.get("save_only_latest_checkpoint", True),
+                             "save_full_checkpoint": model_cfg.get("save_full_checkpoint", True),
+                             "retention_owner": "SPIRULA_BACKEND"}
         attempt_manifest = {
             "schema_version": "exhibition-archive.smoke-training-input-manifest.v1",
             "policy": "SMOKE_TEST_ONLY", "project_id": config["project_id"],
@@ -345,6 +353,7 @@ def run_smoke_training(root: Path, config: dict, state: ProjectState, *, operato
             "production_quality_gate": "SFM_NEEDS_REVIEW", "backend_version": capabilities["tool"]["version"],
             "configuration": {k: v for k, v in model_cfg.items() if k != "environment_overrides"},
             "command": command, "cwd": str(attempt.resolve()), "resource_check": resources,
+            "checkpoint_policy": checkpoint_policy,
             "input_manifest": str(manifest_out.resolve()), "readiness_report": str(readiness_path.resolve()),
             "expected_output_prefix": str((attempt / "outputs" / run_name).resolve()),
             "checkpoint_resume_capability": capabilities["training"]["checkpoint"],
@@ -354,7 +363,8 @@ def run_smoke_training(root: Path, config: dict, state: ProjectState, *, operato
         write_json(attempt / "command.json", command_record)
         execution = execute_process(state, execution_id, SMOKE_STAGE, command, attempt, attempt / "spirula.log",
             environment_overrides, model_cfg.get("timeout_seconds", resource_policy.get("training_timeout_seconds")),
-            float(resource_policy.get("poll_interval_seconds", 1.0)), checkpoint_root=attempt / "outputs")
+            float(resource_policy.get("poll_interval_seconds", 1.0)), checkpoint_root=attempt / "outputs",
+            minimum_free_disk_bytes=resources["minimum_required_bytes"])
         command_record = read_json(attempt / "command.json")
         gpu = _gpu_initialization_evidence(attempt / "spirula.log", device)
         model, candidate_rows, selection_reason = _discover_smoke_model(attempt, model_cfg)

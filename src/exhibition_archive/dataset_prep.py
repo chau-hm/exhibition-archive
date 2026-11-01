@@ -952,7 +952,43 @@ def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str,
     basis = manifest.get("preparation_basis")
     if not isinstance(basis, dict) or _json_digest(basis) != manifest.get("preparation_fingerprint"):
         raise BackendError("Prepared dataset fingerprint does not match its recorded conversion inputs", failure_kind="STALE_DATASET_PREPARATION")
-    current_converter = heif_converter_identity(settings)
+    # The converter is historical preparation provenance, not part of the
+    # current reviewer's environment. The artifact bytes and recorded source /
+    # derived identities below determine freshness. Requiring the currently
+    # installed Pillow/LittleCMS to reproduce an old identity would wrongly
+    # stale immutable, already-verified image derivatives after an upgrade.
+    historical_converter = basis.get("converter")
+    if (not isinstance(historical_converter, dict) or
+            not isinstance(historical_converter.get("name"), str) or
+            not historical_converter.get("name", "").strip() or
+            not isinstance(historical_converter.get("version"), str) or
+            not historical_converter.get("version", "").strip() or
+            not isinstance(historical_converter.get("pixel_validator"), dict) or
+            not isinstance(historical_converter["pixel_validator"].get("version"), str) or
+            not historical_converter["pixel_validator"].get("version", "").strip()):
+        raise BackendError("Historical image-preparation toolchain identity is incomplete", failure_kind="STALE_DATASET_PREPARATION")
+    color_identity = historical_converter.get("color_management")
+    if _is_srgb_target(settings) and color_identity is None:
+        raise BackendError("Historical sRGB conversion is missing its LittleCMS/target ICC identity", failure_kind="STALE_DATASET_PREPARATION")
+    if color_identity is not None and (
+            not isinstance(color_identity, dict) or
+            color_identity.get("engine") != "LittleCMS" or
+            not isinstance(color_identity.get("version"), str) or
+            not color_identity.get("version", "").strip() or
+            not re.fullmatch(r"[0-9a-f]{64}", str(color_identity.get("target_srgb_icc_sha256", "")))):
+        raise BackendError("Historical LittleCMS/ICC toolchain identity is incomplete", failure_kind="STALE_DATASET_PREPARATION")
+    conversion = manifest.get("conversion", {})
+    if (not isinstance(conversion, dict) or conversion.get("backend") != historical_converter or
+            conversion.get("settings") != settings or manifest.get("image_count") != len(expected_records)):
+        raise BackendError("Prepared manifest conversion provenance is incomplete or mismatched", failure_kind="STALE_DATASET_PREPARATION")
+    if _is_srgb_target(settings):
+        historical_target_hash = color_identity["target_srgb_icc_sha256"]
+        for mapping in mappings:
+            if mapping.get("source_format") not in {value.lstrip(".") for value in HEIF_SUFFIXES}:
+                continue
+            validation = mapping.get("conversion_validation", {}).get("color_conversion_validation", {})
+            if validation.get("target_icc_profile_sha256") != historical_target_hash:
+                raise BackendError("Historical LittleCMS target ICC identity does not match the verified derived-image conversion evidence", failure_kind="STALE_DATASET_PREPARATION")
     expected_basis = {
         "schema_version": preparation_schema_for(settings),
         "source_directory": str(input_dir.resolve()),
@@ -963,13 +999,10 @@ def _manifest_is_current(root: Path, config: dict[str, Any], manifest: dict[str,
                      "derived_relative_path": expected_outputs[row["input_relative_path"]]}
                     for row in expected_records],
         "settings": settings,
-        "converter": current_converter,
+        "converter": historical_converter,
     }
-    if basis != expected_basis or basis.get("converter") != current_converter or basis.get("settings") != settings:
-        raise BackendError("heif-convert/libheif identity or JPEG preparation settings changed; rerun safe dataset preparation", failure_kind="STALE_DATASET_PREPARATION")
-    conversion = manifest.get("conversion", {})
-    if conversion.get("backend") != current_converter or conversion.get("settings") != settings or manifest.get("image_count") != len(expected_records):
-        raise BackendError("Prepared manifest conversion provenance is incomplete or stale", failure_kind="STALE_DATASET_PREPARATION")
+    if basis != expected_basis or basis.get("settings") != settings:
+        raise BackendError("Historical preparation identity or current JPEG preparation settings no longer match the registered inputs", failure_kind="STALE_DATASET_PREPARATION")
     actual_outputs = {path.relative_to(dataset).as_posix().casefold() for path in _supported_images(dataset)}
     if actual_outputs != seen_output or _dataset_file_membership(dataset) != seen_output:
         raise BackendError("Prepared dataset contains unexpected or missing files relative to its verified image mapping", failure_kind="STALE_DATASET_PREPARATION")

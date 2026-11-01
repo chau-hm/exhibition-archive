@@ -30,6 +30,7 @@
     "max_failed_attempts": 2
   },
   "resource_policy": {
+    "training_resource_policy_note": "INTENTIONALLY INCOMPLETE: measure checkpoint replacement storage on the target backend/device and set checkpoint_replacement_reserve_bytes before planning or authorizing training.",
     "max_training_iterations": 300,
     "max_concurrent_backend_processes": 1,
     "minimum_free_disk_bytes_sfm": 10737418240,

@@ -11,13 +11,14 @@ from unittest.mock import patch
 from exhibition_archive.adapters import sha256_file
 from exhibition_archive.state import ProjectState
 from exhibition_archive.workflow import (AuthorizationRequired, expensive_execution_plan,
-                                         execute_fresh_sfm, run_workflow, stage_fingerprint)
+                                         execute_fresh_sfm, plan, run_workflow, stage_fingerprint)
 
 
 BACKEND = {
     "tool": {"executable": "/opt/test/spirula", "version": "test-1.2"},
     "sfm": {"auto_arguments": ["--max-image-size"]},
-    "training": {"presets": ["3dgs"], "arguments": ["--train-resolution-divisor", "--device", "--steps-per-save"]},
+    "training": {"presets": ["3dgs"], "arguments": ["--train-resolution-divisor", "--device", "--steps-per-save", "--save-only-latest-checkpoint", "--save-full-checkpoint", "--resume", "--quality", "--view-sampling", "--cache-images", "--load-masks"],
+                 "checkpoint": {"latest_only_retention": "VERIFIED_BY_HELP", "latest_only_prunes_older": "VERIFIED_BY_HELP", "full_state": "VERIFIED_BY_HELP", "resume_cli_flag": "VERIFIED_BY_HELP"}},
 }
 
 
@@ -31,7 +32,9 @@ def project_config(root: Path, *, smoke: bool = False) -> dict:
                       "preset": "3dgs", "iterations": 100, "resolution_divisor": 2},
         },
         "resource_policy": {"max_training_iterations": 1000, "sfm_timeout_seconds": 120,
-                            "training_timeout_seconds": 300, "minimum_free_disk_bytes": 1},
+                            "training_timeout_seconds": 300, "minimum_free_disk_bytes": 1,
+                            "minimum_free_disk_bytes_training": 1,
+                            "checkpoint_replacement_reserve_bytes": 1},
         **({"diagnostic_policy": {"mode": "SMOKE_TEST_ONLY"}} if smoke else {}),
     }
 
@@ -84,6 +87,17 @@ class AuthorizationTests(unittest.TestCase):
             self.config["integrations"]["model"]["iterations"] = 200
             changed_training = self.plan("training")
         self.assertNotEqual(training["plan_id"], changed_training["plan_id"])
+
+    def test_plan_reports_missing_training_resource_limits_as_blocked_readiness(self):
+        self.config["resource_policy"].pop("checkpoint_replacement_reserve_bytes")
+        self.state.set_stage("photo_inventory", "COMPLETED", "fixture", "fixture", None, {})
+        scoped_input = {"component_id": "0", "acceptance_required": False,
+                        "conditional_scope": False}
+        with patch("exhibition_archive.sfm_review.training_component_scope", return_value=scoped_input):
+            stages = plan(self.root, self.config, self.state, discover_backends=False)
+        training = next(row for row in stages if row["id"] == "training")
+        self.assertTrue(training["readiness"].startswith("BLOCKED_TRAINING_CONFIGURATION:"))
+        self.assertIn("checkpoint_replacement_reserve_bytes", training["readiness"])
 
     def test_grant_is_one_time_and_stage_scoped(self):
         plan = self.plan()

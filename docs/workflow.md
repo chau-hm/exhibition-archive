@@ -16,6 +16,8 @@ A typical flow is:
 
 A run may stop safely at a missing input, invalid or stale artifact, quality warning, expensive-stage authorization gate, or human review gate. Read the returned Engine state before choosing the next action. Do not infer readiness from the requested action or a prior conversation.
 
+Use `storage-report WORKSPACE` to inspect source, derivative, attempt, cache, checkpoint, validated/review-referenced artifact, audit, and final-deliverable storage before a costly stage or package review. It only reports; see [storage lifecycle](storage-lifecycle.md) for retention classes and disk controls.
+
 ## Component-scoped SfM review
 
 An SfM result with `SFM_NEEDS_REVIEW` remains in that durable state until it is recomputed or otherwise resolved. A reviewer may record a component-scoped decision without rewriting the stage state:

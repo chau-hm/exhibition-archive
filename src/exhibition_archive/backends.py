@@ -75,6 +75,16 @@ def _flags(help_text: str) -> set[str]:
     return set(re.findall(r"^\s+(--[a-zA-Z0-9][a-zA-Z0-9-]*)\b", help_text, re.MULTILINE))
 
 
+def _flag_description(help_text: str, flag: str) -> str | None:
+    lines = help_text.splitlines()
+    for index, line in enumerate(lines):
+        if re.search(rf"^\s+{re.escape(flag)}\b", line):
+            for following in lines[index + 1:]:
+                if following.strip():
+                    return following.strip()
+    return None
+
+
 def discover_environment(configured: str | None = None, evidence_dir: Path | None = None) -> dict[str, Any]:
     executable = discover_executable(configured)
     captures = {
@@ -93,6 +103,10 @@ def discover_environment(configured: str | None = None, evidence_dir: Path | Non
     train_text = captures["train_help"]["stdout"]
     train_all_text = captures["train_help_all"]["stdout"]
     checkpoint_flags = _flags(train_all_text)
+    steps_description = _flag_description(train_all_text, "--steps-per-save")
+    latest_only_description = _flag_description(train_all_text, "--save-only-latest-checkpoint")
+    full_checkpoint_description = _flag_description(train_all_text, "--save-full-checkpoint")
+    resume_description = _flag_description(train_all_text, "--resume")
     top_lines = [line.strip() for line in captures["top_help"]["stdout"].splitlines() if re.match(r"^[a-z][a-z0-9-]+\s{2,}", line.strip())]
     commands = [re.match(r"^([a-z][a-z0-9-]+)", line).group(1) for line in top_lines if re.match(r"^([a-z][a-z0-9-]+)", line)]
     result = {
@@ -122,12 +136,20 @@ def discover_environment(configured: str | None = None, evidence_dir: Path | Non
             "resolution_arguments": ["--train-resolution-divisor", "--progressive-resolution"],
             "device_argument": "--device index|name|auto|uuid:hex; valid device list is printed at training startup",
             "checkpoint": {
-                "save_intermediate": "VERIFIED_BY_HELP" if "--steps-per-save" in checkpoint_flags else "UNKNOWN",
-                "full_state": "VERIFIED_BY_HELP" if "--save-full-checkpoint" in checkpoint_flags else "UNKNOWN",
-                "resume_cli_flag": "VERIFIED_BY_HELP" if "--resume" in checkpoint_flags else "UNKNOWN",
+                "save_intermediate": "VERIFIED_BY_HELP" if steps_description and "checkpoint" in steps_description.casefold() else "UNKNOWN",
+                "full_state": "VERIFIED_BY_HELP" if full_checkpoint_description and "continue" in full_checkpoint_description.casefold() else "UNKNOWN",
+                "latest_only_retention": "VERIFIED_BY_HELP" if latest_only_description and "newest" in latest_only_description.casefold() else "UNKNOWN",
+                "latest_only_prunes_older": "VERIFIED_BY_HELP" if latest_only_description and "delete older" in latest_only_description.casefold() else "UNKNOWN",
+                "resume_cli_flag": "VERIFIED_BY_HELP" if resume_description and "previous run" in resume_description.casefold() else "UNKNOWN",
+                "resume_mode": "BARE_FLAG_WITH_CONFIGURED_OUTPUT_RUN; BACKEND_SELECTION_NOT_TESTED",
+                "steps_per_save_help": steps_description,
+                "full_checkpoint_help": full_checkpoint_description,
+                "latest_only_help": latest_only_description,
+                "resume_help": resume_description,
+                "checkpoint_format": "UNKNOWN_BY_HELP",
                 "resume_execution": "NOT_TESTED",
                 "spirula_optimizer_resume_semantics": "UNKNOWN_NOT_TESTED",
-                "engine_optimizer_resume": "CHECKPOINT_RESUME_UNSUPPORTED",
+                "engine_optimizer_resume": "EXPLICIT_RESUME_FROM_SUPPORTED; EXECUTION_NOT_TESTED",
                 "init_ply": "VERIFIED_BY_HELP" if "--init-ply" in checkpoint_flags else "UNKNOWN",
                 "init_ply_is_optimizer_resume": False,
                 "evidence": "train-help-all.txt",
@@ -144,7 +166,7 @@ def discover_environment(configured: str | None = None, evidence_dir: Path | Non
             {"claim": "Training device is usable by Spirula on this host", "status": "UNKNOWN", "evidence": "No training process was launched during capability discovery"},
             {"claim": "Actual checkpoint resume restores optimizer state", "status": "UNKNOWN", "evidence": "CLI help describes continuing a previous run but behavior has not been executed"},
         ],
-        "unsupported_or_unknown": ["Accepted image format list is not enumerated by help", "Exact PLY naming and checkpoint directory conventions are not enumerated by help", "Training device availability is not yet verified by Spirula execution", "Checkpoint resume semantics are not yet verified by execution"],
+        "unsupported_or_unknown": ["Accepted image format list is not enumerated by help", "Exact PLY naming and checkpoint directory conventions are not enumerated by help", "Training device availability is not yet verified by Spirula execution", "Checkpoint optimizer-state restore semantics are not yet verified by execution"],
         "evidence_commands": {name: capture["argv"] for name, capture in captures.items()},
     }
     if evidence_dir:
@@ -217,13 +239,26 @@ def create_attempt_dir(project_root: Path, output_root: Path, stage: str, execut
 
 
 def check_resources(path: Path, policy: dict[str, Any], stage: str) -> dict[str, Any]:
-    usage = shutil.disk_usage(path)
     default_minimum = int(policy.get("minimum_free_disk_bytes", 2 * 1024**3))
     stage_key = "minimum_free_disk_bytes_sfm" if stage == "sfm" else "minimum_free_disk_bytes_training"
+    if stage == "training" and (stage_key not in policy or "checkpoint_replacement_reserve_bytes" not in policy):
+        raise BackendError("Fresh training requires explicit minimum_free_disk_bytes_training and checkpoint_replacement_reserve_bytes resource limits", failure_kind="INVALID_CONFIGURATION")
+    if stage == "training" and any(not isinstance(policy.get(key), int) or isinstance(policy.get(key), bool)
+                                    for key in (stage_key, "checkpoint_replacement_reserve_bytes")):
+        raise BackendError("Training disk floor and checkpoint replacement reserve must be integer byte counts", failure_kind="INVALID_CONFIGURATION")
     minimum = int(policy.get(stage_key, default_minimum))
-    if usage.free < minimum:
-        raise BackendError(f"Insufficient free disk space for {stage}: {usage.free} bytes free, {minimum} required", failure_kind="RESOURCE_LIMIT", details={"free_bytes": usage.free, "minimum_required_bytes": minimum})
-    return {"free_bytes_before": usage.free, "minimum_required_bytes": minimum, "filesystem_total_bytes": usage.total, "checked_path": str(path.resolve())}
+    replacement_reserve = int(policy.get("checkpoint_replacement_reserve_bytes", 0)) if stage == "training" else 0
+    if ((stage == "training" and (minimum < 1 or replacement_reserve < 1)) or
+            (stage != "training" and minimum < 0)):
+        raise BackendError("Training disk floor and checkpoint replacement reserve must both be positive", failure_kind="INVALID_CONFIGURATION")
+    launch_minimum = minimum + replacement_reserve
+    usage = shutil.disk_usage(path)
+    if usage.free < launch_minimum:
+        raise BackendError(f"Insufficient free disk space for {stage}: {usage.free} bytes free, {launch_minimum} required", failure_kind="RESOURCE_LIMIT", details={"free_bytes": usage.free, "minimum_runtime_free_bytes": minimum, "checkpoint_replacement_reserve_bytes": replacement_reserve, "minimum_required_bytes": launch_minimum})
+    return {"free_bytes_before": usage.free, "minimum_required_bytes": minimum,
+            "checkpoint_replacement_reserve_bytes": replacement_reserve,
+            "minimum_required_at_launch_bytes": launch_minimum,
+            "filesystem_total_bytes": usage.total, "checked_path": str(path.resolve())}
 
 
 def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = None) -> dict[str, Any]:
@@ -683,11 +718,14 @@ def execute_process(
     timeout_seconds: int | None = None,
     poll_interval: float = 1.0,
     checkpoint_root: Path | None = None,
+    minimum_free_disk_bytes: int | None = None,
 ) -> dict[str, Any]:
     if not command or not all(isinstance(x, str) for x in command):
         raise BackendError("Subprocess command must be a non-empty string argument array", failure_kind="INVALID_COMMAND")
     if poll_interval < 0.1 or poll_interval > 5:
         raise BackendError("poll_interval_seconds must be between 0.1 and 5", failure_kind="INVALID_CONFIGURATION")
+    if minimum_free_disk_bytes is not None and (minimum_free_disk_bytes < 1 or checkpoint_root is None):
+        raise BackendError("Runtime disk monitoring requires a positive floor and checkpoint/output path", failure_kind="INVALID_CONFIGURATION")
     if not cwd.is_dir(): raise BackendError(f"Subprocess working directory is missing: {cwd}", failure_kind="UNSAFE_OUTPUT")
     if log_path.exists(): raise BackendError(f"Refusing to overwrite an existing process log: {log_path}", failure_kind="UNSAFE_OUTPUT")
     env = os.environ.copy()
@@ -712,12 +750,27 @@ def execute_process(
                 attempt_record["log_path"] = str(log_path.resolve())
                 write_json(attempt_record_path, attempt_record)
             state.update_stage_execution(execution_id, command=command, workdir=str(cwd.resolve()), pid=process.pid,
-                                         log_path=str(log_path.resolve()), details={"process_state": "RUNNING", "launched_at_utc": launched_at, "environment_override_keys": sorted(overrides)})
+                                         log_path=str(log_path.resolve()), details={"process_state": "RUNNING", "launched_at_utc": launched_at, "environment_override_keys": sorted(overrides), "runtime_free_disk_floor_bytes": minimum_free_disk_bytes})
             current = state.stage(stage_id) or {}
             state.set_stage(stage_id, "RUNNING", current.get("input_fingerprint"), None, execution_id, {"process_state": "RUNNING", "pid": process.pid, "command": command, "workdir": str(cwd.resolve()), "log_path": str(log_path.resolve()), "started_monotonic": started})
             last_update = started
+            runtime_free_bytes = None
             while process.poll() is None:
                 now = time.monotonic()
+                if minimum_free_disk_bytes is not None:
+                    disk_probe_path = checkpoint_root
+                    while not disk_probe_path.exists() and disk_probe_path != disk_probe_path.parent:
+                        disk_probe_path = disk_probe_path.parent
+                    free_bytes = shutil.disk_usage(disk_probe_path).free
+                    runtime_free_bytes = free_bytes
+                    if free_bytes < minimum_free_disk_bytes:
+                        checkpoints = discover_checkpoints(checkpoint_root)
+                        raise BackendError(
+                            f"{stage_id} stopped because free disk space fell below the configured safe floor ({free_bytes} < {minimum_free_disk_bytes} bytes)",
+                            failure_kind="RESOURCE_LIMIT",
+                            details={"free_bytes": free_bytes, "minimum_runtime_free_bytes": minimum_free_disk_bytes,
+                                     "checkpoint_candidates_at_stop": checkpoints,
+                                     "checkpoint_cleanup_performed": False, "stop_signal": "SIGTERM_THEN_SIGKILL_IF_NEEDED"})
                 if timeout_seconds and now-started > timeout_seconds:
                     try: os.killpg(process.pid, signal.SIGTERM)
                     except (ProcessLookupError, OSError): pass
@@ -739,8 +792,8 @@ def execute_process(
                     except OSError:
                         pass
                     current = state.stage(stage_id) or {}
-                    state.set_stage(stage_id, "RUNNING", current.get("input_fingerprint"), None, execution_id, {"process_state": "RUNNING", "pid": process.pid, "command": command, "workdir": str(cwd.resolve()), "log_path": str(log_path.resolve()), "elapsed_seconds": elapsed, "progress": "UNKNOWN_NOT_REPORTED_BY_BACKEND", "recent_log_lines": recent_lines, "checkpoint_candidates": checkpoints})
-                    state.update_stage_execution(execution_id, details={"elapsed_seconds": elapsed, "checkpoint_candidates": checkpoints, "recent_log_lines": recent_lines})
+                    state.set_stage(stage_id, "RUNNING", current.get("input_fingerprint"), None, execution_id, {"process_state": "RUNNING", "pid": process.pid, "command": command, "workdir": str(cwd.resolve()), "log_path": str(log_path.resolve()), "elapsed_seconds": elapsed, "progress": "UNKNOWN_NOT_REPORTED_BY_BACKEND", "recent_log_lines": recent_lines, "checkpoint_candidates": checkpoints, "runtime_free_disk_bytes": runtime_free_bytes, "runtime_free_disk_floor_bytes": minimum_free_disk_bytes})
+                    state.update_stage_execution(execution_id, details={"elapsed_seconds": elapsed, "checkpoint_candidates": checkpoints, "recent_log_lines": recent_lines, "runtime_free_disk_bytes": runtime_free_bytes, "runtime_free_disk_floor_bytes": minimum_free_disk_bytes})
                     last_update = now
                 time.sleep(poll_interval)
             returncode = process.wait()
@@ -928,7 +981,8 @@ def build_sfm_command(executable: Path, image_dir: Path, output_dir: Path, cfg: 
     return command
 
 
-def build_training_command(executable: Path, dataset_dir: Path, attempt_dir: Path, cfg: dict[str, Any], capabilities: dict[str, Any], attempt_name: str) -> list[str]:
+def build_training_command(executable: Path, dataset_dir: Path, attempt_dir: Path, cfg: dict[str, Any], capabilities: dict[str, Any], attempt_name: str,
+                          resume_output_dir: Path | None = None) -> list[str]:
     supported = set(capabilities["training"]["arguments"])
     required = {"preset", "iterations"}
     missing = [key for key in required if key not in cfg]
@@ -939,10 +993,17 @@ def build_training_command(executable: Path, dataset_dir: Path, attempt_dir: Pat
     if not isinstance(iterations, int) or iterations < 1: raise BackendError("training.iterations must be a positive integer", failure_kind="INVALID_CONFIGURATION")
     data_format = cfg.get("data_format", "colmap")
     if data_format not in {"colmap", "nerfstudio", "metashape"}: raise BackendError(f"Unsupported training data format: {data_format}", failure_kind="INVALID_CONFIGURATION")
+    output_prefix = resume_output_dir.parent if isinstance(resume_output_dir, Path) else attempt_dir / "outputs"
+    output_name = resume_output_dir.name if isinstance(resume_output_dir, Path) else attempt_name
     command = [str(executable), "train", preset, "--data", str(dataset_dir.resolve()), "--data-format", data_format,
                "--image-dir", cfg.get("image_dir", "images"), "--colmap-recon-dir", cfg.get("colmap_recon_dir", "sparse/0"),
-               "--output-dir-prefix", str((attempt_dir / "outputs").resolve()), "--output-dir-name", attempt_name,
+               "--output-dir-prefix", str(output_prefix.resolve()), "--output-dir-name", output_name,
                "--num-iterations", str(iterations), "--disable-viewer", "1", "--keep-viewer-alive", "0"]
+    quality = cfg.get("quality")
+    if quality is not None:
+        if not isinstance(quality, str) or quality not in {"low", "medium", "high", "ultra"} or "--quality" not in supported:
+            raise BackendError("Configured training.quality must be supported by Spirula and one of low, medium, high, or ultra", failure_kind="INVALID_CONFIGURATION")
+        command += ["--quality", quality]
     divisor = cfg.get("resolution_divisor", 4)
     if "--train-resolution-divisor" not in supported or not isinstance(divisor, int) or divisor < 1:
         raise BackendError("training.resolution_divisor must be a positive integer supported by Spirula", failure_kind="INVALID_CONFIGURATION")
@@ -950,16 +1011,61 @@ def build_training_command(executable: Path, dataset_dir: Path, attempt_dir: Pat
     device = cfg.get("device", "auto")
     if not isinstance(device, str) or not device.strip(): raise BackendError("training.device must be a non-empty string", failure_kind="INVALID_CONFIGURATION")
     if "--device" in supported: command += ["--device", device]
-    if "--steps-per-save" in supported: command += ["--steps-per-save", str(cfg.get("steps_per_save", 100))]
-    if "--save-only-latest-checkpoint" in supported: command += ["--save-only-latest-checkpoint", "0"]
-    if "--save-full-checkpoint" in supported: command += ["--save-full-checkpoint", "1"]
+    steps_per_save = cfg.get("steps_per_save", 100)
+    if not isinstance(steps_per_save, int) or isinstance(steps_per_save, bool) or steps_per_save < 1:
+        raise BackendError("training.steps_per_save must be a positive integer", failure_kind="INVALID_CONFIGURATION")
+    if "--steps-per-save" in supported:
+        command += ["--steps-per-save", str(steps_per_save)]
+    elif "steps_per_save" in cfg:
+        raise BackendError("Configured steps_per_save is not supported by the installed Spirula version", failure_kind="INVALID_CONFIGURATION")
+    latest_only = cfg.get("save_only_latest_checkpoint", True)
+    full_checkpoint = cfg.get("save_full_checkpoint", True)
+    if not isinstance(latest_only, bool) or not isinstance(full_checkpoint, bool):
+        raise BackendError("Checkpoint retention settings must be booleans", failure_kind="INVALID_CONFIGURATION")
+    if latest_only and not full_checkpoint:
+        raise BackendError("Latest-only retention requires full checkpoints so the newest checkpoint remains recoverable", failure_kind="INVALID_CONFIGURATION")
+    checkpoint_capabilities = capabilities["training"].get("checkpoint", {})
+    if latest_only and (checkpoint_capabilities.get("latest_only_retention") != "VERIFIED_BY_HELP" or
+                        checkpoint_capabilities.get("latest_only_prunes_older") != "VERIFIED_BY_HELP"):
+        raise BackendError("The installed Spirula help does not confirm latest-only checkpoint pruning semantics", failure_kind="INVALID_CONFIGURATION")
+    if full_checkpoint and checkpoint_capabilities.get("full_state") != "VERIFIED_BY_HELP":
+        raise BackendError("The installed Spirula help does not confirm full checkpoints contain continuation state", failure_kind="INVALID_CONFIGURATION")
+    if "--save-only-latest-checkpoint" in supported:
+        command += ["--save-only-latest-checkpoint", "1" if latest_only else "0"]
+    else:
+        raise BackendError("The installed Spirula version does not support an explicit checkpoint-retention policy", failure_kind="INVALID_CONFIGURATION")
+    if "--save-full-checkpoint" in supported:
+        command += ["--save-full-checkpoint", "1" if full_checkpoint else "0"]
+    else:
+        raise BackendError("The installed Spirula version does not support explicit full checkpoints required for recovery", failure_kind="INVALID_CONFIGURATION")
+    if isinstance(resume_output_dir, Path):
+        if "--resume" not in supported or checkpoint_capabilities.get("resume_cli_flag") != "VERIFIED_BY_HELP":
+            raise BackendError("Resume is not supported by the installed Spirula version", failure_kind="INVALID_CONFIGURATION")
+        command.append("--resume")
+    view_sampling = cfg.get("view_sampling")
+    if view_sampling is not None:
+        if not isinstance(view_sampling, str) or view_sampling not in {"uniform", "deficit"} or "--view-sampling" not in supported:
+            raise BackendError("Configured training.view_sampling must be supported by Spirula and one of uniform or deficit", failure_kind="INVALID_CONFIGURATION")
+        command += ["--view-sampling", view_sampling]
+    cache_images = cfg.get("cache_images")
+    if cache_images is not None:
+        if not isinstance(cache_images, str) or cache_images not in {"cpu", "gpu", "disk"} or "--cache-images" not in supported:
+            raise BackendError("Configured training.cache_images must be supported by Spirula and one of cpu, gpu, or disk", failure_kind="INVALID_CONFIGURATION")
+        command += ["--cache-images", cache_images]
+    load_masks = cfg.get("load_masks", False)
+    if not isinstance(load_masks, bool):
+        raise BackendError("training.load_masks must be a boolean", failure_kind="INVALID_CONFIGURATION")
+    if "--load-masks" in supported:
+        command += ["--load-masks", "1" if load_masks else "0"]
+    elif "load_masks" in cfg:
+        raise BackendError("Configured load_masks value is not supported by the installed Spirula version", failure_kind="INVALID_CONFIGURATION")
     seed = cfg.get("seed")
     if seed is not None:
         if "--seed" not in supported: raise BackendError("Configured seed is not supported by the installed Spirula version", failure_kind="INVALID_CONFIGURATION")
         command += ["--seed", str(seed)]
     extras = cfg.get("additional_args", [])
     if not isinstance(extras, list) or not all(isinstance(x, str) for x in extras): raise BackendError("training.additional_args must be a string array", failure_kind="INVALID_CONFIGURATION")
-    protected = {"--data", "--data-format", "--image-dir", "--colmap-recon-dir", "--output-dir-prefix", "--output-dir-name", "--num-iterations", "--device", "--train-resolution-divisor", "--resume", "--init-ply", "--save-full-checkpoint", "--save-only-latest-checkpoint", "--steps-per-save", "--disable-viewer", "--keep-viewer-alive"}
+    protected = {"--data", "--data-format", "--image-dir", "--colmap-recon-dir", "--output-dir-prefix", "--output-dir-name", "--num-iterations", "--device", "--train-resolution-divisor", "--resume", "--init-ply", "--save-full-checkpoint", "--save-only-latest-checkpoint", "--steps-per-save", "--quality", "--view-sampling", "--cache-images", "--load-masks", "--disable-viewer", "--keep-viewer-alive"}
     flags = [arg for arg in extras if arg.startswith("-")]
     unknown, blocked = sorted(set(flags)-supported), sorted(set(flags)&protected)
     if unknown: raise BackendError(f"Unsupported training extra flags: {unknown}", failure_kind="INVALID_CONFIGURATION")

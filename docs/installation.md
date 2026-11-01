@@ -30,6 +30,8 @@ The installed console script can be run from any working directory. The reposito
 
 Copy examples/fresh-run.project.example.json to a project-specific location, then edit its values. Paths in project manifests are interpreted relative to the project workspace unless they are absolute. Keep original photos read-only and store workflow SQLite state, logs, intermediate outputs, and website output in an external workspace.
 
+The example is intentionally not ready for fresh training. Before planning or authorizing training, measure the target backend's checkpoint replacement requirement and set a positive `resource_policy.checkpoint_replacement_reserve_bytes`; the Engine blocks training plans when this measurement is missing.
+
 ~~~bash
 "$EXHIBITION_ARCHIVE_ENGINE" init --config /data/gallery/project.json --workspace /data/gallery/workspace
 "$EXHIBITION_ARCHIVE_ENGINE" plan /data/gallery/workspace --full-hash
@@ -44,6 +46,7 @@ Do not put venue datasets, runtime SQLite databases, or generated packages in th
 "$EXHIBITION_ARCHIVE_ENGINE" init --config CONFIG --workspace WORKSPACE
 "$EXHIBITION_ARCHIVE_ENGINE" plan WORKSPACE [--full-hash]
 "$EXHIBITION_ARCHIVE_ENGINE" status WORKSPACE
+"$EXHIBITION_ARCHIVE_ENGINE" storage-report WORKSPACE
 "$EXHIBITION_ARCHIVE_ENGINE" run WORKSPACE [--authorization-id ID]
 "$EXHIBITION_ARCHIVE_ENGINE" authorize WORKSPACE --stage sfm|training --plan-id ID --reviewer NAME --rationale TEXT
 "$EXHIBITION_ARCHIVE_ENGINE" resume WORKSPACE [--authorization-id ID]

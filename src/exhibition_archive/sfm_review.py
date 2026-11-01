@@ -38,6 +38,20 @@ def _read_details(row: dict | None) -> dict:
         return {}
 
 
+def _reviewer_environment() -> dict[str, str | None]:
+    """Describe the current reviewer toolchain without binding artifact freshness to it."""
+    import platform
+
+    try:
+        from PIL import ImageCms, __version__ as pillow_version
+        littlecms_version = str(ImageCms.core.littlecms_version)
+    except (ImportError, AttributeError):
+        pillow_version = None
+        littlecms_version = None
+    return {"python": platform.python_version(), "pillow": pillow_version,
+            "littlecms": littlecms_version}
+
+
 def _sfm_component_root(root: Path, config: dict, stage_details: dict) -> Path:
     raw = stage_details.get("reconstruction_directory")
     if not raw:
@@ -269,6 +283,8 @@ def build_sfm_snapshot(root: Path, config: dict, state) -> dict[str, Any]:
     return {**binding, "quality_gate": original_quality, "quality_warnings": original_warnings,
             "revalidation_quality_gate": validation["quality_gate"],
             "revalidation_warnings": list(validation["warnings"]),
+            "historical_preparation_toolchain": (prep_manifest.get("conversion", {}).get("backend")
+                                                  if prep_manifest else None),
             "validation": validation, "binding_sha256": _json_digest(binding),
             "source_image_directory": str(image_dir.resolve()), "source_inventory": inventory}
 
@@ -321,6 +337,10 @@ def review_sfm_component(root: Path, config: dict, state, *, component_id: str, 
         "reconstruction_artifact_digests": {item["component_id"]: item["artifact_tree_sha256"]
                                              for item in snapshot["components"]},
         "source_image_inventory_sha256": snapshot["source_image_inventory_sha256"],
+        "historical_preparation_toolchain": snapshot["historical_preparation_toolchain"],
+        # Informational review provenance only; this is deliberately not part
+        # of the reconstruction binding or freshness comparison.
+        "reviewer_environment": _reviewer_environment(),
         "source_image_count": snapshot["source_image_count"],
         "original_quality_gate": snapshot["original_quality_gate"],
         "original_quality_warnings": snapshot["original_quality_warnings"],

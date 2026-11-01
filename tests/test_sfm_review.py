@@ -31,7 +31,8 @@ from exhibition_archive.workflow import (
 BACKEND = {
     "tool": {"executable": "/opt/test/spirula", "version": "test-1.2"},
     "sfm": {"auto_arguments": ["--max-image-size"]},
-    "training": {"presets": ["3dgs"], "arguments": ["--train-resolution-divisor", "--device", "--steps-per-save"]},
+    "training": {"presets": ["3dgs"], "arguments": ["--train-resolution-divisor", "--device", "--steps-per-save", "--save-only-latest-checkpoint", "--save-full-checkpoint", "--resume", "--quality", "--view-sampling", "--cache-images", "--load-masks"],
+                 "checkpoint": {"latest_only_retention": "VERIFIED_BY_HELP", "latest_only_prunes_older": "VERIFIED_BY_HELP", "full_state": "VERIFIED_BY_HELP", "resume_cli_flag": "VERIFIED_BY_HELP"}},
 }
 
 SFM_STAGE = {"id": "sfm", "deps": ["photo_inventory"], "inputs": [], "outputs": [], "mode": "fixture", "resource": "test"}
@@ -85,7 +86,8 @@ class SfmReviewTests(unittest.TestCase):
                           "preset": "3dgs", "iterations": 40, "resolution_divisor": 2},
             },
             "resource_policy": {"max_training_iterations": 100, "training_timeout_seconds": 300,
-                                "minimum_free_disk_bytes_training": 1},
+                                "minimum_free_disk_bytes_training": 1,
+                                "checkpoint_replacement_reserve_bytes": 1},
         }
         write_json(self.root / "project.json", self.config)
         self.state = ProjectState(self.root)
@@ -148,6 +150,8 @@ class SfmReviewTests(unittest.TestCase):
         self.assertIn("REPROJECTION_ERROR_ZERO_OR_UNINFORMATIVE", decision["original_quality_warnings"])
         self.assertEqual(decision["selected_component"]["registered_image_count"], 8)
         self.assertEqual(decision["selected_component"]["mean_point_reprojection_error_px"], 0.0)
+        self.assertEqual(decision["historical_preparation_toolchain"], None)
+        self.assertIn("python", decision["reviewer_environment"])
         self.assertEqual(self.state.db.execute("SELECT COUNT(*) FROM review_history").fetchone()[0], 1)
         scope = training_component_scope(self.root, self.config, self.state)
         self.assertEqual(scope["component_id"], "0")

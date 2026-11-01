@@ -15,7 +15,7 @@ from exhibition_archive.adapters import sha256_file, write_json
 from exhibition_archive.backends import BackendError
 from exhibition_archive.state import ProjectState
 from exhibition_archive.workflow import (_validate_read_only_image_scope,
-                                         expensive_execution_plan, run_workflow)
+                                         expensive_execution_plan, run_workflow, stage_fingerprint)
 
 
 BACKEND = {
@@ -25,6 +25,7 @@ BACKEND = {
 }
 
 FAKE_CONVERTER = {"name": "libheif heif-convert test double", "version": "libheif test-1",
+                  "executable": "/opt/test/heif-convert",
                   "pixel_validator": {"name": "Pillow", "version": "test"}}
 
 
@@ -156,8 +157,8 @@ class DatasetPreparationTests(unittest.TestCase):
     def tearDown(self):
         self.tmp.cleanup()
 
-    def prepare_with_test_converter(self, inventory: dict) -> dict:
-        with patch.object(dataset_prep, "heif_converter_identity", return_value=FAKE_CONVERTER), \
+    def prepare_with_test_converter(self, inventory: dict, converter: dict = FAKE_CONVERTER) -> dict:
+        with patch.object(dataset_prep, "heif_converter_identity", return_value=converter), \
              patch.object(dataset_prep, "_run_heif_convert_batch", side_effect=fake_batch), \
              patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
             return dataset_prep.prepare_spirula_dataset(self.root, self.config, inventory)
@@ -455,6 +456,51 @@ class DatasetPreparationTests(unittest.TestCase):
             self.assertNotEqual(second_plan["plan_id"], third_plan["plan_id"])
         finally:
             state.close()
+
+    def test_historical_dataset_remains_fresh_under_newer_reviewer_toolchain(self):
+        heic = self.photos / "historical.heic"
+        heic.write_bytes(b"immutable-heic-source")
+        inventory = write_inventory(self.root, self.photos)
+        historical_converter = {**FAKE_CONVERTER,
+                                "color_management": {"engine": "LittleCMS", "version": "historical LittleCMS",
+                                                     "target_srgb_icc_sha256": "b" * 64}}
+        prepared = self.prepare_with_test_converter(inventory, historical_converter)
+        dataset = prepared["effective_image_directory"]
+        historical = json.loads(Path(prepared["manifest_path"]).read_text(encoding="utf-8"))
+        self.assertEqual(historical["preparation_basis"]["converter"], historical_converter)
+
+        newer_toolchain = {**historical_converter, "version": "libheif test 2",
+                           "pixel_validator": {"name": "Pillow", "version": "newer Pillow"},
+                           "color_management": {"engine": "LittleCMS", "version": "newer LittleCMS",
+                                                "target_srgb_icc_sha256": "a" * 64}}
+        with patch.object(dataset_prep, "heif_converter_identity", return_value=newer_toolchain) as current_identity, \
+             patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
+            effective, manifest = dataset_prep.effective_sfm_dataset(self.root, self.config)
+        self.assertEqual(effective, dataset)
+        self.assertEqual(manifest["preparation_basis"]["converter"], historical_converter)
+        current_identity.assert_not_called()
+
+        state = ProjectState(self.root)
+        try:
+            with patch.object(dataset_prep, "heif_converter_identity", return_value=newer_toolchain) as current_identity, \
+                 patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
+                historical_stage_fingerprint = stage_fingerprint(self.root, self.config, state,
+                                                                  "sfm_dataset_prep", full_hash=True)
+                plan = expensive_execution_plan(self.root, self.config, state, "sfm", backend_info=BACKEND)
+            self.assertTrue(historical_stage_fingerprint)
+            self.assertEqual(plan["input_dataset"], str(dataset))
+            self.assertEqual(plan["input_dataset_provenance"]["converter"], historical_converter)
+            current_identity.assert_not_called()
+        finally:
+            state.close()
+
+        derived = next(path for path in dataset.rglob("*.jpg") if path.is_file())
+        derived.write_bytes(derived.read_bytes() + b"changed")
+        with patch.object(dataset_prep, "heif_converter_identity", return_value=newer_toolchain) as current_identity, \
+             patch.object(dataset_prep, "_jpeg_dimensions", return_value=(24, 32)):
+            with self.assertRaisesRegex(BackendError, "changed after verification"):
+                dataset_prep.effective_sfm_dataset(self.root, self.config)
+        current_identity.assert_not_called()
 
     def test_failed_conversion_discards_staging_and_preserves_originals(self):
         self.config["integrations"]["sfm"]["additional_args"] = ["--image-gamut", "Rec.709"]

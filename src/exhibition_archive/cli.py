@@ -223,6 +223,13 @@ def cmd_status(args) -> int:
         state.close()
 
 
+def cmd_storage_report(args) -> int:
+    root, config = load_project(args.project)
+    from .storage import storage_report
+    print(json.dumps(storage_report(root, config), indent=2))
+    return 0
+
+
 def cmd_cancel(args) -> int:
     if args.grace_seconds < 0:
         raise ValueError("--grace-seconds must be zero or greater")
@@ -643,6 +650,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_run, resume=True)
     p = sub.add_parser("status", help="Inspect durable workflow state and resume eligibility")
     p.add_argument("project"); p.set_defaults(func=cmd_status)
+    p = sub.add_parser("storage-report", help="Measure project storage classes and list non-destructive cleanup candidates")
+    p.add_argument("project"); p.set_defaults(func=cmd_storage_report)
     p = sub.add_parser("package", help="Run packaging and verification stages without rerunning SfM or training")
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true")
     p.set_defaults(func=cmd_run, resume=True, package_only=True)

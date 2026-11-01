@@ -43,7 +43,7 @@ elif args[:3] == ["sfm", "auto", "--help"]:
 elif args == ["train", "--help"]:
     print("  --data <path>\n  --data-format <name>\n  --image-dir <path>\n  --colmap-recon-dir <path>\n  --output-dir-prefix <path>\n  --output-dir-name <name>\n  --num-iterations <int>\n  --train-resolution-divisor <int>\n  --device <device>\n  --disable-viewer <0|1>\n  --keep-viewer-alive <0|1>")
 elif args == ["train", "--help-all"]:
-    print("  --steps-per-save <int>\n  --save-only-latest-checkpoint <0|1>\n  --save-full-checkpoint <0|1>\n  --resume\n  --init-ply <path>")
+    print("  --steps-per-save <int>\n      How often a checkpoint is written.\n  --save-only-latest-checkpoint <0|1>\n      Keep the newest checkpoint and delete older ones as training goes.\n  --save-full-checkpoint <0|1>\n      Store what training needs to continue in every checkpoint.\n  --resume\n      Continue a previous run instead of starting from scratch.\n  --init-ply <path>")
 elif args[:2] == ["sfm", "auto"]:
     if os.environ.get("FAKE_SFM_FAIL"):
         print("controlled fake SfM failure", file=sys.stderr)
@@ -244,6 +244,8 @@ def _project_fixture(root: Path, *, fail_sfm: bool = False, sleep_sfm: float | N
       "publication": {"public_site": True, "include_source_photographs": False, "include_private_review_notes": False},
       "archive_policy": {"bundle_source_photographs": False}, "retry_policy": {"max_failed_attempts": 1},
       "resource_policy": {"max_training_iterations": 12, "minimum_free_disk_bytes": 0, "sfm_timeout_seconds": 30,
+                          "minimum_free_disk_bytes_training": max(1, min_disk_bytes),
+                          "checkpoint_replacement_reserve_bytes": 1,
                           "training_timeout_seconds": 30, "poll_interval_seconds": 0.1},
       "integrations": {
         "sfm": {"mode": "spirula_fresh", "executable": str(fake), "image_directory": "derived/spatial-camera-exports" if derived_inputs else str(photos.resolve()),
@@ -265,6 +267,7 @@ def _project_fixture(root: Path, *, fail_sfm: bool = False, sleep_sfm: float | N
     if timeout_training_seconds is not None:
         cfg["integrations"]["model"]["timeout_seconds"] = timeout_training_seconds
     cfg["resource_policy"]["minimum_free_disk_bytes"] = min_disk_bytes
+    cfg["resource_policy"]["minimum_free_disk_bytes_training"] = max(1, min_disk_bytes)
     config = root / "project-config.json"
     config.write_text(json.dumps(cfg, indent=2) + "\n", encoding="utf-8")
     workspace = root / "workspace"

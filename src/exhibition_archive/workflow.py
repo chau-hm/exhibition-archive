@@ -11,7 +11,7 @@ from typing import Any
 from .adapters import colmap_binary_counts, ply_identity, read_json, sha256_file, validate_navigation, write_json
 from .navigation import generate_navigation, read_colmap_reconstruction, render_navigation_review_html
 from .backends import (BackendError, IMAGE_SUFFIXES, build_sfm_command, build_training_command,
-                       check_resources, create_attempt_dir, discover_environment, discover_model_files,
+                       check_resources, create_attempt_dir, discover_checkpoints, discover_environment, discover_model_files,
                        execute_process, finalize_attempt_record, finalize_stage_attempt, image_inventory as backend_image_inventory, prepare_training_dataset,
                        validate_colmap_directory, validate_gaussian_ply)
 from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_preparation_required,
@@ -98,6 +98,71 @@ def json_digest(value: Any) -> str:
     return hashlib.sha256(json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":")).encode()).hexdigest()
 
 
+def training_resume_identity(root: Path, config: dict, model_cfg: dict) -> tuple[Path | None, dict | None]:
+    """Resolve and full-hash an explicitly selected prior Spirula run for --resume."""
+    configured = model_cfg.get("resume_from")
+    if configured is None:
+        return None, None
+    if not isinstance(configured, str) or not configured.strip():
+        raise WorkflowError("model.resume_from must be a non-empty path to a prior training output directory")
+    raw = Path(configured).expanduser()
+    candidate = (raw if raw.is_absolute() else root / raw)
+    if candidate.is_symlink():
+        raise WorkflowError("model.resume_from may not be a symlink")
+    resume_dir = candidate.resolve()
+    allowed_root = (output_path(root, config) / "backend-runs" / "training").resolve()
+    if allowed_root not in resume_dir.parents or not resume_dir.is_dir():
+        raise WorkflowError("model.resume_from must name an existing training output directory inside this project's output/backend-runs/training")
+    resume_entries = list(resume_dir.rglob("*"))
+    if any(path.is_symlink() for path in resume_entries):
+        raise WorkflowError("model.resume_from may not contain symlinks")
+    existing_models = [path for path in resume_entries if path.suffix.casefold() == ".ply"]
+    if existing_models:
+        raise WorkflowError("Refusing to resume in place from a run directory containing a model PLY; preserve the existing candidate and prepare a separate clean resume directory")
+    candidates = discover_checkpoints(resume_dir)
+    if not candidates:
+        raise WorkflowError("model.resume_from contains no Spirula checkpoint candidates")
+    identities = []
+    for item in candidates:
+        checkpoint = Path(item["path"])
+        if checkpoint.is_symlink():
+            raise WorkflowError("Checkpoint candidates may not be symlinks")
+        if checkpoint.is_file():
+            identities.append({**item, "sha256": sha256_file(checkpoint)})
+            continue
+        files = []
+        for child in sorted(checkpoint.rglob("*")):
+            if child.is_symlink():
+                raise WorkflowError(f"Checkpoint directory contains a symlink: {child}")
+            if child.is_file():
+                files.append({"relative_path": child.relative_to(checkpoint).as_posix(),
+                              "size_bytes": child.stat().st_size, "sha256": sha256_file(child)})
+        if not files:
+            raise WorkflowError(f"Checkpoint directory contains no regular files: {checkpoint}")
+        identities.append({**item, "size_bytes": sum(row["size_bytes"] for row in files),
+                           "sha256": json_digest(files), "files": files})
+    newest = max(identities, key=lambda row: (row["mtime_ns"], row["path"]))
+    return resume_dir, {"output_directory": str(resume_dir), "checkpoint_candidates": identities,
+                        "newest_by_mtime": {"path": newest["path"], "sha256": newest["sha256"]},
+                        "selection_semantics": "ADVISORY_MTIME; Spirula --resume selects its own latest checkpoint"}
+
+
+def validate_training_resource_policy(config: dict, model_cfg: dict) -> dict[str, int]:
+    policy = config.get("resource_policy", {})
+    maximum = policy.get("max_training_iterations")
+    timeout = model_cfg.get("timeout_seconds", policy.get("training_timeout_seconds"))
+    minimum_disk = policy.get("minimum_free_disk_bytes_training")
+    replacement_reserve = policy.get("checkpoint_replacement_reserve_bytes")
+    values = {"max_training_iterations": maximum, "training_timeout_seconds": timeout,
+              "minimum_free_disk_bytes_training": minimum_disk,
+              "checkpoint_replacement_reserve_bytes": replacement_reserve}
+    if any(not isinstance(value, int) or isinstance(value, bool) or value < 1 for value in values.values()):
+        raise WorkflowError("Fresh training requires positive max_training_iterations, training timeout, minimum_free_disk_bytes_training, and checkpoint_replacement_reserve_bytes")
+    if not isinstance(model_cfg.get("iterations"), int) or isinstance(model_cfg.get("iterations"), bool) or not 1 <= model_cfg["iterations"] <= maximum:
+        raise WorkflowError("Fresh training iterations must be positive and at or below max_training_iterations")
+    return {key: int(value) for key, value in values.items()}
+
+
 def fingerprint_file(state: ProjectState, path: Path, force: bool = False) -> dict:
     return {"path": str(path.resolve()), "exists": path.is_file(), "size_bytes": path.stat().st_size if path.is_file() else None,
             "sha256": state.cached_hash(path, force) if path.is_file() else None}
@@ -174,7 +239,17 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
             fingerprint_file(state, Path(__file__).with_name("dataset_prep.py"), full_hash),
         ]
         if contains_heif(image_dir):
-            selected["converter"] = heif_converter_identity(prep_settings)
+            # Use a valid prepared dataset's recorded toolchain when computing
+            # its historical stage identity. Only a missing/stale preparation
+            # needs the current converter identity for a future preparation.
+            try:
+                _, historical_manifest = effective_sfm_dataset(root, config, validate_files=full_hash)
+            except (BackendError, DatasetPreparationRequired):
+                historical_manifest = None
+            if historical_manifest:
+                selected["converter"] = historical_manifest.get("conversion", {}).get("backend")
+            else:
+                selected["converter"] = heif_converter_identity(prep_settings)
         selected["input_images"] = [fingerprint_file(state, file, full_hash)
                                      for file in sorted(image_dir.rglob("*") if image_dir.is_dir() else [])
                                      if file.is_file() and file.suffix.casefold() in IMAGE_SUFFIXES]
@@ -254,6 +329,9 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
     if cfg.get("mode", "adopt_existing") != "spirula_fresh":
         raise WorkflowError(f"Stage {stage_id} is configured to adopt existing artifacts and does not need GPU authorization")
     training_scope = None
+    resume_output_dir = None
+    resume_identity = None
+    training_limits = None
     if stage_id == "training":
         from .sfm_review import training_component_scope
         try:
@@ -262,11 +340,8 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
             raise WorkflowError(f"Training authorization requires a current accepted SfM component: {exc}") from exc
         if cfg.get("run_type") not in {"smoke_test", "candidate"}:
             raise WorkflowError("Fresh training requires model.run_type to be explicitly smoke_test or candidate")
-        policy = config.get("resource_policy", {})
-        if "iterations" not in cfg or "max_training_iterations" not in policy:
-            raise WorkflowError("Fresh training requires explicit model.iterations and resource_policy.max_training_iterations")
-        if not isinstance(cfg["iterations"], int) or cfg["iterations"] < 1 or cfg["iterations"] > int(policy["max_training_iterations"]):
-            raise WorkflowError("Fresh training iterations must be positive and at or below max_training_iterations")
+        training_limits = validate_training_resource_policy(config, cfg)
+        resume_output_dir, resume_identity = training_resume_identity(root, config, cfg)
 
     from .backends import discover_environment
     backend = backend_info or discover_environment(cfg.get("executable"))
@@ -283,10 +358,12 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
         image_dir, prep_manifest = effective_training_dataset(root, config)
         dataset = attempt / "<prepared-dataset>"
         command = build_training_command(executable, dataset, attempt, cfg, backend,
-                                         f"{config['project_id']}-<next-execution-id>")
+                                         f"{config['project_id']}-<next-execution-id>", resume_output_dir)
         limits = {**config.get("resource_policy", {}), "timeout_seconds": cfg.get("timeout_seconds", config.get("resource_policy", {}).get("training_timeout_seconds")),
                   "max_training_iterations": config.get("resource_policy", {}).get("max_training_iterations"),
-                  "iterations": cfg.get("iterations")}
+                  "iterations": cfg.get("iterations"),
+                  "minimum_free_disk_bytes_training": training_limits["minimum_free_disk_bytes_training"],
+                  "checkpoint_replacement_reserve_bytes": training_limits["checkpoint_replacement_reserve_bytes"]}
         quality_gates = {"sfm_quality_gate": input_cfg.get("quality_gate", {}), "training": cfg.get("quality_gate", {})}
         backend_capabilities = backend.get("training", {})
     gamut_error = image_gamut_mismatch(config, prep_manifest) if stage_id == "sfm" else None
@@ -339,8 +416,13 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
         "environment_override_keys": sorted(env),
         "environment_overrides_sha256": json_digest(env),
         "resource_limits": limits, "quality_gates": quality_gates,
+        "checkpoint_policy": ({"steps_per_save": cfg.get("steps_per_save", 100),
+                               "save_only_latest_checkpoint": cfg.get("save_only_latest_checkpoint", True),
+                               "save_full_checkpoint": cfg.get("save_full_checkpoint", True),
+                               "retention_owner": "SPIRULA_BACKEND"} if stage_id == "training" else None),
+        "resume_checkpoint_identity": resume_identity,
         "reuse": {"valid_cached_result": False, "policy": "valid cache is reused before authorization is checked"},
-        "cancellation_and_recovery": "Cancellation retains attempt files and history; retry starts a new attempt. Spirula optimizer-state resume is not claimed or authorized by this plan.",
+        "cancellation_and_recovery": ("Cancellation retains attempt files and history; no automatic retry or cleanup occurs. An explicitly configured model.resume_from selects an existing run directory and passes Spirula --resume; optimizer restoration remains NOT_TESTED." if stage_id == "training" else "Cancellation retains attempt files and history; retry starts a new authorized attempt."),
         "execution_context": {"kind": "operator-initiated-local-cli", "host_sandbox_authorization": "NOT_EXPOSED_TO_ENGINE"},
     }
     if training_scope:
@@ -875,6 +957,8 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
         raise BackendError("model.iterations must be a positive integer", failure_kind="INVALID_CONFIGURATION")
     if cfg["iterations"] > maximum:
         raise BackendError(f"Requested {cfg['iterations']} training iterations exceed the configured cap {maximum}", failure_kind="RESOURCE_LIMIT")
+    training_limits = validate_training_resource_policy(config, cfg)
+    resume_output_dir, resume_identity = training_resume_identity(root, config, cfg)
     from .sfm_review import training_component_scope
     sfm_scope = training_component_scope(root, config, state)
     sfm_state = state.stage("sfm") or {}
@@ -934,7 +1018,9 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     }
     policy = config.get("resource_policy", {})
     attempt = create_attempt_dir(root, output_path(root, config), "training", execution_id, policy.get("retained_attempt_limit"))
-    resources = check_resources(attempt, policy, "training")
+    # A resume writes checkpoints beside the selected prior checkpoint, which
+    # may reside on a different filesystem from this new Engine attempt log.
+    resources = check_resources(resume_output_dir or attempt, policy, "training")
     capabilities = discover_environment(cfg.get("executable"), attempt / "backend-discovery")
     training_dataset = prepare_training_dataset(attempt, image_dir, reconstruction,
                                                 registered_image_names=registered_names)
@@ -947,8 +1033,15 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     selected_formats = materialized_images["formats"]
     source_names = set(source_by_name)
     excluded_names = sorted(source_names - set(registered_names))
-    run_name = f"{config['project_id']}-attempt-{execution_id:04d}"
-    command = build_training_command(Path(capabilities["tool"]["executable"]), training_dataset, attempt, cfg, capabilities, run_name)
+    run_name = resume_output_dir.name if resume_output_dir else f"{config['project_id']}-attempt-{execution_id:04d}"
+    command = build_training_command(Path(capabilities["tool"]["executable"]), training_dataset, attempt, cfg, capabilities, run_name,
+                                     resume_output_dir)
+    backend_output_dir = resume_output_dir or (attempt / "outputs" / run_name)
+    checkpoint_root = resume_output_dir or (attempt / "outputs")
+    checkpoint_policy = {"steps_per_save": cfg.get("steps_per_save", 100),
+                         "save_only_latest_checkpoint": cfg.get("save_only_latest_checkpoint", True),
+                         "save_full_checkpoint": cfg.get("save_full_checkpoint", True),
+                         "retention_owner": "SPIRULA_BACKEND"}
     env_overrides = cfg.get("environment_overrides", {})
     if not isinstance(env_overrides, dict) or not all(isinstance(k, str) and isinstance(v, str) for k, v in env_overrides.items()):
         raise BackendError("model.environment_overrides must be an object of string values", failure_kind="INVALID_CONFIGURATION")
@@ -988,17 +1081,19 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     write_json(manifest_path, training_manifest)
     input_validation_path = attempt / "training-input-validation.json"
     write_json(input_validation_path, input_validation)
-    command_record = {"stage": "training", "attempt_id": attempt.name, "engine_execution_id": execution_id, "backend_version": capabilities["tool"]["version"], "run_name": run_name, "run_type": cfg["run_type"], "configuration": {k:v for k,v in cfg.items() if k not in {"environment_overrides"}}, "command": command, "cwd": str(attempt.resolve()), "environment_override_keys": sorted(env_overrides), "resource_check": resources, "expected_output_prefix": str((attempt / "outputs" / run_name).resolve()), "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "started_at_utc": utc_now(), "artifact_discovery_status": "NOT_STARTED", "validation_result": {"status": "NOT_RUN"}}
+    command_record = {"stage": "training", "attempt_id": attempt.name, "engine_execution_id": execution_id, "backend_version": capabilities["tool"]["version"], "run_name": run_name, "run_type": cfg["run_type"], "configuration": {k:v for k,v in cfg.items() if k not in {"environment_overrides"}}, "command": command, "cwd": str(attempt.resolve()), "environment_override_keys": sorted(env_overrides), "resource_check": resources, "resource_limits": training_limits, "checkpoint_policy": checkpoint_policy, "resume_checkpoint_identity": resume_identity, "expected_output_prefix": str(backend_output_dir.resolve()), "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "started_at_utc": utc_now(), "artifact_discovery_status": "NOT_STARTED", "validation_result": {"status": "NOT_RUN"}}
     write_json(attempt / "command.json", command_record)
     if not authorization_plan_id:
         raise AuthorizationRequired("training", "Fresh training execution requires an explicit one-time authorization. Run plan --full-hash, then authorize the displayed plan_id.")
     assert_authorization_plan_current(root, config, state, "training", authorization_plan_id, backend_info=capabilities)
     execution = execute_process(state, execution_id, "training", command, attempt, attempt / "spirula.log", env_overrides,
-                               cfg.get("timeout_seconds", policy.get("training_timeout_seconds")), float(policy.get("poll_interval_seconds", 1.0)), checkpoint_root=attempt / "outputs")
+                               training_limits["training_timeout_seconds"], float(policy.get("poll_interval_seconds", 1.0)),
+                               checkpoint_root=checkpoint_root,
+                               minimum_free_disk_bytes=training_limits["minimum_free_disk_bytes_training"])
     command_record = read_json(attempt / "command.json")
     from .backends import discover_checkpoints
-    checkpoints = discover_checkpoints(attempt / "outputs")
-    candidates = discover_model_files(attempt / "outputs", cfg.get("artifact_selector"))
+    checkpoints = discover_checkpoints(checkpoint_root)
+    candidates = discover_model_files(backend_output_dir, cfg.get("artifact_selector"))
     model_validation = validate_gaussian_ply(candidates[0])
     model_validation.update({"producer": "Spirula", "producer_version": capabilities["tool"]["version"], "attempt_id": attempt.name,
                              "run_type": cfg["run_type"], "smoke_test_marker": "SMOKE_TEST_MODEL" if cfg["run_type"] == "smoke_test" else None,
@@ -1023,6 +1118,8 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
                   "public_selection_allowed": False, "backend": "spirula", "backend_version": capabilities["tool"]["version"],
                   "elapsed_seconds": execution["elapsed_seconds"], "exit_code": execution["exit_code"], "log_path": execution["log_path"],
                   "command": command, "configuration": command_record["configuration"], "resource_check": resources,
+                  "resource_limits": training_limits, "checkpoint_policy": checkpoint_policy,
+                  "resume_checkpoint_identity": resume_identity,
                   "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "checkpoint_resume_execution_status": "NOT_TESTED",
                   "discovered_checkpoints": checkpoints,
                   "model": model_validation, "input_manifest": str(manifest_path.resolve()), "input_validation_report": str(input_validation_path.resolve()),
@@ -1135,14 +1232,18 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
                         if not images.is_dir(): readiness = "BLOCKED_IMAGE_DIRECTORY_MISSING"
                     else:
                         effective_training_dataset(root, config)
-                        model_caps = backend or {"training": {"presets": [group_cfg.get("preset", "3dgs")], "arguments": ["--train-resolution-divisor", "--device", "--steps-per-save", "--save-only-latest-checkpoint", "--save-full-checkpoint", "--disable-viewer", "--keep-viewer-alive"]}}
+                        model_caps = backend or {"training": {"presets": [group_cfg.get("preset", "3dgs")], "arguments": ["--train-resolution-divisor", "--device", "--steps-per-save", "--save-only-latest-checkpoint", "--save-full-checkpoint", "--resume", "--quality", "--view-sampling", "--cache-images", "--load-masks", "--disable-viewer", "--keep-viewer-alive"], "checkpoint": {"latest_only_retention": "VERIFIED_BY_HELP", "latest_only_prunes_older": "VERIFIED_BY_HELP", "full_state": "VERIFIED_BY_HELP", "resume_cli_flag": "VERIFIED_BY_HELP"}}}
                         dataset_placeholder = attempt / "dataset"
-                        planned_command = build_training_command(executable, dataset_placeholder, attempt, group_cfg, model_caps, f"{config['project_id']}-{attempt_id}")
+                        resume_output_dir, _ = training_resume_identity(root, config, group_cfg)
+                        planned_command = build_training_command(executable, dataset_placeholder, attempt, group_cfg, model_caps, f"{config['project_id']}-{attempt_id}", resume_output_dir)
+                        validate_training_resource_policy(config, group_cfg)
                         if "iterations" not in group_cfg or "max_training_iterations" not in config.get("resource_policy", {}): readiness = "BLOCKED_EXPLICIT_ITERATION_CAP_REQUIRED"
                         elif group_cfg["iterations"] > config["resource_policy"]["max_training_iterations"]: readiness = "BLOCKED_ITERATION_CAP_EXCEEDED"
                     if planned_command and readiness == "READY": readiness = "READY_BACKEND_DRY_RUN"
                 except DatasetPreparationRequired as exc:
                     readiness = f"BLOCKED_DATASET_PREPARATION_REQUIRED:{exc}"
+                except WorkflowError as exc:
+                    readiness = f"BLOCKED_TRAINING_CONFIGURATION:{exc}"
                 except (BackendError, KeyError, TypeError, ValueError) as exc:
                     readiness = f"BLOCKED_BACKEND_CONFIGURATION:{exc}"
             if sid == "navigation" and has_cfg and configured_mode == "generate_from_sfm":
