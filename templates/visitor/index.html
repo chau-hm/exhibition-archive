@@ -1,0 +1,38 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="dark">
+  <meta name="theme-color" content="#151714">
+  <link rel="icon" href="data:,">
+  <title>__EXHIBITION_TITLE__</title>
+  <link rel="stylesheet" href="./vendor/supersplat-viewer.css">
+  <link rel="stylesheet" href="./css/viewer.css">
+</head>
+<body>
+  <main id="exhibition" aria-label="__EXHIBITION_TITLE__">
+    <div id="viewer" tabindex="-1" aria-label="Explore the exhibition in three dimensions"></div>
+    <div id="loading" role="status" aria-live="polite">
+      <div class="loading-card"><span class="spinner" aria-hidden="true"></span><span id="loadingMessage">Opening the exhibition…</span></div>
+    </div>
+    <header class="top-controls">
+      <h1>__EXHIBITION_TITLE__</h1>
+      <div class="top-actions">
+        <select id="languageSelect" aria-label="Language" title="Language">
+          <option value="zh-Hant">繁體中文</option>
+          <option value="en">English</option>
+        </select>
+        <button id="resetView" type="button" title="Return to the opening view">Reset view</button>
+      </div>
+    </header>
+    <div class="bottom-controls">
+      <button id="helpToggle" type="button" aria-expanded="true" aria-controls="helpPanel" title="Navigation help">Help</button>
+      <section id="helpPanel" aria-label="Navigation help">
+        <ul id="navigationInstructions"></ul>
+      </section>
+    </div>
+  </main>
+  <script type="module" src="./js/viewer.js"></script>
+</body>
+</html>

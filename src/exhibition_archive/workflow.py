@@ -33,7 +33,7 @@ STAGES = [
     {"id": "navigation", "deps": ["sfm"], "inputs": ["trusted camera poses, geometry evidence, coordinate frame and review decisions"], "outputs": ["versioned navigation proposal or approved artifact"], "mode": "adopt_existing or generate_from_sfm", "resource": "low"},
     {"id": "training", "deps": ["photo_inventory", "sfm"], "inputs": ["images and validated SfM"], "outputs": ["validated candidate 3DGS PLY and training provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "GPU intensive"},
     {"id": "evaluation", "deps": ["training", "artwork_association"], "inputs": ["candidate model and fidelity evidence"], "outputs": ["model selection and limitations"], "mode": "adopt evidence / human gate" , "resource": "review dependent"},
-    {"id": "viewer_package", "deps": ["training", "navigation", "evaluation", "artwork_association"], "inputs": ["selected model, navigation, confirmed catalogue, theme"], "outputs": ["portable static website"], "mode": "execute locally", "resource": "large model copy"},
+    {"id": "viewer_package", "deps": ["training", "navigation", "evaluation", "artwork_association"], "inputs": ["selected model, navigation, confirmed catalogue, theme"], "outputs": ["independent static Review and Visitor websites"], "mode": "execute locally", "resource": "model copy and optional SOG conversion"},
     {"id": "archive_package", "deps": ["photo_inventory", "capture_preflight", "artwork_association", "sfm", "training", "evaluation", "navigation", "viewer_package"], "inputs": ["validated evidence and package"], "outputs": ["private archive metadata and manifest"], "mode": "execute locally", "resource": "low"},
     {"id": "verification", "deps": ["archive_package"], "inputs": ["website, manifest, checksums, policies"], "outputs": ["verification report"], "mode": "execute locally", "resource": "I/O bound"},
 ]
@@ -225,9 +225,23 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
         viewer_source = Path(__file__).resolve().parents[2] / "templates" / "viewer"
         for name in ("app.js", "index.html", "style.css", "vendor/index.js", "vendor/index.css"):
             selected["files"].append(fingerprint_file(state, viewer_source / name, full_hash))
+        visitor_source = Path(__file__).resolve().parents[2] / "templates" / "visitor"
+        for name in ("app.js", "index.html", "style.css", "runtime.js", "locales.json",
+                     "vendor/visitor-app.js", "vendor/supersplat-viewer.js", "vendor/supersplat-viewer.css",
+                     "vendor/SUPERSPLAT-VIEWER-LICENSE.txt", "vendor/PLAYCANVAS-LICENSE.txt",
+                     "vendor/THIRD_PARTY-NOTICES.md", "vendor/runtime.json"):
+            selected["files"].append(fingerprint_file(state, visitor_source / name, full_hash))
+        product_root = Path(__file__).resolve().parents[2]
+        for path in (product_root / "scripts" / "build_visitor_viewer.mjs", product_root / "package.json", product_root / "package-lock.json"):
+            selected["files"].append(fingerprint_file(state, path, full_hash))
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("publisher.py"), full_hash))
+        selected["files"].append(fingerprint_file(state, Path(__file__).with_name("visitor.py"), full_hash))
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("adapters.py"), full_hash))
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("navigation.py"), full_hash))
+        selected["visitor_sog_tool"] = {"name": "@playcanvas/splat-transform", "version": "3.10.3", "sh_iterations": 20,
+                                        "webp_effort": 9, "gpu": "cpu", "max_workers": 4,
+                                        "diagnostics": ["verbose", "memory"], "timeout_seconds": 600,
+                                        "node_heap_mb": 8192}
     if stage_id == "archive_package":
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("workflow.py"), full_hash))
     if stage_id == "verification":
@@ -1987,6 +2001,7 @@ def _website_reference_failures(website: Path) -> list[str]:
 def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectState | None = None, force_hash: bool = False) -> dict:
     output_root = output_path(root, config)
     website, archive = output_root / "website", output_root / "archive"
+    visitor_website = output_root / "website-visitor"
     manifest = read_json(archive / "manifest.json")
     failures = []
     checks = []
@@ -2019,7 +2034,7 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         if digest != image.get("sha256"):
             source_errors.append({"image_id": image.get("image_id"), "issue": "SHA256_MISMATCH"})
     if source_errors: failures.append(f"Source photo integrity gate failed for {len(source_errors)} files")
-    public_files = [p for p in website.rglob("*") if p.is_file()]
+    public_files = [p for site in (website, visitor_website) for p in site.rglob("*") if p.is_file()]
     public_text = []
     for p in public_files:
         if p.suffix.casefold() in {".json", ".html", ".js", ".css", ".md", ".txt"}:
@@ -2045,6 +2060,19 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
             failures.append("Website package index project_id does not match the configured project")
         if package_index.get("model_sha256") != expected_hash:
             failures.append("Website package index model_sha256 does not match the selected baseline")
+    visitor_index_path = visitor_website / "config" / "package-index.json"
+    visitor_index = None
+    if not visitor_index_path.is_file():
+        failures.append("Visitor website package index is missing")
+    else:
+        visitor_index = read_json(visitor_index_path)
+        visitor_checks, visitor_failures = verify_website_package_index(visitor_website, visitor_index)
+        checks.extend(visitor_checks)
+        failures.extend(visitor_failures)
+        if visitor_index.get("profile") != "visitor":
+            failures.append("Visitor package index does not identify the visitor publication profile")
+        if visitor_index.get("project_id") != config.get("project_id") or visitor_index.get("model_sha256") != expected_hash:
+            failures.append("Visitor package index project or master PLY identity does not match the selected baseline")
     app_path, html_path = website / "viewer" / "app.js", website / "viewer" / "index.html"
     if app_path.is_file() and html_path.is_file():
         app_text = app_path.read_text(encoding="utf-8", errors="replace")
@@ -2053,6 +2081,7 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         if absolute_asset.search(app_text) or absolute_asset.search(html_text):
             failures.append("Static viewer contains a root-absolute asset/API path and may fail under a nested deployment path")
     failures.extend(_website_reference_failures(website))
+    failures.extend(_website_reference_failures(visitor_website))
     health_path = website / "api" / "health.json"
     if health_path.is_file():
         health = read_json(health_path)
@@ -2081,4 +2110,52 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
     expected_website = [website / "index.html", website / "viewer" / "app.js", website / "viewer" / "vendor" / "index.js", website / "config" / "navigation.json", packaged_model, package_index_path]
     for p in expected_website:
         if not p.is_file(): failures.append(f"Required website file missing: {p.relative_to(website)}")
-    return {"schema_version": "exhibition-archive.verification.v1", "status": "PASS" if not failures else "FAIL", "checks": checks, "model_identity_match": model_ok, "source_photo_count": source_index.get("image_count"), "source_photo_integrity_failure_count": len(source_errors), "source_photo_integrity_failures": source_errors, "full_hash_requested": force_hash, "public_text_file_count": len(public_text), "failure_count": len(failures), "failures": failures, "static_http_browser_validation": "see separate browser-validation evidence", "verified_at_utc": utc_now()}
+    visitor_required = [
+        visitor_website / "index.html", visitor_website / "js" / "viewer.js", visitor_website / "css" / "viewer.css",
+        visitor_website / "vendor" / "supersplat-viewer.js", visitor_website / "vendor" / "supersplat-viewer.css",
+        visitor_website / "config" / "settings.json", visitor_website / "config" / "exhibition.json",
+        visitor_website / "config" / "locales.json", visitor_website / "assets" / "exhibition.ply",
+        visitor_website / "assets" / "enclosure-collision.glb", visitor_index_path,
+    ]
+    for path in visitor_required:
+        if not path.is_file(): failures.append(f"Required visitor website file missing: {path.relative_to(visitor_website)}")
+    visitor_metadata_path = visitor_website / "config" / "exhibition.json"
+    visitor_metadata = read_json(visitor_metadata_path) if visitor_metadata_path.is_file() else {}
+    visitor_ply = visitor_website / "assets" / "exhibition.ply"
+    if visitor_ply.is_file() and (sha256_file(visitor_ply) != expected_hash or visitor_ply.stat().st_size != model.stat().st_size):
+        failures.append("Visitor PLY fallback does not match the accepted master model identity")
+    master_record = visitor_metadata.get("master", {})
+    if master_record.get("sha256") != expected_hash or master_record.get("size_bytes") != model.stat().st_size:
+        failures.append("Visitor master metadata does not match the selected accepted PLY identity")
+    conversion_record = visitor_metadata.get("conversion", {})
+    if conversion_record.get("input_sha256") != expected_hash:
+        failures.append("Visitor conversion input hash does not match the selected accepted PLY master")
+    collision_path = visitor_website / "assets" / "enclosure-collision.glb"
+    collision_record = visitor_metadata.get("collision", {})
+    if collision_record.get("source_model_sha256") != expected_hash:
+        failures.append("Visitor enclosure collision provenance does not match the selected accepted PLY")
+    if collision_path.is_file() and (sha256_file(collision_path) != collision_record.get("sha256") or collision_path.stat().st_size != collision_record.get("size_bytes")):
+        failures.append("Visitor enclosure collision mesh does not match its recorded integrity metadata")
+    if visitor_metadata.get("profile") != "visitor" or visitor_metadata.get("release_authorization") != "NEEDS_REVIEW":
+        failures.append("Visitor package profile or independent release authorization state is invalid")
+    if visitor_metadata.get("primary_format") == "sog":
+        sog_path = visitor_website / "assets" / "exhibition.sog"
+        from zipfile import is_zipfile
+        sog_version_ok = bool(re.search(r"\bv3\.10\.3\b", str(conversion_record.get("tool_version", ""))))
+        if (not sog_path.is_file() or not is_zipfile(sog_path) or sha256_file(sog_path) != conversion_record.get("output_sha256")
+                or sog_path.stat().st_size != conversion_record.get("output_size_bytes")
+                or conversion_record.get("status") != "COMPLETED" or not sog_version_ok):
+            failures.append("Visitor SOG primary asset is missing, invalid, or does not match its conversion integrity metadata")
+    elif visitor_metadata.get("primary_format") != "ply":
+        failures.append("Visitor package has an unsupported primary model format")
+    if collision_record.get("contains_interior_objects") is not False:
+        failures.append("Visitor collision data must contain only the accepted enclosure, floor, and ceiling")
+    visitor_html = visitor_website / "index.html"
+    if visitor_html.is_file():
+        html_text = visitor_html.read_text(encoding="utf-8", errors="replace").casefold()
+        for forbidden_control in ("guided tour", "route selector", "diagnostic", "geometry overlay", "technical status"):
+            if forbidden_control in html_text:
+                failures.append(f"Visitor presentation contains a removed technical control: {forbidden_control}")
+        if 'id="resetview"' not in html_text or 'id="helptoggle"' not in html_text:
+            failures.append("Visitor presentation is missing Reset View or navigation help")
+    return {"schema_version": "exhibition-archive.verification.v1", "status": "PASS" if not failures else "FAIL", "checks": checks, "model_identity_match": model_ok, "visitor_primary_format": visitor_metadata.get("primary_format"), "visitor_sog_status": visitor_metadata.get("conversion", {}).get("status"), "visitor_enclosure_collision": collision_record.get("contains_interior_objects") is False, "source_photo_count": source_index.get("image_count"), "source_photo_integrity_failure_count": len(source_errors), "source_photo_integrity_failures": source_errors, "full_hash_requested": force_hash, "public_text_file_count": len(public_text), "failure_count": len(failures), "failures": failures, "static_http_browser_validation": "see separate browser-validation evidence", "verified_at_utc": utc_now()}

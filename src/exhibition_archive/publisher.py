@@ -1,9 +1,14 @@
 from __future__ import annotations
 
 import html
+import json
 import math
+import os
+import re
 import struct
 import shutil
+import subprocess
+import time
 from pathlib import Path
 from typing import Any
 
@@ -12,6 +17,20 @@ from .workflow import output_path, project_path
 
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
+SOG_TOOL_VERSION = "3.10.3"
+SOG_SH_ITERATIONS = 20
+SOG_WEBP_EFFORT = 9
+SOG_MAX_WORKERS = 4
+SOG_MAX_SECONDS = 600
+SOG_NODE_OLD_SPACE_MB = 8192
+SOG_OUTPUT_TAIL_CHARS = 12000
+
+
+def _process_output_tail(value: str | bytes | None) -> str | None:
+    if value is None:
+        return None
+    text = value.decode("utf-8", errors="replace") if isinstance(value, bytes) else value
+    return text[-SOG_OUTPUT_TAIL_CHARS:] or None
 
 
 def _path(root: Path, config: dict, group: str, key: str) -> Path:
@@ -140,6 +159,9 @@ def _static_api(root: Path, config: dict, website: Path, model_record: dict, sta
     _write_json(website, "footprints", footprint_public)
     _write_json(website, "distribution", {"schemaVersion": 1, "threeNearestNeighborEdges": distribution.get("threeNearestNeighborEdges", [])})
     _write_json(website, "transform", transform.get("transform", {}))
+    from .visitor import canonical_initial_camera, viewer_transform_node
+    initial_camera = canonical_initial_camera(envelope, stations, viewer_transform_node(transform.get("transform", {})))
+    _write_json(website, "initial-camera", initial_camera)
     _write_json(website, "artifact-evidence", {"schemaVersion": 1, "status": "GEOMETRY_VIEWPOINT_ONLY; no artwork identity or semantic label is published", "candidate": candidates[0] if candidates else {}})
     _write_json(website, "ghost-annotations", {"schemaVersion": 1, "annotations": []})
 
@@ -173,6 +195,227 @@ def _static_api(root: Path, config: dict, website: Path, model_record: dict, sta
         write_json(website / "config" / "navigation.json", public_json({"envelope": envelope, "runtime_policy": policy}))
     write_json(website / "config" / "artworks.json", public_json(confirmed))
     return {"health": health, "public_artwork_count": config_file["artwork_catalogue_status"], "static_api_count": 11}
+
+
+def _visitor_transform(root: Path, config: dict) -> dict:
+    raw = config.get("integrations", {}).get("navigation", {}).get("transform")
+    if not raw:
+        return {}
+    path = _path(root, config, "navigation", "transform")
+    return read_json(path)
+
+
+def _splat_transform_binary() -> str | None:
+    configured = os.environ.get("EXHIBITION_ARCHIVE_SPLAT_TRANSFORM")
+    if configured:
+        path = Path(configured).expanduser()
+        return str(path.resolve()) if path.is_file() else None
+    local_binary = PRODUCT_ROOT / "node_modules" / ".bin" / "splat-transform"
+    if local_binary.is_file():
+        return str(local_binary)
+    return shutil.which("splat-transform")
+
+
+def _convert_sog(model: Path, target: Path) -> dict[str, Any]:
+    from .visitor import VIEWER_VERSION
+
+    command_template = ["splat-transform", "--no-tty", "--verbose", "--memory", "--webp-effort", str(SOG_WEBP_EFFORT),
+                        "--sh-iterations", str(SOG_SH_ITERATIONS), "--max-workers", str(SOG_MAX_WORKERS),
+                        "--gpu", "cpu", "accepted-master.ply", "exhibition.sog"]
+    base_provenance = {
+        "tool": "@playcanvas/splat-transform CLI",
+        "expected_tool_version": SOG_TOOL_VERSION,
+        "elapsed_time_limit_seconds": SOG_MAX_SECONDS,
+        "node_old_space_limit_mb": SOG_NODE_OLD_SPACE_MB,
+        "settings": {"sh_band_clustering_iterations": SOG_SH_ITERATIONS, "lossless_webp_effort": SOG_WEBP_EFFORT,
+                     "gpu": "cpu", "workers": SOG_MAX_WORKERS, "filters": [], "decimation": None,
+                     "coordinate_transform": "none; original accepted PLY coordinates retained"},
+        "command_template": command_template,
+        "viewer_version": VIEWER_VERSION,
+        "input_size_bytes": model.stat().st_size,
+    }
+    if os.environ.get("EXHIBITION_ARCHIVE_BUILD_SOG") != "1":
+        return {**base_provenance, "status": "NOT_REQUESTED",
+                "reason": "SOG conversion is opt-in; set EXHIBITION_ARCHIVE_BUILD_SOG=1 for an explicitly authorized bounded conversion. The visitor package uses its PLY fallback."}
+    executable = _splat_transform_binary()
+    if not executable:
+        return {**base_provenance, "status": "NOT_AVAILABLE",
+                "reason": "splat-transform was not found; the visitor package uses its PLY fallback."}
+    try:
+        version_result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=30, check=False)
+    except (OSError, subprocess.TimeoutExpired):
+        return {**base_provenance, "status": "NOT_AVAILABLE",
+                "reason": "Could not query splat-transform; the visitor package uses its PLY fallback."}
+    version = (version_result.stdout or version_result.stderr).strip().splitlines()
+    version_text = version[0] if version else ""
+    match = re.search(r"\bv(\d+\.\d+\.\d+)\b", version_text)
+    if version_result.returncode or not match or match.group(1) != SOG_TOOL_VERSION:
+        return {**base_provenance, "status": "UNSUPPORTED_TOOL_VERSION",
+                "reason": f"Expected splat-transform {SOG_TOOL_VERSION}; found {version_text or 'unknown'}. The visitor package uses its PLY fallback.",
+                "tool_version": version_text or None}
+    provenance = {**base_provenance, "tool_version": version_text}
+    target.parent.mkdir(parents=True, exist_ok=True)
+    command = [executable, "--no-tty", "--verbose", "--memory", "--webp-effort", str(SOG_WEBP_EFFORT),
+               "--sh-iterations", str(SOG_SH_ITERATIONS), "--max-workers", str(SOG_MAX_WORKERS),
+               "--gpu", "cpu", str(model), str(target)]
+    child_env = os.environ.copy()
+    child_env["NODE_OPTIONS"] = (child_env.get("NODE_OPTIONS", "").strip() + f" --max-old-space-size={SOG_NODE_OLD_SPACE_MB}").strip()
+    started_at = time.monotonic()
+    try:
+        converted = subprocess.run(command, capture_output=True, text=True, timeout=SOG_MAX_SECONDS, check=False, env=child_env)
+    except subprocess.TimeoutExpired as error:
+        elapsed = round(time.monotonic() - started_at, 3)
+        target.unlink(missing_ok=True)
+        return {**provenance, "status": "TIMEOUT", "elapsed_seconds": elapsed,
+                "stdout_tail": _process_output_tail(error.stdout), "stderr_tail": _process_output_tail(error.stderr),
+                "reason": f"SOG conversion exceeded {SOG_MAX_SECONDS} seconds; the visitor package uses its PLY fallback."}
+    except OSError:
+        elapsed = round(time.monotonic() - started_at, 3)
+        target.unlink(missing_ok=True)
+        return {**provenance, "status": "FAILED", "elapsed_seconds": elapsed,
+                "reason": "Could not run splat-transform; the visitor package uses its PLY fallback."}
+    elapsed = round(time.monotonic() - started_at, 3)
+    if converted.returncode or not target.is_file() or target.stat().st_size <= 0:
+        target.unlink(missing_ok=True)
+        return {**provenance, "status": "FAILED", "reason": f"splat-transform returned {converted.returncode} or produced no SOG; the visitor package uses its PLY fallback.",
+                "returncode": converted.returncode, "elapsed_seconds": elapsed,
+                "stdout_tail": _process_output_tail(converted.stdout), "stderr_tail": _process_output_tail(converted.stderr)}
+    from zipfile import is_zipfile
+    if not is_zipfile(target):
+        target.unlink(missing_ok=True)
+        return {**provenance, "status": "FAILED", "elapsed_seconds": elapsed,
+                "stdout_tail": _process_output_tail(converted.stdout), "stderr_tail": _process_output_tail(converted.stderr),
+                "reason": "splat-transform output is not a valid bundled SOG archive; the visitor package uses its PLY fallback."}
+    output_size = target.stat().st_size
+    return {
+        **provenance,
+        "status": "COMPLETED",
+        "elapsed_seconds": elapsed,
+        "output_size_bytes": output_size,
+        "compression_ratio_output_to_input": output_size / model.stat().st_size,
+        "output_sha256": sha256_file(target),
+        "stdout_tail": _process_output_tail(converted.stdout),
+        "stderr_tail": _process_output_tail(converted.stderr),
+    }
+
+
+def _build_visitor_website(root: Path, config: dict, model_record: dict, review_website: Path) -> dict[str, Any]:
+    from .visitor import enclosure_collision_glb, visitor_camera_settings, viewer_transform_node, write_glb
+
+    website = output_path(root, config) / "website-visitor"
+    staging = website.with_name("website-visitor.staging")
+    if staging.exists():
+        shutil.rmtree(staging)
+    for folder in ("assets", "config", "vendor", "js", "css"):
+        (staging / folder).mkdir(parents=True, exist_ok=True)
+    title = str(config.get("viewer", {}).get("title", config["project_id"]))
+    source_template = PRODUCT_ROOT / "templates" / "visitor"
+    html_template = (source_template / "index.html").read_text(encoding="utf-8")
+    public_html = html_template.replace("__EXHIBITION_TITLE__", html.escape(title, quote=True))
+    if "__EXHIBITION_TITLE__" in public_html:
+        raise ValueError("Visitor viewer title was not rendered")
+    (staging / "index.html").write_text(public_html, encoding="utf-8")
+    shutil.copy2(source_template / "style.css", staging / "css" / "viewer.css")
+    shutil.copy2(source_template / "locales.json", staging / "config" / "locales.json")
+    visitor_vendor = source_template / "vendor"
+    required_vendor = ("supersplat-viewer.css", "SUPERSPLAT-VIEWER-LICENSE.txt", "PLAYCANVAS-LICENSE.txt", "THIRD_PARTY-NOTICES.md", "runtime.json")
+    missing_vendor = [name for name in required_vendor if not (visitor_vendor / name).is_file()]
+    if not (visitor_vendor / "visitor-app.js").is_file():
+        missing_vendor.append("visitor-app.js")
+    if missing_vendor:
+        raise ValueError(f"Visitor viewer runtime has not been built; missing: {missing_vendor}. Run npm run build:visitor-viewer.")
+    for name in required_vendor:
+        shutil.copy2(visitor_vendor / name, staging / "vendor" / name)
+    acceptance_build = os.environ.get("EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE") == "1"
+    if acceptance_build:
+        visitor_js = (source_template / "app.js").read_text(encoding="utf-8")
+        visitor_js = visitor_js.replace("__EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__", "true")
+        if "__EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__" in visitor_js:
+            raise ValueError("Visitor acceptance build marker was not rendered")
+        (staging / "js" / "viewer.js").write_text(visitor_js, encoding="utf-8")
+    else:
+        shutil.copy2(visitor_vendor / "visitor-app.js", staging / "js" / "viewer.js")
+    shutil.copy2(visitor_vendor / "supersplat-viewer.js", staging / "vendor" / "supersplat-viewer.js")
+
+    model = Path(model_record["path"])
+    ply_path = staging / "assets" / "exhibition.ply"
+    shutil.copy2(model, ply_path)
+    review_api = review_website / "api"
+    envelope = read_json(review_api / "boundary.json")
+    stations = read_json(review_api / "stations.json")
+    transform_doc = read_json(review_api / "transform.json") if (review_api / "transform.json").is_file() else _visitor_transform(root, config)
+    transform_node = viewer_transform_node(transform_doc)
+    settings, camera = visitor_camera_settings(envelope, stations, transform_node)
+    write_json(staging / "config" / "settings.json", settings)
+    collision_data, collision_metadata = enclosure_collision_glb(envelope, transform_node)
+    collision_path = staging / "assets" / "enclosure-collision.glb"
+    write_glb(collision_path, collision_data)
+    collision_metadata.update({"source_model_sha256": model_record["sha256"],
+                               "sha256": sha256_file(collision_path), "size_bytes": collision_path.stat().st_size})
+
+    sog_path = staging / "assets" / "exhibition.sog"
+    conversion = _convert_sog(model, sog_path)
+    conversion["input_sha256"] = model_record["sha256"]
+    primary = "sog" if conversion.get("status") == "COMPLETED" else "ply"
+    viewer_runtime = read_json(visitor_vendor / "runtime.json")
+    default_language = str(config.get("viewer", {}).get("default_language", "en"))
+    if default_language not in {"en", "zh-Hant", "zh-TW"}:
+        default_language = "en"
+    metadata = {
+        "schema_version": "exhibition-archive.visitor-publication.v1",
+        "profile": "visitor",
+        "project_id": config["project_id"],
+        "title": title,
+        "default_language": "zh-Hant" if default_language == "zh-TW" else default_language,
+        "release_authorization": "NEEDS_REVIEW",
+        "primary_format": primary,
+        "models": {
+            "sog": {"url": "./assets/exhibition.sog", "filename": "exhibition.sog", "available": conversion.get("status") == "COMPLETED"},
+            "ply": {"url": "./assets/exhibition.ply", "filename": "exhibition.ply", "available": True},
+        },
+        "master": {"filename": "exhibition.ply", "size_bytes": model.stat().st_size, "sha256": model_record["sha256"],
+                   "gaussian_count": model_record.get("gaussian_count"), "selection": model_record.get("selection")},
+        "conversion": conversion,
+        "collision": {"url": "./assets/enclosure-collision.glb", **collision_metadata},
+        "initial_camera": camera,
+        "viewer_runtime": viewer_runtime,
+        "navigation_policy": "Free XYZ SuperSplat Fly Mode; enclosure-only collision shell derived from the accepted horizontal boundary, floor, and ceiling. No fixed-height Walk Mode or interior-object collisions.",
+        "visitor_ui": ["unobtrusive navigation help", "reset view"],
+    }
+    write_json(staging / "config" / "exhibition.json", metadata)
+    model_role = "It is the active visitor model." if primary == "ply" else "It is available as a fallback."
+    conversion_note = ""
+    if conversion.get("status") != "COMPLETED":
+        conversion_note = f" SOG conversion status: {conversion.get('status', 'UNKNOWN')}. {conversion.get('reason', 'The package uses its accepted PLY model.')}"
+    readme = f"""# {title} — visitor website\n\nThis static package opens directly into the exhibition. It uses the official SuperSplat Viewer {viewer_runtime['viewer']['version']} with an enclosure-only collision mesh. Visitors can fly freely in XYZ, reset to the opening view, and open brief navigation help. The package contains no guided tours, route selectors, diagnostics, geometry overlays, or technical status panels.\n\nThe primary model format is **{primary.upper()}**. The accepted master PLY is retained as `assets/exhibition.ply`; {model_role}{conversion_note} `config/exhibition.json` records the master hash, conversion tool and settings, output hashes, Viewer version, and collision dimensions. `config/package-index.json` hashes every payload file except itself.\n\nThe website is modular: replace `assets/exhibition.ply` (or the optional `assets/exhibition.sog`) while keeping the configured filename, edit `config/settings.json` for the opening view and rendering settings, and edit `config/locales.json` for visitor UI text. See `INTEGRATION.md` for HTTP hosting, nested paths, iframe embedding, and direct use of the model with the official Viewer API. Modular assets require HTTP/HTTPS; double-click `file://` is not supported.\n\nThis website is a static publication candidate, not a Preservation Package. Release authorization remains **NEEDS_REVIEW**. Review artwork identity and rights, navigation, and access policy before any public release.\n"""
+    (staging / "README.md").write_text(readme, encoding="utf-8")
+    shutil.copy2(PRODUCT_ROOT / "docs" / "visitor-integration.md", staging / "INTEGRATION.md")
+    index = [{"path": path.relative_to(staging).as_posix(), "size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
+             for path in sorted(staging.rglob("*")) if path.is_file()]
+    write_json(staging / "config" / "package-index.json", {
+        "schema_version": "exhibition-archive.website-index.v2",
+        "project_id": config["project_id"],
+        "model_sha256": model_record["sha256"],
+        "profile": "visitor",
+        "file_count": len(index),
+        "total_bytes": sum(row["size_bytes"] for row in index),
+        "files": index,
+    })
+    if website.exists():
+        shutil.rmtree(website)
+    staging.replace(website)
+    published_collision = website / "assets" / "enclosure-collision.glb"
+    return {
+        "website": str(website),
+        "primary_format": primary,
+        "sog_status": conversion.get("status"),
+        "sog_size_bytes": conversion.get("output_size_bytes"),
+        "sog_sha256": conversion.get("output_sha256"),
+        "collision_size_bytes": published_collision.stat().st_size,
+        "collision_sha256": collision_metadata["sha256"],
+        "total_bytes": sum(row["size_bytes"] for row in index),
+        "package_index": str(website / "config" / "package-index.json"),
+    }
 
 
 def build_website(root: Path, config: dict, state, output_dir: Path) -> dict:
@@ -262,5 +505,20 @@ Engine version detected in the bundle: 2.23.0. The upstream Viewer is MIT-licens
         shutil.rmtree(website)
     staging.replace(website)
     packaged_model = website / "assets" / "exhibition.ply"
-    return {"status": "COMPLETED", "artifacts": [website / "index.html", website / "viewer" / "app.js", packaged_model, website / "config" / "navigation.json"],
-            "details": {"website": str(website), "model_size_bytes": packaged_model.stat().st_size, "model_sha256": sha256_file(packaged_model), "public_artwork_count": confirmed_count, "viewer_origin": "generic metadata-driven PlayCanvas static archive viewer", "source_photographs_included": False}}
+    from .model_registry import selected_model_record
+    model_record = selected_model_record(root, config, state)
+    visitor_details = _build_visitor_website(root, config, model_record, website)
+    visitor_website = Path(visitor_details["website"])
+    return {"status": "COMPLETED", "artifacts": [website / "index.html", website / "viewer" / "app.js", packaged_model,
+                                                    website / "api" / "initial-camera.json",
+                                                    website / "config" / "navigation.json", website / "config" / "package-index.json",
+                                                    visitor_website / "index.html", visitor_website / "js" / "viewer.js",
+                                                    visitor_website / "css" / "viewer.css",
+                                                    visitor_website / "config" / "settings.json",
+                                                    visitor_website / "config" / "exhibition.json",
+                                                    visitor_website / "assets" / "exhibition.ply", visitor_website / "assets" / "enclosure-collision.glb",
+                                                    visitor_website / "config" / "package-index.json"],
+            "details": {"website": str(website), "review_website": str(website), "visitor_website": str(visitor_website),
+                        "model_size_bytes": packaged_model.stat().st_size, "model_sha256": sha256_file(packaged_model),
+                        "public_artwork_count": confirmed_count, "viewer_origin": "Review: existing diagnostic PlayCanvas viewer; Visitor: official SuperSplat Viewer",
+                        "visitor": visitor_details, "source_photographs_included": False}}

@@ -1,0 +1,42 @@
+{
+  "en": {
+    "exhibitionAria": "Exhibition viewer",
+    "viewerAria": "Explore the exhibition in three dimensions",
+    "languageAria": "Choose language",
+    "loading": "Opening the exhibition…",
+    "fallbackLoading": "Opening the original exhibition model…",
+    "assetError": "model request failed",
+    "error": "This exhibition could not be opened. Please try again later.",
+    "reset": "Reset view",
+    "resetTitle": "Return to the opening view",
+    "help": "Help",
+    "helpTitle": "Navigation help",
+    "close": "Close",
+    "closeTitle": "Close navigation help",
+    "instructions": [
+      "W / A / S / D — fly forward, left, back and right",
+      "E / Q — rise and descend",
+      "Hold the left mouse button and drag to look around"
+    ]
+  },
+  "zh-Hant": {
+    "exhibitionAria": "展覽檢視器",
+    "viewerAria": "以三維方式探索展覽",
+    "languageAria": "選擇語言",
+    "loading": "正在開啟展覽…",
+    "fallbackLoading": "正在開啟原始展覽模型…",
+    "assetError": "模型讀取失敗",
+    "error": "無法開啟此展覽，請稍後再試。",
+    "reset": "重設視角",
+    "resetTitle": "返回展覽起始視角",
+    "help": "操作說明",
+    "helpTitle": "導覽操作說明",
+    "close": "關閉",
+    "closeTitle": "關閉操作說明",
+    "instructions": [
+      "W / A / S / D — 向前、向左、向後、向右飛行",
+      "E / Q — 上升、下降",
+      "按住滑鼠左鍵並拖曳以環視"
+    ]
+  }
+}

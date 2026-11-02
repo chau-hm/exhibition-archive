@@ -27,7 +27,7 @@ function check(name,ok,details={}){result.checks.push({name,ok:Boolean(ok),...de
 function sleep(ms){return new Promise(resolve=>setTimeout(resolve,ms));}
 function finish(){if(result.status==='RUNNING')result.status=result.checks.every(x=>x.ok)?'PASS':'FAIL';document.getElementById('result').textContent=JSON.stringify(result);}
 async function run(){
- const frame=document.getElementById('site');frame.src=`${prefix}/`;
+ const frame=document.getElementById('site');frame.src=`${prefix}/`;frame.contentWindow.focus();
  const deadline=Date.now()+210000;let doc=null,hooks=null,errorState=false;
  while(Date.now()<deadline){
    try{doc=frame.contentDocument;hooks=frame.contentWindow.__exhibitionArchiveTestHooks;const status=doc?.getElementById('modelStatus')?.textContent||'';
@@ -261,6 +261,7 @@ def chrome_binary(value: str | None) -> str:
 def run_chrome(chrome: str, url: str, profile: Path, screenshot: Path | None, timeout: int) -> tuple[str, str, int]:
     command = [
         chrome, "--headless=new", "--no-sandbox", "--disable-dev-shm-usage", "--enable-webgl",
+        "--disable-background-timer-throttling", "--disable-renderer-backgrounding", "--disable-backgrounding-occluded-windows",
         "--enable-unsafe-swiftshader", "--use-gl=angle", "--use-angle=swiftshader",
         "--hide-scrollbars", "--window-size=1600,1000", "--virtual-time-budget=600000",
         f"--user-data-dir={profile}", "--dump-dom",

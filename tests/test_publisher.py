@@ -2,14 +2,16 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import subprocess
 import sys
 import tempfile
 import unittest
+from unittest.mock import patch
 from pathlib import Path
 
 from exhibition_archive.adapters import sha256_file, write_json
-from exhibition_archive.publisher import build_website
+from exhibition_archive.publisher import _convert_sog, build_website
 from exhibition_archive.workflow import _website_reference_failures, verify_website_package_index
 
 
@@ -105,6 +107,88 @@ class WebsiteReferenceTests(unittest.TestCase):
             self.assertTrue(any("missing" in failure for failure in failures))
 
 
+class SogConversionTests(unittest.TestCase):
+    def test_timeout_preserves_conversion_settings_and_removes_partial_output(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "accepted-master.ply"
+            source.write_bytes(b"master fixture")
+            target = root / "assets" / "exhibition.sog"
+            version = subprocess.CompletedProcess(["splat-transform", "--version"], 0, "splat-transform v3.10.3 (fixture)\n", "")
+            timeout = subprocess.TimeoutExpired("splat-transform", 600, output=b"SH clustering 31%", stderr=b"peak working set 123 MiB")
+            with (
+                patch.dict(os.environ, {"EXHIBITION_ARCHIVE_BUILD_SOG": "1"}),
+                patch("exhibition_archive.publisher._splat_transform_binary", return_value="splat-transform"),
+                patch("exhibition_archive.publisher.subprocess.run", side_effect=[version, timeout]),
+                patch("exhibition_archive.publisher.time.monotonic", side_effect=[10.0, 610.0]),
+            ):
+                result = _convert_sog(source, target)
+
+            self.assertEqual(result["status"], "TIMEOUT")
+            self.assertEqual(result["tool"], "@playcanvas/splat-transform CLI")
+            self.assertEqual(result["tool_version"], "splat-transform v3.10.3 (fixture)")
+            self.assertEqual(result["settings"]["sh_band_clustering_iterations"], 20)
+            self.assertEqual(result["settings"]["lossless_webp_effort"], 9)
+            self.assertEqual(result["settings"]["gpu"], "cpu")
+            self.assertEqual(result["settings"]["workers"], 4)
+            self.assertEqual(result["elapsed_time_limit_seconds"], 600)
+            self.assertEqual(result["elapsed_seconds"], 600.0)
+            self.assertEqual(result["stdout_tail"], "SH clustering 31%")
+            self.assertEqual(result["stderr_tail"], "peak working set 123 MiB")
+            self.assertEqual(result["input_size_bytes"], len(b"master fixture"))
+            self.assertEqual(result["node_old_space_limit_mb"], 8192)
+            self.assertFalse(target.exists())
+
+    def test_success_records_duration_size_hash_and_compression_ratio(self):
+        from zipfile import ZipFile
+
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "accepted-master.ply"
+            source.write_bytes(b"a sufficiently large accepted master fixture")
+            target = root / "assets" / "exhibition.sog"
+            version = subprocess.CompletedProcess(["splat-transform", "--version"], 0, "splat-transform v3.10.3 (fixture)\n", "")
+
+            def convert(command, **_kwargs):
+                with ZipFile(command[-1], "w") as archive:
+                    archive.writestr("meta.json", "{}")
+                return subprocess.CompletedProcess(command, 0, "encoded SOG", "memory sample")
+
+            def run(command, **kwargs):
+                return version if command[-1] == "--version" else convert(command, **kwargs)
+
+            with (
+                patch.dict(os.environ, {"EXHIBITION_ARCHIVE_BUILD_SOG": "1"}),
+                patch("exhibition_archive.publisher._splat_transform_binary", return_value="splat-transform"),
+                patch("exhibition_archive.publisher.subprocess.run", side_effect=run),
+                patch("exhibition_archive.publisher.time.monotonic", side_effect=[3.0, 5.5]),
+            ):
+                result = _convert_sog(source, target)
+
+            self.assertEqual(result["status"], "COMPLETED")
+            self.assertEqual(result["elapsed_seconds"], 2.5)
+            self.assertEqual(result["output_size_bytes"], target.stat().st_size)
+            self.assertEqual(result["compression_ratio_output_to_input"], target.stat().st_size / source.stat().st_size)
+            self.assertEqual(result["output_sha256"], sha256_file(target))
+            self.assertEqual(result["stdout_tail"], "encoded SOG")
+            self.assertEqual(result["stderr_tail"], "memory sample")
+
+    def test_conversion_is_not_started_without_explicit_opt_in(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            source = root / "accepted-master.ply"
+            source.write_bytes(b"master fixture")
+            with (
+                patch.dict(os.environ, {"EXHIBITION_ARCHIVE_BUILD_SOG": ""}),
+                patch("exhibition_archive.publisher._splat_transform_binary", return_value="splat-transform"),
+                patch("exhibition_archive.publisher.subprocess.run") as run,
+            ):
+                result = _convert_sog(source, root / "assets" / "exhibition.sog")
+
+            self.assertEqual(result["status"], "NOT_REQUESTED")
+            run.assert_not_called()
+
+
 class GenericPublisherTests(unittest.TestCase):
     def test_build_is_metadata_driven_and_reproducible_for_independent_fixture(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -122,15 +206,53 @@ class GenericPublisherTests(unittest.TestCase):
             confirmed.parent.mkdir(parents=True)
             write_json(confirmed, {"count": 0, "artworks": []})
 
-            build_website(root, config, None, root / "deliverable" / "work")
+            with patch.dict(os.environ, {"EXHIBITION_ARCHIVE_SPLAT_TRANSFORM": str(root / "missing-splat-transform")}):
+                build_website(root, config, None, root / "deliverable" / "work")
             website = root / "deliverable" / "website"
+            visitor = root / "deliverable" / "website-visitor"
             first_index_bytes = (website / "config" / "package-index.json").read_bytes()
+            first_visitor_index_bytes = (visitor / "config" / "package-index.json").read_bytes()
             index = json.loads(first_index_bytes)
             self.assertEqual(index["schema_version"], "exhibition-archive.website-index.v2")
             self.assertEqual(index["project_id"], config["project_id"])
             self.assertEqual(index["model_sha256"], config["integrations"]["model"]["expected_sha256"])
             self.assertEqual(verify_website_package_index(website, index)[1], [])
             self.assertEqual(_website_reference_failures(website), [])
+            visitor_index = json.loads((visitor / "config" / "package-index.json").read_text(encoding="utf-8"))
+            self.assertEqual(visitor_index["profile"], "visitor")
+            self.assertEqual(visitor_index["model_sha256"], config["integrations"]["model"]["expected_sha256"])
+            self.assertEqual(verify_website_package_index(visitor, visitor_index)[1], [])
+            self.assertEqual(_website_reference_failures(visitor), [])
+            visitor_metadata = json.loads((visitor / "config" / "exhibition.json").read_text(encoding="utf-8"))
+            review_camera = json.loads((website / "api" / "initial-camera.json").read_text(encoding="utf-8"))
+            self.assertEqual(visitor_metadata["initial_camera"]["pose_common_viewer"], review_camera["pose_common_viewer"])
+            self.assertEqual(visitor_metadata["conversion"]["expected_tool_version"], "3.10.3")
+            self.assertEqual(visitor_metadata["primary_format"], "ply")
+            self.assertEqual(visitor_metadata["release_authorization"], "NEEDS_REVIEW")
+            self.assertEqual(visitor_metadata["conversion"]["status"], "NOT_REQUESTED")
+            self.assertEqual(
+                sha256_file(visitor / "assets" / "exhibition.ply"),
+                config["integrations"]["model"]["expected_sha256"],
+            )
+            self.assertFalse((visitor / "assets" / "exhibition.sog").exists())
+            self.assertTrue((visitor / "assets" / "enclosure-collision.glb").is_file())
+            self.assertTrue((visitor / "js" / "viewer.js").is_file())
+            self.assertTrue((visitor / "css" / "viewer.css").is_file())
+            self.assertTrue((visitor / "vendor" / "supersplat-viewer.js").is_file())
+            self.assertTrue((visitor / "config" / "locales.json").is_file())
+            visitor_html = (visitor / "index.html").read_text(encoding="utf-8").casefold()
+            self.assertIn('id="resetview"', visitor_html)
+            self.assertIn('id="helptoggle"', visitor_html)
+            self.assertIn('id="languageselect"', visitor_html)
+            self.assertIn('./js/viewer.js', visitor_html)
+            self.assertIn('./css/viewer.css', visitor_html)
+            self.assertNotIn("tour", visitor_html)
+            self.assertNotIn("diagnostic", visitor_html)
+            self.assertEqual(visitor_html.count("<select"), 1)
+            locales = json.loads((visitor / "config" / "locales.json").read_text(encoding="utf-8"))
+            self.assertIn("zh-Hant", locales)
+            self.assertIn("en", locales)
+            self.assertIn("E / Q", " ".join(locales["en"]["instructions"]))
 
             html = (website / "viewer" / "index.html").read_text(encoding="utf-8")
             app = (website / "viewer" / "app.js").read_text(encoding="utf-8")
@@ -155,8 +277,10 @@ class GenericPublisherTests(unittest.TestCase):
             self.assertFalse((website / "source-images").exists())
             self.assertIn("visitors need no Exhibition Archive Engine or Python runtime", (website / "README.md").read_text(encoding="utf-8"))
 
-            build_website(root, config, None, root / "deliverable" / "work")
+            with patch.dict(os.environ, {"EXHIBITION_ARCHIVE_SPLAT_TRANSFORM": str(root / "missing-splat-transform")}):
+                build_website(root, config, None, root / "deliverable" / "work")
             self.assertEqual(first_index_bytes, (website / "config" / "package-index.json").read_bytes())
+            self.assertEqual(first_visitor_index_bytes, (visitor / "config" / "package-index.json").read_bytes())
             self.assertEqual(
                 sha256_file(website / "assets" / "exhibition.ply"),
                 config["integrations"]["model"]["expected_sha256"],

@@ -3,7 +3,7 @@ import { createViewer } from './vendor/index.js';
 const $ = id => document.getElementById(id);
 const ids = ['serverStatus','modelStatus','modelHash','viewerHost','selectionOverlay','graphics','cameraPosition','decision','mode','modeNote','speed','speedLabel','station','goStation','saveBookmark','restoreBookmark','returnExplore','tour','playTour','artwork','orbitArtwork','boundarySummary','boundaryMap','showCameras','showWalls','showCandidates','showNeighborGraph','exportBoundary','diagnosticScene','diagnosticPose','captureDiagnostic','sourcePhoto','annotationToggle','annotationClear','annotationSave','annotationExport','annotationLabel','annotationStatus','annotationList','acceptanceChecklist','exportAcceptance','resetAcceptance','runtimeSummary','exportCamera'];
 const el = Object.fromEntries(ids.map(id => [id, $(id)]));
-let health, boundary, generatedBoundary, stationsDoc, tourDoc, candidateDoc, artifactEvidence, cameraDoc, footprintDoc, distributionDoc, annotationsDoc, handle;
+let health, boundary, generatedBoundary, stationsDoc, initialCameraDoc, tourDoc, candidateDoc, artifactEvidence, cameraDoc, footprintDoc, distributionDoc, annotationsDoc, handle;
 let activeMode = 'visitor-explore';
 let navArmed = false, pointerDragging = false, lastPointer = null;
 let frameId = 0, lastFrameAt = 0, tourRaf = 0;
@@ -170,7 +170,12 @@ function stationPose(station) {
   const p=station.centerCommonViewer, f=station.representativeForwardCommonViewer;
   return poseFacing(p,f,getPose(),70.75);
 }
-function spawnPose() { const preferred=stationsDoc.stations.find(s=>s.stationId===stationsDoc.defaultStationId)??stationsDoc.stations.find(s=>s.normalVisitorPositionCandidate)??stationsDoc.stations[0]; return stationPose(preferred); }
+function spawnPose() {
+  const canonical=initialCameraDoc?.pose_common_viewer;
+  if(canonical&&Array.isArray(canonical.position)&&Array.isArray(canonical.target))return {position:[...canonical.position],target:[...canonical.target],fov:canonical.fov??70.75};
+  const preferred=stationsDoc.stations.find(s=>s.stationId===stationsDoc.defaultStationId)??stationsDoc.stations.find(s=>s.normalVisitorPositionCandidate)??stationsDoc.stations[0];
+  return stationPose(preferred);
+}
 function goToStation() {
   const station=stationsDoc.stations.find(x=>x.stationId===el.station.value);
   if(!station||!runtimeAvailable()) return;
@@ -497,8 +502,8 @@ async function startViewer() {
   handle.app.on('frameend',updatePoseHud);
 }
 async function init() {
-  [health,boundary,generatedBoundary,stationsDoc,tourDoc,candidateDoc,artifactEvidence,cameraDoc,footprintDoc,distributionDoc,annotationsDoc]=await Promise.all([
-    fetch('../api/health.json',{cache:'no-store'}).then(r=>r.json()),fetch('../api/boundary.json',{cache:'no-store'}).then(r=>r.json()),fetch('../api/boundary-generated.json',{cache:'no-store'}).then(r=>r.json()),fetch('../api/stations.json').then(r=>r.json()),fetch('../api/tours.json').then(r=>r.json()),fetch('../api/candidates.json').then(r=>r.json()),fetch('../api/artifact-evidence.json').then(r=>r.json()),fetch('../api/cameras.json').then(r=>r.json()),fetch('../api/footprints.json').then(r=>r.json()),fetch('../api/distribution.json').then(r=>r.json()),fetch('../api/ghost-annotations.json').then(r=>r.json())
+  [health,boundary,generatedBoundary,stationsDoc,initialCameraDoc,tourDoc,candidateDoc,artifactEvidence,cameraDoc,footprintDoc,distributionDoc,annotationsDoc]=await Promise.all([
+    fetch('../api/health.json',{cache:'no-store'}).then(r=>r.json()),fetch('../api/boundary.json',{cache:'no-store'}).then(r=>r.json()),fetch('../api/boundary-generated.json',{cache:'no-store'}).then(r=>r.json()),fetch('../api/stations.json').then(r=>r.json()),fetch('../api/initial-camera.json').then(r=>r.json()),fetch('../api/tours.json').then(r=>r.json()),fetch('../api/candidates.json').then(r=>r.json()),fetch('../api/artifact-evidence.json').then(r=>r.json()),fetch('../api/cameras.json').then(r=>r.json()),fetch('../api/footprints.json').then(r=>r.json()),fetch('../api/distribution.json').then(r=>r.json()),fetch('../api/ghost-annotations.json').then(r=>r.json())
   ]);
   if(!health.ok)throw new Error(`Model identity check failed: ${health.sha256} (${health.modelBytes} bytes).`);
   el.serverStatus.textContent=`Static archive · ${health.modelBytes.toLocaleString()} model bytes`;
