@@ -21,6 +21,10 @@ The Phase 4C accepted PLY and Review website were used read-only. No SfM, Gaussi
 | Review profile and guided routes | **PASS** | Review package/index remained read-only and retained all five route artifacts. Final Chrome regression passed root, `/nested/`, and the intentional missing-model case. |
 | Public release authorization | **NEEDS_REVIEW** | No deployment or rights changes were made. |
 
+## SuperSplat export reference
+
+The supplied Lumo output contains the 59,318,159-byte `output/splat.html` export and a modular `output/splat/` set with `index.html`, `index.js`, `index.css`, `settings.json`, and an external 41,640,430-byte `index.sog`. The modular page bootstraps the official Viewer with the external SOG and separate settings; its settings camera has a 109° FOV. Both exports informed the compact native-style controls and external-asset packaging decision. No Lumo model, camera pose, or exhibition settings were copied. The listed modular set contains no enclosure collision asset, so Chuen Lung continues to use its own accepted boundary shell and verified SuperSplat collision integration.
+
 ## Camera and framing root cause
 
 The accepted Review viewer selected `defaultStationId` from `stations.json` and aimed two common-frame units along that station's representative forward vector at 70.75° FOV. For this project that is station `station-046`. The Phase 4D Visitor implementation interpreted that common-frame pose in SuperSplat's PLY/SOG frame while also applying the accepted model scene transform, which produced the tilted ceiling-facing view and foreground obstruction. The current publisher writes the Review pose into `api/initial-camera.json`; Review consumes its common-frame pose, while Visitor serializes the mapped SuperSplat Y-up pose and applies the matching transformed model scene node and collision shell.
