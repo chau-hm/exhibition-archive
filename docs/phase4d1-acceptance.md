@@ -78,7 +78,7 @@ The Review profile and its five accepted guided routes remain available independ
 ## Validation record
 
 - Visitor real-browser acceptance: **42/42 passed**; see the JSON evidence path above.
-- Review browser regression: **PASS** for root, `/nested/`, and the intentional missing-model case after disabling Chrome headless background throttling; see `evidence-review-final/browser-acceptance.json`. The read-only package retained all five guided routes and their waypoints.
+- Review browser regression: **PASS** for root, `/nested/`, and the intentional missing-model case after disabling Chrome headless background throttling; see `derived/phase4d1/evidence/review-regression/browser-acceptance.json`. The read-only package retained all five guided routes and their waypoints.
 - Unit/regression suite: **81 passed, 3 subtests passed** with `PYTHONPATH=src .venv/bin/python -m pytest tests -q`.
-- Production Visitor package build was repeated with an identical package index; package inventory, paths, hashes, and references passed browser acceptance. The Chuen Lung historical project tree was not written.
+- Production Visitor package build was repeated with an identical package index; package inventory, paths, hashes, and references passed browser acceptance. Phase 4C and Phase 4D were read-only; the new candidate and evidence were written to `derived/phase4d1/`.
 - SOG conversion, SOG loading, and visual fidelity comparison: **blocked / not tested**, as described above.
