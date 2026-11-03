@@ -16,6 +16,7 @@ __pycache__/
 review-hub.json
 review-hub.log
 review-data/
+node_modules/
 
 # Generated processing and publication output
 backend-runs/
