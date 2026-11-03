@@ -264,7 +264,13 @@ function waitForFrames(app, count, timeoutMs) {
 }
 
 async function openModel(format, settings) {
-  const model = metadata.models[format];
+  let model = metadata.models[format];
+  const params = new URLSearchParams(location.search);
+  if (format === 'ply' && !model?.available && __EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__ &&
+      params.get('acceptance') === '1' && params.has('comparisonPlyUrl')) {
+    model = { available: true, filename: 'exhibition.ply', url: params.get('comparisonPlyUrl') };
+  }
+  if (!model?.available || typeof model.url !== 'string') throw new Error(`${format.toUpperCase()} is not included in this visitor package.`);
   const response = await fetch(model.url, { cache: 'force-cache' });
   if (!response.ok) throw new Error(`${format.toUpperCase()} ${strings[currentLanguage].assetError} (${response.status}).`);
   const handle = await createViewer({
@@ -420,9 +426,11 @@ async function start() {
     applyLanguage(chooseLanguage(metadata.default_language));
     applyTestSettings(settings);
 
-    const requested = new URLSearchParams(location.search).get('format');
-    const primary = requested === 'ply' ? 'ply' : metadata.primary_format;
-    const choices = primary === 'sog' ? ['sog', 'ply'] : ['ply'];
+    const query = new URLSearchParams(location.search);
+    const requested = query.get('format');
+    const comparisonPlyRequested = __EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__ && query.has('comparisonPlyUrl');
+    const primary = requested === 'ply' && (metadata.models.ply.available || comparisonPlyRequested) ? 'ply' : metadata.primary_format;
+    const choices = primary === 'sog' && metadata.models.ply.available ? ['sog', 'ply'] : [primary];
     let lastError = null;
     for (const format of choices) {
       try {

@@ -248,6 +248,22 @@ def cmd_storage_report(args) -> int:
     return 0
 
 
+def cmd_sog_import(args) -> int:
+    root, config = load_project(args.project)
+    from .publisher import register_external_sog
+    execution_metadata = json.loads(args.execution_metadata_json) if args.execution_metadata_json else {}
+    if not isinstance(execution_metadata, dict):
+        raise ValueError("--execution-metadata-json must decode to a JSON object")
+    result = register_external_sog(
+        root, config, Path(args.sog), converter_version=args.converter_version,
+        command=args.conversion_command, device=args.device, gpu_selection=args.gpu_selection,
+        sh_iterations=args.sh_iterations,
+        webp_effort=args.webp_effort, execution_metadata=execution_metadata, replace=args.replace,
+    )
+    print(json.dumps(result, indent=2))
+    return 0
+
+
 def cmd_cancel(args) -> int:
     if args.grace_seconds < 0:
         raise ValueError("--grace-seconds must be zero or greater")
@@ -679,6 +695,18 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("project"); p.set_defaults(func=cmd_status)
     p = sub.add_parser("storage-report", help="Measure project storage classes and list non-destructive cleanup candidates")
     p.add_argument("project"); p.set_defaults(func=cmd_storage_report)
+    p = sub.add_parser("sog-import", help="Validate and register a SOG generated outside the Engine")
+    p.add_argument("project", help="Project manifest path or workspace containing project.json")
+    p.add_argument("sog", type=Path, help="External bundled .sog artifact")
+    p.add_argument("--converter-version", required=True, help="Version reported by the tool that produced this SOG")
+    p.add_argument("--conversion-command", required=True, help="Exact command used to create the external SOG")
+    p.add_argument("--device", help="GPU adapter or explicit CPU device used during conversion")
+    p.add_argument("--gpu-selection", help="Converter selection token used with -g/--gpu, e.g. 0 or cpu")
+    p.add_argument("--sh-iterations", type=int, default=10)
+    p.add_argument("--webp-effort", type=int)
+    p.add_argument("--execution-metadata-json", help="Optional JSON object with elapsed time and resource diagnostics")
+    p.add_argument("--replace", action="store_true", help="Replace an existing registered SOG after validation")
+    p.set_defaults(func=cmd_sog_import)
     p = sub.add_parser("package", help="Run packaging and verification stages without rerunning SfM or training")
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true")
     p.set_defaults(func=cmd_run, resume=True, package_only=True)

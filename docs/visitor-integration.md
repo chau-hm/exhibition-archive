@@ -8,8 +8,8 @@ The package keeps presentation, Viewer settings, language text, model assets, an
 
 ```text
 index.html
-assets/exhibition.ply
-assets/exhibition.sog                 # present only after an accepted conversion
+assets/exhibition.sog                 # selected for a SOG-primary package
+# or assets/exhibition.ply            # selected when using the PLY publication profile
 assets/enclosure-collision.glb
 config/exhibition.json
 config/settings.json
@@ -21,11 +21,28 @@ vendor/supersplat-viewer.js
 vendor/supersplat-viewer.css
 ```
 
-`assets/exhibition.ply` is the accepted reference master and remains unchanged. When a SOG derivative is available, `config/exhibition.json` names it as the primary model and the Viewer loads that separate `.sog` URL. The model format is selected from the configured filename extension. The SOG may also be copied into another application without copying the HTML page.
+The accepted PLY master remains unchanged at its Engine artifact location and is identified by SHA-256 in `config/exhibition.json`. A SOG-primary Visitor package contains the SOG as an independent external asset and does not copy the unused 247.7 MB PLY into the website. When the SOG is unavailable or not selected, the Engine publishes a PLY-profile package containing the accepted PLY instead. The SOG may be copied into another application without copying the HTML page.
+
+## Registering an externally generated SOG
+
+On a GPU-capable host, generate SOG from the accepted PLY with the pinned `splat-transform` tool. Then import it into the Engine project. Import validates the project master PLY hash, checks PLY and SOG with `splat-transform --info`, compares Gaussian count and SH band count, checks the SOG metadata and archive CRCs, and records source/output integrity and conversion provenance. It does not recompress the asset and does not need GPU access:
+
+```bash
+exhibition-archive sog-import /path/to/project \
+  /path/to/exhibition.sog \
+  --converter-version 'splat-transform v3.10.3 (4f90012)' \
+  --conversion-command 'splat-transform -g 0 --verbose --memory accepted-master.ply exhibition.sog -i 10' \
+  --device 'Apple M4 Pro' --gpu-selection 0 --sh-iterations 10 \
+  --execution-metadata-json '{"elapsed_seconds":17.274,"gpu_peak_memory":"122.3 MB","cpu_peak_memory":"1.21 GB"}'
+
+exhibition-archive package /path/to/project
+```
+
+The Engine registers the exact input bytes at `output/artifacts/visitor-sog/exhibition.sog` with a private provenance record. The package stage validates that record against the current accepted master before selecting the SOG. A changed master hash invalidates the import; register a new SOG derivative after conversion from the new master.
 
 ## Replacing or reusing the model
 
-To select another compatible model, place it under `assets/` and update the relevant `models` entry in `config/exhibition.json` with its relative URL and filename. Preserve `assets/exhibition.ply` when retaining the accepted archive master. Recompute the package index after edits; the generated index covers every package file except itself.
+To select another compatible model, place it under `assets/` and update the relevant `models` entry in `config/exhibition.json` with its relative URL and filename. Keep the archival PLY master in the Engine artifact store; include it in a website only when building the PLY publication profile. Rebuild with the Engine after edits so the generated package index covers every package file except itself.
 
 `config/settings.json` contains the supported SuperSplat Experience Settings v2 rendering and camera settings. `config/locales.json` contains the two visitor UI translations. Exhibition titles and artwork metadata stay in their authored records and are not translated by the UI.
 
@@ -52,7 +69,8 @@ const [metadata, settings] = await Promise.all([
   fetch(new URL('config/exhibition.json', base)).then(response => response.json()),
   fetch(new URL('config/settings.json', base)).then(response => response.json())
 ]);
-const model = metadata.models.sog.available ? metadata.models.sog : metadata.models.ply;
+const model = metadata.primary_format === 'sog' ? metadata.models.sog : metadata.models.ply;
+if (!model?.available) throw new Error('The selected model asset is unavailable.');
 const viewer = await createViewer({
   container: document.querySelector('#viewer'),
   contentUrl: new URL(model.url, base).href,
@@ -90,6 +108,6 @@ The first complete frame precedes `state.loaded`, and the official Viewer may th
 
 ## Static hosting details
 
-Serve `.sog`, `.ply`, and `.glb` as binary responses, preferably `application/octet-stream`, and allow byte-range requests for large model files. Do not rewrite their bytes. No Python service is needed after the package is built. The `.sog` and `.ply` files remain independent payload assets; neither is embedded in HTML or JavaScript.
+Serve the selected `.sog` or `.ply` and `.glb` as binary responses, preferably `application/octet-stream`, and allow byte-range requests for model files. Do not rewrite their bytes. No Python service is needed after the package is built. The selected model remains an independent payload asset; it is not embedded in HTML or JavaScript.
 
 This package is a reproducible static publication candidate, not a Preservation Package. Its release authorization remains `NEEDS_REVIEW`.

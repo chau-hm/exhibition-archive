@@ -63,11 +63,26 @@ SuperSplat resolves `state.loaded` after its first complete frame, then switches
 
 ### SOG derivative
 
-The Engine uses the pinned open-source `@playcanvas/splat-transform` 3.10.3 CLI with SH clustering iterations 20, lossless WebP effort 9, CPU mode, four workers, no filters, no decimation, and no coordinate transform. The command records verbose progress and memory output. SOG conversion is opt-in: set `EXHIBITION_ARCHIVE_BUILD_SOG=1` only for a specifically authorized packaging operation. Routine package builds record `NOT_REQUESTED`, do not start the converter, and use PLY. Each opted-in attempt is capped at 600 seconds and Node heap at 8 GiB; a later package run does not imply permission to retry. Successful conversions are stored as the external asset `assets/exhibition.sog`, with settings, input/output hashes, output size, compression ratio, duration, and bounded log tails in `output/website-visitor/config/exhibition.json`; the package index covers every published file. The accepted PLY remains byte-identical as `assets/exhibition.ply` and is the reference master and runtime fallback. See the upstream [SplatTransform CLI and format documentation](https://github.com/playcanvas/splat-transform).
+The publisher uses the pinned open-source `@playcanvas/splat-transform` 3.10.3 CLI. SOG conversion uses 10 SH clustering iterations, four workers, the converter's default lossless WebP effort, no filters, no decimation, and no coordinate transform. Conversion is opt-in: `EXHIBITION_ARCHIVE_BUILD_SOG=1` is required. `EXHIBITION_ARCHIVE_SOG_DEVICE=auto` (default) enumerates supported GPU adapters and selects the first reported adapter; a numeric value selects that adapter. If no adapter is visible, conversion stops with `GPU_UNAVAILABLE` and the PLY publication profile is built. It never changes silently to CPU. CPU execution requires both the SOG opt-in and `EXHIBITION_ARCHIVE_SOG_DEVICE=cpu`. Each conversion is capped at 600 seconds and an 8 GiB Node heap. Outputs are written to a staging filename, checked with `splat-transform --info`, compared against the PLY Gaussian count and SH bands, and ZIP/CRC validated before promotion.
 
-The pinned 3.10.3 package includes upstream SOG performance work released in 3.6.0, including single-pass gather, concurrent texture pipelines, and radix Morton sorting ([official release notes](https://github.com/playcanvas/splat-transform/releases/tag/v3.6.0)). The upstream CLI also notes that CPU compression can be substantially slower than GPU compression ([device-selection guidance](https://github.com/playcanvas/splat-transform#device-selection-for-sog-compression)). On the Chuen Lung machine, `--list-gpus` found no adapter, so the approved attempts used CPU. These facts narrow likely causes but do not identify the exact stalled stage; future bounded attempts preserve verbose progress and memory output for diagnosis.
+To reuse an SOG converted on a GPU-capable host, register the external artifact without a GPU or recompression:
 
-For the accepted Chuen Lung PLY (`247,738,651` bytes; SHA-256 `bebbec74f033deed6bf4df8811fbd6537947f9e3ba07d684622a79a4f62d9d3e`), two separately approved CPU attempts (SH clustering 20 and 10 iterations) reached the 600-second limit without producing SOG. A separately approved 62,434-Gaussian diagnostic sample also timed out at 120 seconds with 10 SH iterations, WebP effort 9, and four workers. Its captured logs contain only the startup and output-stage banners; no SOG, later progress, CLI memory data, or RSS sample was produced. The exact stall remains unknown. The Visitor package therefore uses PLY. SOG size, browser load, and visual comparisons at artwork viewpoints are `NOT_TESTED`; there is no derivative to compare. The generated package metadata records the status of its own build, not the separate attempts. Their settings and outcomes are recorded in the Phase 4D.1 acceptance report. Do not infer SOG fidelity from a synthetic model. Conversion itself does not approve public release.
+```bash
+exhibition-archive sog-import /path/to/project \
+  /path/to/exhibition.sog \
+  --converter-version 'splat-transform v3.10.3 (4f90012)' \
+  --conversion-command 'splat-transform -g 0 --verbose --memory accepted-master.ply exhibition.sog -i 10' \
+  --device 'Apple M4 Pro' --gpu-selection 0 --sh-iterations 10 \
+  --execution-metadata-json '{"elapsed_seconds":17.274,"gpu_peak_memory":"122.3 MB","cpu_peak_memory":"1.21 GB"}'
+
+exhibition-archive package /path/to/project
+```
+
+The import command verifies the project's configured PLY hash, inspects the PLY and SOG formats, compares Gaussian count and SH bands, validates SOG archive members and CRCs, and records both input and output hashes. The registered reusable derivative and private provenance are stored under `output/artifacts/visitor-sog/`. Publication rechecks those bindings before using the SOG. A SOG-primary Visitor package contains the independent `assets/exhibition.sog` but omits the unused 247.7 MB PLY. The accepted PLY remains at its original master location. When no valid SOG is registered or converted, the Visitor PLY profile contains the accepted PLY instead.
+
+For Chuen Lung, the three earlier CPU attempts timed out after 600 seconds (full master, 20 then 10 iterations) and 120 seconds (1-in-16 sample). The old Engine explicitly passed `--gpu cpu` because its process could not enumerate an adapter. The user's confirmed host conversion used the same SplatTransform 3.10.3 build, `-g 0`, 10 iterations, Apple M4 Pro GPU, about 17.274 seconds, and produced a visually inspected 16,137,572-byte SOG. The current Engine process still reports no visible GPU adapter. These facts explain the mode mismatch and support an environment-dependent visibility difference; they do not prove sandboxing was the sole cause of the CPU stalls. Exact CPU stall stage remains unknown. See the Phase 4D.2 acceptance report for hashes, screenshots, measured browser load, and navigation checks. Conversion or a static package does not approve public release.
+
+Repeated publication from the same registered SOG bytes, accepted PLY identity, settings, and runtime produces a deterministic package index. GPU compression is not promised to be byte-identical across separate runs; every output hash is recorded. SOG is lossy relative to PLY, and package equivalence does not claim byte-level or visual equivalence.
 
 ## Static hosting
 
@@ -81,14 +96,14 @@ config/
 assets/exhibition.ply
 ```
 
-Serve the website over HTTP or HTTPS. Do not open the files with `file://`. Both viewers and their bundled runtime assets use relative paths, so the same package works at `/` and at paths such as `/exhibitions/chuen-lung/`. Serve the selected Visitor SOG (when available), PLY fallback, and enclosure GLB as unchanged binary assets; allow full model downloads and byte ranges. The Chuen Lung PLY is approximately 248 MB. The package needs no Engine checkout, Python installation, backend process, API service, database, or runtime asset proxy after deployment.
+Serve the website over HTTP or HTTPS. Do not open the files with `file://`. Both viewers and their bundled runtime assets use relative paths, so the same package works at `/` and at paths such as `/exhibitions/chuen-lung/`. Serve the selected Visitor SOG or PLY model and enclosure GLB as unchanged binary assets; allow full model downloads and byte ranges. A SOG-primary package does not include the unused PLY master. The package needs no Engine checkout, Python installation, backend process, API service, database, or runtime asset proxy after deployment.
 
 `README.md` is included in each website with its selected model hash. Keep `config/package-index.json` alongside the files. The Visitor package instead has:
 
 ```text
 index.html
-assets/exhibition.ply
-assets/exhibition.sog                 # when conversion succeeds
+assets/exhibition.sog                 # SOG-primary Visitor profile
+# or assets/exhibition.ply            # PLY publication profile when SOG is unavailable
 assets/enclosure-collision.glb
 config/exhibition.json
 config/settings.json

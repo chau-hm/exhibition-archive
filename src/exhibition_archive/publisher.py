@@ -9,8 +9,10 @@ import struct
 import shutil
 import subprocess
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from zipfile import BadZipFile, ZipFile, is_zipfile
 
 from .adapters import public_json, read_json, sha256_file, write_json
 from .workflow import output_path, project_path
@@ -18,12 +20,12 @@ from .workflow import output_path, project_path
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 SOG_TOOL_VERSION = "3.10.3"
-SOG_SH_ITERATIONS = 20
-SOG_WEBP_EFFORT = 9
+SOG_SH_ITERATIONS = 10
 SOG_MAX_WORKERS = 4
 SOG_MAX_SECONDS = 600
 SOG_NODE_OLD_SPACE_MB = 8192
 SOG_OUTPUT_TAIL_CHARS = 12000
+SOG_IMPORT_DIRECTORY = "artifacts/visitor-sog"
 
 
 def _process_output_tail(value: str | bytes | None) -> str | None:
@@ -216,23 +218,231 @@ def _splat_transform_binary() -> str | None:
     return shutil.which("splat-transform")
 
 
+def _tool_version(executable: str) -> str:
+    result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=30, check=False)
+    text = (result.stdout or result.stderr).strip().splitlines()
+    version = text[0] if text else ""
+    match = re.search(r"\bv(\d+\.\d+\.\d+)\b", version)
+    if result.returncode or not match or match.group(1) != SOG_TOOL_VERSION:
+        raise ValueError(f"Expected splat-transform {SOG_TOOL_VERSION}; found {version or 'unknown'}")
+    return version
+
+
+def _tool_info(executable: str, path: Path) -> dict[str, Any]:
+    result = subprocess.run([executable, str(path), "--info", "json", "null"], capture_output=True,
+                            text=True, timeout=120, check=False)
+    if result.returncode:
+        raise ValueError(f"splat-transform --info failed for {path.name}: {_process_output_tail(result.stderr or result.stdout)}")
+    output = result.stdout or ""
+    start = output.find("{")
+    if start < 0:
+        raise ValueError(f"splat-transform --info returned no JSON for {path.name}")
+    try:
+        info = json.loads(output[start:output.rfind("}") + 1])
+    except json.JSONDecodeError as error:
+        raise ValueError(f"splat-transform --info returned invalid JSON for {path.name}: {error}") from error
+    if not isinstance(info, dict) or info.get("gaussian") is not True or int(info.get("numGaussians", 0)) <= 0:
+        raise ValueError(f"{path.name} is not a non-empty Gaussian model")
+    return info
+
+
+def _sog_archive_metadata(path: Path, expected_count: int | None = None) -> dict[str, Any]:
+    if not path.is_file() or path.stat().st_size <= 0 or not is_zipfile(path):
+        raise ValueError("SOG is missing, empty, unreadable, or not a bundled SOG archive")
+    try:
+        with ZipFile(path) as archive:
+            names = set(archive.namelist())
+            if any(name.startswith("/") or ".." in Path(name).parts for name in names):
+                raise ValueError("SOG archive contains an unsafe member path")
+            bad_member = archive.testzip()
+            if bad_member:
+                raise ValueError(f"SOG archive CRC check failed for {bad_member}")
+            if "meta.json" not in names:
+                raise ValueError("SOG archive has no meta.json")
+            metadata = json.loads(archive.read("meta.json"))
+            if metadata.get("version") not in {1, 2}:
+                raise ValueError(f"Unsupported SOG metadata version: {metadata.get('version')}")
+            count = int(metadata.get("count", 0))
+            if count <= 0 or (expected_count is not None and count != expected_count):
+                raise ValueError(f"SOG Gaussian count {count} does not match expected count {expected_count}")
+            referenced = []
+            for key in ("means", "scales", "quats", "sh0", "shN"):
+                record = metadata.get(key)
+                if isinstance(record, dict):
+                    referenced.extend(record.get("files", []))
+            if not referenced or any(name not in names for name in referenced):
+                raise ValueError("SOG metadata references missing texture assets")
+            return {"format": "sog", "metadata_version": metadata["version"], "gaussian_count": count,
+                    "generator": metadata.get("asset", {}).get("generator"),
+                    "sh_texture_present": any(name.startswith("shN_") for name in referenced),
+                    "member_count": len(names)}
+    except (BadZipFile, OSError, json.JSONDecodeError) as error:
+        raise ValueError(f"SOG archive validation failed: {error}") from error
+
+
+def register_external_sog(root: Path, config: dict, source_sog: Path, *, converter_version: str,
+                          command: str, device: str | None = None, gpu_selection: str | None = None,
+                          sh_iterations: int = SOG_SH_ITERATIONS,
+                          webp_effort: int | None = None, execution_metadata: dict[str, Any] | None = None,
+                          replace: bool = False) -> dict[str, Any]:
+    """Validate and register a SOG produced outside the Engine's execution environment."""
+    from .workflow import output_path, project_path
+
+    source_sog = source_sog.expanduser().resolve()
+    if source_sog.suffix.casefold() != ".sog":
+        raise ValueError("External visitor model must use the .sog extension")
+    model_config = config.get("integrations", {}).get("model", {})
+    source_ply_value = model_config.get("path")
+    expected_source_hash = model_config.get("expected_sha256")
+    if not source_ply_value or not expected_source_hash:
+        raise ValueError("Project must identify the accepted master PLY path and expected SHA-256")
+    source_ply = project_path(root, config, source_ply_value)
+    if not source_ply.is_file():
+        raise ValueError(f"Accepted source PLY is missing: {source_ply}")
+    input_hash = sha256_file(source_ply)
+    if input_hash != expected_source_hash:
+        raise ValueError("Accepted source PLY hash does not match the project manifest")
+    binary = _splat_transform_binary()
+    if not binary:
+        raise ValueError("splat-transform is required to inspect and validate the SOG import")
+    inspector_version = _tool_version(binary)
+    source_info = _tool_info(binary, source_ply)
+    sog_info = _tool_info(binary, source_sog)
+    if source_info.get("format") != "ply" or sog_info.get("format") != "sog":
+        raise ValueError("Source must inspect as PLY and imported artifact must inspect as SOG")
+    source_count = int(source_info["numGaussians"])
+    sog_count = int(sog_info["numGaussians"])
+    source_bands = int(source_info.get("shBands", 0))
+    sog_bands = int(sog_info.get("shBands", 0))
+    if source_count != sog_count or source_bands != sog_bands:
+        raise ValueError(f"SOG content metadata differs from its source PLY (count {source_count}/{sog_count}; SH bands {source_bands}/{sog_bands})")
+    archive_metadata = _sog_archive_metadata(source_sog, source_count)
+    generator_version = re.search(r"v?(\d+\.\d+\.\d+)", str(archive_metadata.get("generator", "")))
+    claimed_version = re.search(r"v?(\d+\.\d+\.\d+)", converter_version)
+    if not claimed_version or not generator_version or generator_version.group(1) != claimed_version.group(1):
+        raise ValueError("Supplied converter version does not match the SOG generator metadata")
+    if not command.strip():
+        raise ValueError("The conversion command must be recorded for external SOG provenance")
+    if sh_iterations < 1 or (webp_effort is not None and not 0 <= webp_effort <= 9):
+        raise ValueError("SOG conversion settings are outside supported ranges")
+    if execution_metadata is not None and not isinstance(execution_metadata, dict):
+        raise ValueError("External SOG execution metadata must be a JSON object")
+
+    output_root = output_path(root, config) / SOG_IMPORT_DIRECTORY
+    target = output_root / "exhibition.sog"
+    provenance_path = output_root / "provenance.json"
+    output_hash = sha256_file(source_sog)
+    if target.exists() and not replace:
+        if target.is_file() and sha256_file(target) == output_hash:
+            existing = read_json(provenance_path) if provenance_path.is_file() else {}
+            if existing.get("output_sha256") == output_hash and existing.get("input_sha256") == input_hash:
+                return {"status": "ALREADY_REGISTERED", "artifact": str(target), "provenance": str(provenance_path),
+                        "output_sha256": output_hash, "output_size_bytes": target.stat().st_size}
+        raise FileExistsError(f"A different SOG is already registered at {target}; pass replace=True to replace it explicitly")
+
+    output_root.mkdir(parents=True, exist_ok=True)
+    staged = output_root / "exhibition.sog.staging"
+    staged.unlink(missing_ok=True)
+    shutil.copy2(source_sog, staged)
+    if sha256_file(staged) != output_hash or staged.stat().st_size != source_sog.stat().st_size:
+        staged.unlink(missing_ok=True)
+        raise ValueError("Copied SOG failed byte-integrity verification")
+    os.replace(staged, target)
+    provenance = {
+        "schema_version": "exhibition-archive.visitor-sog-provenance.v1",
+        "status": "VALIDATED_EXTERNAL",
+        "registered_at_utc": datetime.now(timezone.utc).replace(microsecond=0).isoformat().replace("+00:00", "Z"),
+        "source_ply_path": str(source_ply),
+        "input_sha256": input_hash,
+        "input_size_bytes": source_ply.stat().st_size,
+        "input_gaussian_count": source_count,
+        "input_sh_bands": source_bands,
+        "converter": {"name": "@playcanvas/splat-transform", "version": converter_version,
+                      "command": command, "device": device, "gpu_selection": gpu_selection,
+                      "parameters": {"sh_iterations": sh_iterations, "webp_effort": webp_effort,
+                                     "gpu": gpu_selection or device or "unknown",
+                                     "filters": [], "decimation": None, "coordinate_transform": "none",
+                                     "workers": SOG_MAX_WORKERS},
+                      "execution_metadata": execution_metadata or {}},
+        "inspector": {"name": "@playcanvas/splat-transform", "version": inspector_version,
+                      "source_info": source_info, "sog_info": sog_info},
+        "sog_format": archive_metadata,
+        "output_sha256": output_hash,
+        "output_size_bytes": source_sog.stat().st_size,
+        "compression_ratio_output_to_input": source_sog.stat().st_size / source_ply.stat().st_size,
+    }
+    write_json(provenance_path, provenance)
+    return {"status": provenance["status"], "artifact": str(target), "provenance": str(provenance_path),
+            "output_sha256": output_hash, "output_size_bytes": target.stat().st_size,
+            "input_sha256": input_hash, "gaussian_count": source_count, "sh_bands": source_bands}
+
+
+def _registered_sog(model: Path, record: dict, target: Path) -> dict[str, Any] | None:
+    registered = Path(record["path"]).resolve()
+    provenance_path = registered.with_name("provenance.json")
+    if not registered.is_file() and not provenance_path.is_file():
+        return None
+    if not registered.is_file() or not provenance_path.is_file():
+        raise ValueError("Registered external SOG artifact is incomplete")
+    provenance = read_json(provenance_path)
+    expected_hash = record.get("sha256")
+    if (provenance.get("status") != "VALIDATED_EXTERNAL" or provenance.get("input_sha256") != expected_hash
+            or sha256_file(model) != expected_hash or provenance.get("output_sha256") != sha256_file(registered)
+            or provenance.get("output_size_bytes") != registered.stat().st_size):
+        raise ValueError("Registered SOG provenance does not match the current accepted PLY or SOG bytes")
+    sog_info = _sog_archive_metadata(registered, int(record.get("gaussian_count") or provenance.get("input_gaussian_count") or 0))
+    info = provenance.get("inspector", {}).get("sog_info", {})
+    if info.get("format") != "sog" or int(info.get("numGaussians", 0)) != sog_info["gaussian_count"]:
+        raise ValueError("Registered SOG metadata does not match the validated archive")
+    target.parent.mkdir(parents=True, exist_ok=True)
+    staged = target.with_name(target.name + ".staging")
+    shutil.copy2(registered, staged)
+    if sha256_file(staged) != provenance["output_sha256"]:
+        staged.unlink(missing_ok=True)
+        raise ValueError("Staged SOG copy failed SHA-256 validation")
+    os.replace(staged, target)
+    converter = provenance["converter"]
+    parameters = converter.get("parameters", {})
+    public_command = ["splat-transform", "-g", str(converter.get("gpu_selection") or "auto"), "--verbose", "--memory",
+                      "accepted-master.ply", "exhibition.sog", "-i", str(parameters.get("sh_iterations", SOG_SH_ITERATIONS))]
+    return {
+        "status": "VALIDATED_EXTERNAL",
+        "method": "external-artifact-import",
+        "tool": "@playcanvas/splat-transform CLI",
+        "tool_version": converter.get("version"),
+        "inspector_version": provenance.get("inspector", {}).get("version"),
+        "execution_metadata": converter.get("execution_metadata", {}),
+        "command_template": public_command,
+        "device": converter.get("device"),
+        "settings": parameters,
+        "input_sha256": provenance["input_sha256"],
+        "input_size_bytes": provenance["input_size_bytes"],
+        "input_gaussian_count": provenance["input_gaussian_count"],
+        "input_sh_bands": provenance["input_sh_bands"],
+        "sog_format": sog_info,
+        "output_size_bytes": registered.stat().st_size,
+        "compression_ratio_output_to_input": registered.stat().st_size / model.stat().st_size,
+        "output_sha256": provenance["output_sha256"],
+    }
+
+
 def _convert_sog(model: Path, target: Path) -> dict[str, Any]:
     from .visitor import VIEWER_VERSION
 
-    command_template = ["splat-transform", "--no-tty", "--verbose", "--memory", "--webp-effort", str(SOG_WEBP_EFFORT),
-                        "--sh-iterations", str(SOG_SH_ITERATIONS), "--max-workers", str(SOG_MAX_WORKERS),
-                        "--gpu", "cpu", "accepted-master.ply", "exhibition.sog"]
+    command_template = ["splat-transform", "-g", "auto", "--no-tty", "--verbose", "--memory", "accepted-master.ply",
+                        "exhibition.sog", "-i", str(SOG_SH_ITERATIONS), "--max-workers", str(SOG_MAX_WORKERS)]
     base_provenance = {
         "tool": "@playcanvas/splat-transform CLI",
         "expected_tool_version": SOG_TOOL_VERSION,
         "elapsed_time_limit_seconds": SOG_MAX_SECONDS,
         "node_old_space_limit_mb": SOG_NODE_OLD_SPACE_MB,
-        "settings": {"sh_band_clustering_iterations": SOG_SH_ITERATIONS, "lossless_webp_effort": SOG_WEBP_EFFORT,
-                     "gpu": "cpu", "workers": SOG_MAX_WORKERS, "filters": [], "decimation": None,
+        "settings": {"sh_band_clustering_iterations": SOG_SH_ITERATIONS, "gpu": "auto",
+                     "workers": SOG_MAX_WORKERS, "filters": [], "decimation": None,
                      "coordinate_transform": "none; original accepted PLY coordinates retained"},
         "command_template": command_template,
         "viewer_version": VIEWER_VERSION,
         "input_size_bytes": model.stat().st_size,
+        "input_sha256": sha256_file(model),
     }
     if os.environ.get("EXHIBITION_ARCHIVE_BUILD_SOG") != "1":
         return {**base_provenance, "status": "NOT_REQUESTED",
@@ -242,22 +452,50 @@ def _convert_sog(model: Path, target: Path) -> dict[str, Any]:
         return {**base_provenance, "status": "NOT_AVAILABLE",
                 "reason": "splat-transform was not found; the visitor package uses its PLY fallback."}
     try:
-        version_result = subprocess.run([executable, "--version"], capture_output=True, text=True, timeout=30, check=False)
-    except (OSError, subprocess.TimeoutExpired):
+        version_text = _tool_version(executable)
+    except (OSError, subprocess.TimeoutExpired, ValueError) as error:
         return {**base_provenance, "status": "NOT_AVAILABLE",
-                "reason": "Could not query splat-transform; the visitor package uses its PLY fallback."}
-    version = (version_result.stdout or version_result.stderr).strip().splitlines()
-    version_text = version[0] if version else ""
-    match = re.search(r"\bv(\d+\.\d+\.\d+)\b", version_text)
-    if version_result.returncode or not match or match.group(1) != SOG_TOOL_VERSION:
-        return {**base_provenance, "status": "UNSUPPORTED_TOOL_VERSION",
-                "reason": f"Expected splat-transform {SOG_TOOL_VERSION}; found {version_text or 'unknown'}. The visitor package uses its PLY fallback.",
-                "tool_version": version_text or None}
+                "reason": f"Could not validate splat-transform: {error}. The visitor package uses its PLY fallback."}
     provenance = {**base_provenance, "tool_version": version_text}
+    try:
+        gpu_result = subprocess.run([executable, "--list-gpus"], capture_output=True, text=True, timeout=30, check=False)
+        gpu_output = ((gpu_result.stdout or "") + "\n" + (gpu_result.stderr or "")).strip()
+    except (OSError, subprocess.TimeoutExpired) as error:
+        return {**provenance, "status": "GPU_DETECTION_FAILED",
+                "reason": f"Could not enumerate SOG GPU adapters ({error}); refusing an implicit CPU fallback."}
+    gpu_rows = []
+    for line in gpu_output.splitlines():
+        match = re.match(r"\s*(?:\[(\d+)\]|(?:GPU\s*)?(\d+)\s*[:.)-])\s*(\S.*)\s*$", line, re.IGNORECASE)
+        if match:
+            gpu_rows.append({"index": int(match.group(1) or match.group(2)), "name": match.group(3)})
+    device_request = os.environ.get("EXHIBITION_ARCHIVE_SOG_DEVICE", "auto").strip().casefold()
+    if (not gpu_rows and re.search(r"Failed to enumerate GPU adapters", gpu_output, re.IGNORECASE)
+            and device_request != "cpu"):
+        return {**provenance, "status": "GPU_DETECTION_FAILED", "gpu_enumeration": _process_output_tail(gpu_output),
+                "reason": "SplatTransform could not enumerate GPU adapters; refusing an implicit CPU fallback."}
+    if device_request == "cpu":
+        selected_device: str | int = "cpu"
+    elif device_request not in {"", "auto"}:
+        if not device_request.isdigit() or int(device_request) not in {row["index"] for row in gpu_rows}:
+            return {**provenance, "status": "GPU_UNAVAILABLE",
+                    "gpu_adapters": gpu_rows, "gpu_enumeration": _process_output_tail(gpu_output),
+                    "reason": f"Configured SOG GPU {device_request!r} was not found; no CPU fallback was attempted."}
+        selected_device = int(device_request)
+    elif gpu_rows:
+        selected_device = gpu_rows[0]["index"]
+    else:
+        return {**provenance, "status": "GPU_UNAVAILABLE", "gpu_adapters": [],
+                "gpu_enumeration": _process_output_tail(gpu_output),
+                    "reason": "No supported GPU adapter is visible to this Engine process; no CPU fallback was attempted. Run `sog-import` with a SOG generated on a GPU-capable host, or explicitly configure and approve CPU mode."}
+    provenance = {**provenance, "gpu_adapters": gpu_rows,
+                  "selected_device": selected_device,
+                  "settings": {**base_provenance["settings"], "gpu": selected_device},
+                  "gpu_enumeration": _process_output_tail(gpu_output)}
     target.parent.mkdir(parents=True, exist_ok=True)
-    command = [executable, "--no-tty", "--verbose", "--memory", "--webp-effort", str(SOG_WEBP_EFFORT),
-               "--sh-iterations", str(SOG_SH_ITERATIONS), "--max-workers", str(SOG_MAX_WORKERS),
-               "--gpu", "cpu", str(model), str(target)]
+    staged_target = target.with_name(target.stem + ".staging" + target.suffix)
+    staged_target.unlink(missing_ok=True)
+    command = [executable, "-g", str(selected_device), "--no-tty", "--verbose", "--memory",
+               str(model), str(staged_target), "-i", str(SOG_SH_ITERATIONS), "--max-workers", str(SOG_MAX_WORKERS)]
     child_env = os.environ.copy()
     child_env["NODE_OPTIONS"] = (child_env.get("NODE_OPTIONS", "").strip() + f" --max-old-space-size={SOG_NODE_OLD_SPACE_MB}").strip()
     started_at = time.monotonic()
@@ -265,35 +503,48 @@ def _convert_sog(model: Path, target: Path) -> dict[str, Any]:
         converted = subprocess.run(command, capture_output=True, text=True, timeout=SOG_MAX_SECONDS, check=False, env=child_env)
     except subprocess.TimeoutExpired as error:
         elapsed = round(time.monotonic() - started_at, 3)
-        target.unlink(missing_ok=True)
+        staged_target.unlink(missing_ok=True)
         return {**provenance, "status": "TIMEOUT", "elapsed_seconds": elapsed,
                 "stdout_tail": _process_output_tail(error.stdout), "stderr_tail": _process_output_tail(error.stderr),
                 "reason": f"SOG conversion exceeded {SOG_MAX_SECONDS} seconds; the visitor package uses its PLY fallback."}
     except OSError:
         elapsed = round(time.monotonic() - started_at, 3)
-        target.unlink(missing_ok=True)
+        staged_target.unlink(missing_ok=True)
         return {**provenance, "status": "FAILED", "elapsed_seconds": elapsed,
                 "reason": "Could not run splat-transform; the visitor package uses its PLY fallback."}
     elapsed = round(time.monotonic() - started_at, 3)
-    if converted.returncode or not target.is_file() or target.stat().st_size <= 0:
-        target.unlink(missing_ok=True)
+    if converted.returncode or not staged_target.is_file() or staged_target.stat().st_size <= 0:
+        staged_target.unlink(missing_ok=True)
         return {**provenance, "status": "FAILED", "reason": f"splat-transform returned {converted.returncode} or produced no SOG; the visitor package uses its PLY fallback.",
                 "returncode": converted.returncode, "elapsed_seconds": elapsed,
                 "stdout_tail": _process_output_tail(converted.stdout), "stderr_tail": _process_output_tail(converted.stderr)}
-    from zipfile import is_zipfile
-    if not is_zipfile(target):
-        target.unlink(missing_ok=True)
+    try:
+        info = _tool_info(executable, staged_target)
+        sog_meta = _sog_archive_metadata(staged_target, int(info["numGaussians"]))
+        source_info = _tool_info(executable, model)
+        if int(source_info["numGaussians"]) != int(info["numGaussians"]) or int(source_info.get("shBands", 0)) != int(info.get("shBands", 0)):
+            raise ValueError("Converted SOG Gaussian count or SH bands differ from the PLY master")
+    except (OSError, subprocess.TimeoutExpired, ValueError) as error:
+        staged_target.unlink(missing_ok=True)
         return {**provenance, "status": "FAILED", "elapsed_seconds": elapsed,
                 "stdout_tail": _process_output_tail(converted.stdout), "stderr_tail": _process_output_tail(converted.stderr),
-                "reason": "splat-transform output is not a valid bundled SOG archive; the visitor package uses its PLY fallback."}
+                "reason": f"splat-transform output failed SOG validation ({error}); the visitor package uses its PLY fallback."}
+    os.replace(staged_target, target)
     output_size = target.stat().st_size
     return {
         **provenance,
         "status": "COMPLETED",
         "elapsed_seconds": elapsed,
+        "command": ["splat-transform", "-g", str(selected_device), "--no-tty", "--verbose", "--memory",
+                    "accepted-master.ply", "exhibition.sog", "-i", str(SOG_SH_ITERATIONS),
+                    "--max-workers", str(SOG_MAX_WORKERS)],
         "output_size_bytes": output_size,
         "compression_ratio_output_to_input": output_size / model.stat().st_size,
         "output_sha256": sha256_file(target),
+        "sog_format": sog_meta,
+        "sog_info": info,
+        "input_gaussian_count": int(source_info["numGaussians"]),
+        "input_sh_bands": int(source_info.get("shBands", 0)),
         "stdout_tail": _process_output_tail(converted.stdout),
         "stderr_tail": _process_output_tail(converted.stderr),
     }
@@ -338,8 +589,6 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
     shutil.copy2(visitor_vendor / "supersplat-viewer.js", staging / "vendor" / "supersplat-viewer.js")
 
     model = Path(model_record["path"])
-    ply_path = staging / "assets" / "exhibition.ply"
-    shutil.copy2(model, ply_path)
     review_api = review_website / "api"
     envelope = read_json(review_api / "boundary.json")
     stations = read_json(review_api / "stations.json")
@@ -354,9 +603,17 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
                                "sha256": sha256_file(collision_path), "size_bytes": collision_path.stat().st_size})
 
     sog_path = staging / "assets" / "exhibition.sog"
-    conversion = _convert_sog(model, sog_path)
+    registered_path = output_path(root, config) / SOG_IMPORT_DIRECTORY / "exhibition.sog"
+    conversion = None
+    if registered_path.exists() or registered_path.with_name("provenance.json").exists():
+        conversion = _registered_sog(model, {**model_record, "path": str(registered_path)}, sog_path)
+    if conversion is None:
+        conversion = _convert_sog(model, sog_path)
     conversion["input_sha256"] = model_record["sha256"]
-    primary = "sog" if conversion.get("status") == "COMPLETED" else "ply"
+    primary = "sog" if conversion.get("status") in {"COMPLETED", "VALIDATED_EXTERNAL"} else "ply"
+    if primary == "ply":
+        sog_path.unlink(missing_ok=True)
+        shutil.copy2(model, staging / "assets" / "exhibition.ply")
     viewer_runtime = read_json(visitor_vendor / "runtime.json")
     default_language = str(config.get("viewer", {}).get("default_language", "en"))
     if default_language not in {"en", "zh-Hant", "zh-TW"}:
@@ -370,10 +627,12 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
         "release_authorization": "NEEDS_REVIEW",
         "primary_format": primary,
         "models": {
-            "sog": {"url": "./assets/exhibition.sog", "filename": "exhibition.sog", "available": conversion.get("status") == "COMPLETED"},
-            "ply": {"url": "./assets/exhibition.ply", "filename": "exhibition.ply", "available": True},
+            "sog": {"url": "./assets/exhibition.sog", "filename": "exhibition.sog", "available": primary == "sog"},
+            "ply": {"url": "./assets/exhibition.ply" if primary == "ply" else None,
+                    "filename": "exhibition.ply", "available": primary == "ply"},
         },
-        "master": {"filename": "exhibition.ply", "size_bytes": model.stat().st_size, "sha256": model_record["sha256"],
+        "master": {"filename": "exhibition.ply", "published_in_visitor_package": primary == "ply",
+                   "size_bytes": model.stat().st_size, "sha256": model_record["sha256"],
                    "gaussian_count": model_record.get("gaussian_count"), "selection": model_record.get("selection")},
         "conversion": conversion,
         "collision": {"url": "./assets/enclosure-collision.glb", **collision_metadata},
@@ -383,11 +642,12 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
         "visitor_ui": ["unobtrusive navigation help", "reset view"],
     }
     write_json(staging / "config" / "exhibition.json", metadata)
-    model_role = "It is the active visitor model." if primary == "ply" else "It is available as a fallback."
+    model_role = ("The PLY master remains in the project's derived artifact store and is not duplicated into this package."
+                  if primary == "sog" else "It is the active visitor model.")
     conversion_note = ""
-    if conversion.get("status") != "COMPLETED":
+    if primary != "sog":
         conversion_note = f" SOG conversion status: {conversion.get('status', 'UNKNOWN')}. {conversion.get('reason', 'The package uses its accepted PLY model.')}"
-    readme = f"""# {title} — visitor website\n\nThis static package opens directly into the exhibition. It uses the official SuperSplat Viewer {viewer_runtime['viewer']['version']} with an enclosure-only collision mesh. Visitors can fly freely in XYZ, reset to the opening view, and open brief navigation help. The package contains no guided tours, route selectors, diagnostics, geometry overlays, or technical status panels.\n\nThe primary model format is **{primary.upper()}**. The accepted master PLY is retained as `assets/exhibition.ply`; {model_role}{conversion_note} `config/exhibition.json` records the master hash, conversion tool and settings, output hashes, Viewer version, and collision dimensions. `config/package-index.json` hashes every payload file except itself.\n\nThe website is modular: replace `assets/exhibition.ply` (or the optional `assets/exhibition.sog`) while keeping the configured filename, edit `config/settings.json` for the opening view and rendering settings, and edit `config/locales.json` for visitor UI text. See `INTEGRATION.md` for HTTP hosting, nested paths, iframe embedding, and direct use of the model with the official Viewer API. Modular assets require HTTP/HTTPS; double-click `file://` is not supported.\n\nThis website is a static publication candidate, not a Preservation Package. Release authorization remains **NEEDS_REVIEW**. Review artwork identity and rights, navigation, and access policy before any public release.\n"""
+    readme = f"""# {title} — visitor website\n\nThis static package opens directly into the exhibition. It uses the official SuperSplat Viewer {viewer_runtime['viewer']['version']} with an enclosure-only collision mesh. Visitors can fly freely in XYZ, reset to the opening view, and open brief navigation help. The package contains no guided tours, route selectors, diagnostics, geometry overlays, or technical status panels.\n\nThe primary model format is **{primary.upper()}**. {model_role}{conversion_note} `config/exhibition.json` records the accepted master PLY hash, conversion tool and settings, output hashes, Viewer version, and collision dimensions. `config/package-index.json` hashes every payload file except itself.\n\nThe website is modular: replace the selected external model asset, edit `config/settings.json` for the opening view and rendering settings, and edit `config/locales.json` for visitor UI text. See `INTEGRATION.md` for HTTP hosting, nested paths, iframe embedding, and direct use of the model with the official Viewer API. Modular assets require HTTP/HTTPS; double-click `file://` is not supported.\n\nThis website is a static publication candidate, not a Preservation Package. Release authorization remains **NEEDS_REVIEW**. Review artwork identity and rights, navigation, and access policy before any public release.\n"""
     (staging / "README.md").write_text(readme, encoding="utf-8")
     shutil.copy2(PRODUCT_ROOT / "docs" / "visitor-integration.md", staging / "INTEGRATION.md")
     index = [{"path": path.relative_to(staging).as_posix(), "size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
@@ -414,6 +674,7 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
         "collision_size_bytes": published_collision.stat().st_size,
         "collision_sha256": collision_metadata["sha256"],
         "total_bytes": sum(row["size_bytes"] for row in index),
+        "published_model_asset": f"assets/exhibition.{primary}",
         "package_index": str(website / "config" / "package-index.json"),
     }
 
@@ -509,6 +770,7 @@ Engine version detected in the bundle: 2.23.0. The upstream Viewer is MIT-licens
     model_record = selected_model_record(root, config, state)
     visitor_details = _build_visitor_website(root, config, model_record, website)
     visitor_website = Path(visitor_details["website"])
+    visitor_model = visitor_website / "assets" / f"exhibition.{visitor_details['primary_format']}"
     return {"status": "COMPLETED", "artifacts": [website / "index.html", website / "viewer" / "app.js", packaged_model,
                                                     website / "api" / "initial-camera.json",
                                                     website / "config" / "navigation.json", website / "config" / "package-index.json",
@@ -516,7 +778,7 @@ Engine version detected in the bundle: 2.23.0. The upstream Viewer is MIT-licens
                                                     visitor_website / "css" / "viewer.css",
                                                     visitor_website / "config" / "settings.json",
                                                     visitor_website / "config" / "exhibition.json",
-                                                    visitor_website / "assets" / "exhibition.ply", visitor_website / "assets" / "enclosure-collision.glb",
+                                                    visitor_model, visitor_website / "assets" / "enclosure-collision.glb",
                                                     visitor_website / "config" / "package-index.json"],
             "details": {"website": str(website), "review_website": str(website), "visitor_website": str(visitor_website),
                         "model_size_bytes": packaged_model.stat().st_size, "model_sha256": sha256_file(packaged_model),

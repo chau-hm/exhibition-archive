@@ -106,7 +106,10 @@ function buildUrl(prefix, format, noCollision = false) {
   const url = new URL(root);
   url.searchParams.set('acceptance', '1');
   url.searchParams.set('lang', 'zh-Hant');
-  if (format === 'ply') url.searchParams.set('format', 'ply');
+  if (format === 'ply') {
+    url.searchParams.set('format', 'ply');
+    if (cases.comparison_ply_url) url.searchParams.set('comparisonPlyUrl', cases.comparison_ply_url);
+  }
   if (noCollision) url.searchParams.set('collision', 'off');
   url.searchParams.set('poses', Buffer.from(JSON.stringify(cases.viewpoints)).toString('base64'));
   return url.toString();
@@ -398,6 +401,30 @@ for (let index = 0; index < views.length; index++) {
 console.error('acceptance: viewpoint screenshots complete');
 
 if (primary === 'sog') {
+  await setPose(0);
+  const sogLanguageBefore = await evaluate('window.__phase4dAcceptance.state');
+  const sogModelRequestCount = await evaluate(`performance.getEntriesByType('resource').filter(entry=>entry.name.includes('/assets/exhibition.')).length`);
+  await evaluate(`(() => { const e=document.querySelector('#languageSelect'); e.value='en'; e.dispatchEvent(new Event('change',{bubbles:true})); })()`);
+  await sleep(200);
+  const sogEnglish = await evaluate(`(() => ({state:window.__phase4dAcceptance.state,text:document.body.innerText,lang:document.documentElement.lang,selected:document.querySelector('#languageSelect').value,modelRequests:performance.getEntriesByType('resource').filter(entry=>entry.name.includes('/assets/exhibition.')).length}))()`);
+  check('English language switch preserves the active SOG scene without reload or camera movement',
+    sogEnglish.lang === 'en' && sogEnglish.selected === 'en' && /Reset view/.test(sogEnglish.text) &&
+      sogEnglish.state.activeFormat === 'sog' && distance(sogLanguageBefore.position, sogEnglish.state.position) < 0.01 &&
+      sogEnglish.modelRequests === sogModelRequestCount,
+    { before: sogLanguageBefore.position, after: sogEnglish.state.position, language: sogEnglish.lang,
+      activeFormat: sogEnglish.state.activeFormat, text: sogEnglish.text });
+  await snap('opening-en-sog');
+  await evaluate(`(() => { const e=document.querySelector('#languageSelect'); e.value='zh-Hant'; e.dispatchEvent(new Event('change',{bubbles:true})); })()`);
+  await sleep(200);
+  const sogChinese = await evaluate(`(() => ({state:window.__phase4dAcceptance.state,text:document.body.innerText,lang:document.documentElement.lang,selected:document.querySelector('#languageSelect').value,modelRequests:performance.getEntriesByType('resource').filter(entry=>entry.name.includes('/assets/exhibition.')).length}))()`);
+  check('Traditional Chinese switch preserves the active SOG scene and uses Traditional Chinese text',
+    sogChinese.lang === 'zh-Hant' && sogChinese.selected === 'zh-Hant' && /重設視角/.test(sogChinese.text) &&
+      !/[检视览选语开启读败无请关说动后进]/u.test(sogChinese.text) && sogChinese.state.activeFormat === 'sog' &&
+      distance(sogLanguageBefore.position, sogChinese.state.position) < 0.01 && sogChinese.modelRequests === sogModelRequestCount,
+    { before: sogLanguageBefore.position, after: sogChinese.state.position, language: sogChinese.lang,
+      activeFormat: sogChinese.state.activeFormat, text: sogChinese.text });
+  await snap('opening-zh-Hant-sog');
+
   firstOpening = await loadPage('', 'ply');
   for (let index = 0; index < views.length; index++) {
     if (index) await setPose(index);

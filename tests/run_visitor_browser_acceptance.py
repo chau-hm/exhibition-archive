@@ -35,6 +35,7 @@ class StaticServer(ThreadingHTTPServer):
 
 class StaticHandler(BaseHTTPRequestHandler):
     website: Path
+    comparison_ply: Path | None
     request_log: list[dict]
     request_lock: threading.Lock
 
@@ -51,11 +52,14 @@ class StaticHandler(BaseHTTPRequestHandler):
         elif decoded.startswith("/nested/"):
             decoded = decoded[len("/nested"):]
         relative = decoded.lstrip("/")
-        candidate = (self.website / relative).resolve()
-        try:
-            candidate.relative_to(self.website.resolve())
-        except ValueError:
-            candidate = self.website / "__unsafe__"
+        if relative == "__test__/comparison-ply" and self.comparison_ply:
+            candidate = self.comparison_ply.resolve()
+        else:
+            candidate = (self.website / relative).resolve()
+            try:
+                candidate.relative_to(self.website.resolve())
+            except ValueError:
+                candidate = self.website / "__unsafe__"
         if candidate.is_dir():
             candidate = candidate / "index.html"
         if not candidate.is_file():
@@ -186,6 +190,23 @@ def _viewpoints(review_website: Path, visitor_metadata: dict, transform_node: di
                  for axis in range(3)]
         current_height = sum(point[axis] * normal[axis] for axis in range(3)) + envelope["floor"]["offset"]
         return [point[axis] + normal[axis] * (height - current_height) for axis in range(3)]
+    center_uv = [sum(point[axis] for point in polygon) / len(polygon) for axis in range(2)]
+    floor_height = envelope["floor"]["clearance"]
+    ceiling_height = envelope["ceiling"]["heightAlongFloorNormal"] - envelope["ceiling"]["clearance"]
+    floor_position = common_at(center_uv, floor_height + 1.6)
+    floor_target = common_at((center_uv[0] + 0.8, center_uv[1]), floor_height + 0.12)
+    ceiling_position = common_at(center_uv, floor_height + 3.8)
+    ceiling_target = common_at((center_uv[0] + 0.8, center_uv[1]), ceiling_height - 0.12)
+    result.extend([
+        {"id": "floor-comparison", "label": "central floor surface view",
+         "source": "test-only camera aimed at the accepted central floor region",
+         "pose": {"position": list(common_to_supersplat(floor_position, up_alignment)),
+                  "target": list(common_to_supersplat(floor_target, up_alignment)), "fov": default.get("fov", 70.75)}},
+        {"id": "ceiling-comparison", "label": "central ceiling surface view",
+         "source": "test-only camera aimed at the inferred ceiling surface",
+         "pose": {"position": list(common_to_supersplat(ceiling_position, up_alignment)),
+                  "target": list(common_to_supersplat(ceiling_target, up_alignment)), "fov": default.get("fov", 70.75)}},
+    ])
     start_common = common_at(start_uv, envelope["floor"]["clearance"] + 1.4)
     outward_common = [basis["basisU"][axis] * outward_uv[0] + basis["basisV"][axis] * outward_uv[1]
                       for axis in range(3)]
@@ -206,6 +227,7 @@ def main() -> int:
     parser.add_argument("--review-website", required=True, type=Path)
     parser.add_argument("--output", required=True, type=Path)
     parser.add_argument("--chrome")
+    parser.add_argument("--comparison-ply", type=Path, help="Accepted master PLY served only by the local test server for matched SOG captures")
     parser.add_argument("--root-only", action="store_true", help="Run the full root-path browser matrix without the separate nested-path smoke run")
     parser.add_argument("--motion-smoke", action="store_true", help="Load once and compare public Fly movement at the authored opening pose")
     parser.add_argument("--collision-disabled", action="store_true", help="Run the motion smoke test without the enclosure collision asset")
@@ -232,18 +254,31 @@ def main() -> int:
     index = read_json(website / "config" / "package-index.json")
     index_checks, index_failures = verify_website_package_index(website, index)
     ref_failures = _website_reference_failures(website)
-    visitor_hash = sha256_file(website / "assets" / "exhibition.ply")
-    if visitor_hash != metadata["master"]["sha256"] or visitor_hash != review_health["sha256"]:
-        raise SystemExit("Visitor and Review PLY copies do not match the Phase 4C accepted master")
-    if visitor_hash != PHASE4C_ACCEPTED_HASH:
+    master_hash = metadata["master"]["sha256"]
+    if master_hash != review_health["sha256"]:
+        raise SystemExit("Visitor master metadata does not match the accepted Review model")
+    if master_hash != PHASE4C_ACCEPTED_HASH:
         raise SystemExit("The accepted Phase 4C PLY SHA-256 changed; refusing browser acceptance")
+    visitor_ply = website / "assets" / "exhibition.ply"
+    if metadata["primary_format"] == "ply":
+        if not visitor_ply.is_file() or sha256_file(visitor_ply) != master_hash:
+            raise SystemExit("PLY Visitor package does not match the accepted Phase 4C master")
+    elif metadata["primary_format"] == "sog":
+        if visitor_ply.exists():
+            raise SystemExit("SOG Visitor package must not include an unused full-size PLY fallback")
+        if args.comparison_ply:
+            if not args.comparison_ply.is_file() or sha256_file(args.comparison_ply) != master_hash:
+                raise SystemExit("Comparison PLY does not match the accepted Phase 4C master")
+    else:
+        raise SystemExit(f"Unsupported Visitor primary format: {metadata['primary_format']}")
     if index_failures or ref_failures:
         raise SystemExit(json.dumps({"package_index_failures": index_failures, "reference_failures": ref_failures}, indent=2))
 
     case_data = {
         "primary_format": metadata["primary_format"],
         "models": metadata["models"],
-        "master_sha256": visitor_hash,
+        "master_sha256": master_hash,
+        "comparison_ply_url": "./__test__/comparison-ply" if args.comparison_ply else None,
         "envelope": envelope,
         "transform_node": transform_node,
         "up_alignment": metadata["initial_camera"]["common_to_supersplat_rotation_quaternion_xyzw"],
@@ -257,6 +292,7 @@ def main() -> int:
 
     server = StaticServer(("127.0.0.1", 0), StaticHandler)
     StaticHandler.website = website
+    StaticHandler.comparison_ply = args.comparison_ply.resolve() if args.comparison_ply else None
     StaticHandler.request_log = []
     StaticHandler.request_lock = threading.Lock()
     server_thread = threading.Thread(target=server.serve_forever, daemon=True)
@@ -347,8 +383,8 @@ def main() -> int:
         "playcanvas_version": metadata["viewer_runtime"]["engine"]["version"],
         "primary_format": metadata["primary_format"],
         "conversion": metadata["conversion"],
-        "master_sha256": visitor_hash,
-        "master_size_bytes": (website / "assets" / "exhibition.ply").stat().st_size,
+        "master_sha256": master_hash,
+        "master_size_bytes": metadata["master"]["size_bytes"],
         "sog_size_bytes": (website / "assets" / "exhibition.sog").stat().st_size if (website / "assets" / "exhibition.sog").is_file() else None,
         "collision_sha256": metadata["collision"]["sha256"],
         "collision_size_bytes": metadata["collision"]["size_bytes"],
@@ -369,7 +405,7 @@ def main() -> int:
         "evidence_directory": str(output),
     }
 
-    for viewpoint in ("opening", "guided-route-02", "guided-route-03"):
+    for viewpoint in ("opening", "guided-route-02", "guided-route-03", "floor-comparison", "ceiling-comparison"):
         sog = screenshots / f"{viewpoint}-sog.png"
         ply = screenshots / f"{viewpoint}-ply.png"
         if sog.is_file() and ply.is_file():

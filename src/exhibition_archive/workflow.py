@@ -2114,16 +2114,13 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         visitor_website / "index.html", visitor_website / "js" / "viewer.js", visitor_website / "css" / "viewer.css",
         visitor_website / "vendor" / "supersplat-viewer.js", visitor_website / "vendor" / "supersplat-viewer.css",
         visitor_website / "config" / "settings.json", visitor_website / "config" / "exhibition.json",
-        visitor_website / "config" / "locales.json", visitor_website / "assets" / "exhibition.ply",
+        visitor_website / "config" / "locales.json",
         visitor_website / "assets" / "enclosure-collision.glb", visitor_index_path,
     ]
     for path in visitor_required:
         if not path.is_file(): failures.append(f"Required visitor website file missing: {path.relative_to(visitor_website)}")
     visitor_metadata_path = visitor_website / "config" / "exhibition.json"
     visitor_metadata = read_json(visitor_metadata_path) if visitor_metadata_path.is_file() else {}
-    visitor_ply = visitor_website / "assets" / "exhibition.ply"
-    if visitor_ply.is_file() and (sha256_file(visitor_ply) != expected_hash or visitor_ply.stat().st_size != model.stat().st_size):
-        failures.append("Visitor PLY fallback does not match the accepted master model identity")
     master_record = visitor_metadata.get("master", {})
     if master_record.get("sha256") != expected_hash or master_record.get("size_bytes") != model.stat().st_size:
         failures.append("Visitor master metadata does not match the selected accepted PLY identity")
@@ -2140,14 +2137,37 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         failures.append("Visitor package profile or independent release authorization state is invalid")
     if visitor_metadata.get("primary_format") == "sog":
         sog_path = visitor_website / "assets" / "exhibition.sog"
-        from zipfile import is_zipfile
         sog_version_ok = bool(re.search(r"\bv3\.10\.3\b", str(conversion_record.get("tool_version", ""))))
-        if (not sog_path.is_file() or not is_zipfile(sog_path) or sha256_file(sog_path) != conversion_record.get("output_sha256")
+        if (not sog_path.is_file() or sha256_file(sog_path) != conversion_record.get("output_sha256")
                 or sog_path.stat().st_size != conversion_record.get("output_size_bytes")
-                or conversion_record.get("status") != "COMPLETED" or not sog_version_ok):
+                or conversion_record.get("status") not in {"COMPLETED", "VALIDATED_EXTERNAL"} or not sog_version_ok):
             failures.append("Visitor SOG primary asset is missing, invalid, or does not match its conversion integrity metadata")
+        try:
+            from .publisher import _sog_archive_metadata
+            sog_meta = _sog_archive_metadata(sog_path, int(master_record.get("gaussian_count") or 0))
+            if (sog_meta.get("format") != "sog"
+                    or conversion_record.get("input_gaussian_count") != master_record.get("gaussian_count")
+                    or not isinstance(conversion_record.get("input_sh_bands"), int)
+                    or conversion_record.get("input_sh_bands", -1) < 0):
+                failures.append("Visitor SOG format metadata is incomplete")
+        except (OSError, ValueError) as error:
+            failures.append(f"Visitor SOG archive failed structural validation: {error}")
+        if (visitor_website / "assets" / "exhibition.ply").exists():
+            failures.append("SOG-primary Visitor package unexpectedly duplicates the full PLY master")
+        models = visitor_metadata.get("models", {})
+        if not models.get("sog", {}).get("available") or models.get("ply", {}).get("available"):
+            failures.append("SOG-primary Visitor model availability flags are inconsistent")
     elif visitor_metadata.get("primary_format") != "ply":
         failures.append("Visitor package has an unsupported primary model format")
+    else:
+        visitor_ply = visitor_website / "assets" / "exhibition.ply"
+        if not visitor_ply.is_file() or sha256_file(visitor_ply) != expected_hash or visitor_ply.stat().st_size != model.stat().st_size:
+            failures.append("Visitor PLY publication does not match the accepted master model identity")
+        if (visitor_website / "assets" / "exhibition.sog").exists():
+            failures.append("PLY-primary Visitor package unexpectedly includes an unselected SOG model")
+        models = visitor_metadata.get("models", {})
+        if not models.get("ply", {}).get("available") or models.get("sog", {}).get("available"):
+            failures.append("PLY-primary Visitor model availability flags are inconsistent")
     if collision_record.get("contains_interior_objects") is not False:
         failures.append("Visitor collision data must contain only the accepted enclosure, floor, and ceiling")
     visitor_html = visitor_website / "index.html"
