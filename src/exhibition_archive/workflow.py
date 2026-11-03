@@ -5,7 +5,7 @@ import json
 import os
 import re
 import shutil
-from pathlib import Path
+from pathlib import Path, PurePosixPath
 from typing import Any
 
 from .adapters import colmap_binary_counts, ply_identity, read_json, sha256_file, validate_navigation, write_json
@@ -33,7 +33,7 @@ STAGES = [
     {"id": "navigation", "deps": ["sfm"], "inputs": ["trusted camera poses, geometry evidence, coordinate frame and review decisions"], "outputs": ["versioned navigation proposal or approved artifact"], "mode": "adopt_existing or generate_from_sfm", "resource": "low"},
     {"id": "training", "deps": ["photo_inventory", "sfm"], "inputs": ["images and validated SfM"], "outputs": ["validated candidate 3DGS PLY and training provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "GPU intensive"},
     {"id": "evaluation", "deps": ["training", "artwork_association"], "inputs": ["candidate model and fidelity evidence"], "outputs": ["model selection and limitations"], "mode": "adopt evidence / human gate" , "resource": "review dependent"},
-    {"id": "viewer_package", "deps": ["training", "navigation", "evaluation", "artwork_association"], "inputs": ["selected model, navigation, confirmed catalogue, theme"], "outputs": ["portable static website"], "mode": "execute locally", "resource": "large model copy"},
+    {"id": "viewer_package", "deps": ["training", "navigation", "evaluation", "artwork_association"], "inputs": ["selected model, navigation, confirmed catalogue, theme"], "outputs": ["independent static Review and Visitor websites"], "mode": "execute locally", "resource": "model copy and optional SOG conversion"},
     {"id": "archive_package", "deps": ["photo_inventory", "capture_preflight", "artwork_association", "sfm", "training", "evaluation", "navigation", "viewer_package"], "inputs": ["validated evidence and package"], "outputs": ["private archive metadata and manifest"], "mode": "execute locally", "resource": "low"},
     {"id": "verification", "deps": ["archive_package"], "inputs": ["website, manifest, checksums, policies"], "outputs": ["verification report"], "mode": "execute locally", "resource": "I/O bound"},
 ]
@@ -225,9 +225,23 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
         viewer_source = Path(__file__).resolve().parents[2] / "templates" / "viewer"
         for name in ("app.js", "index.html", "style.css", "vendor/index.js", "vendor/index.css"):
             selected["files"].append(fingerprint_file(state, viewer_source / name, full_hash))
+        visitor_source = Path(__file__).resolve().parents[2] / "templates" / "visitor"
+        for name in ("app.js", "index.html", "style.css", "runtime.js", "locales.json",
+                     "vendor/visitor-app.js", "vendor/supersplat-viewer.js", "vendor/supersplat-viewer.css",
+                     "vendor/SUPERSPLAT-VIEWER-LICENSE.txt", "vendor/PLAYCANVAS-LICENSE.txt",
+                     "vendor/THIRD_PARTY-NOTICES.md", "vendor/runtime.json"):
+            selected["files"].append(fingerprint_file(state, visitor_source / name, full_hash))
+        product_root = Path(__file__).resolve().parents[2]
+        for path in (product_root / "scripts" / "build_visitor_viewer.mjs", product_root / "package.json", product_root / "package-lock.json"):
+            selected["files"].append(fingerprint_file(state, path, full_hash))
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("publisher.py"), full_hash))
+        selected["files"].append(fingerprint_file(state, Path(__file__).with_name("visitor.py"), full_hash))
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("adapters.py"), full_hash))
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("navigation.py"), full_hash))
+        selected["visitor_sog_tool"] = {"name": "@playcanvas/splat-transform", "version": "3.10.3", "sh_iterations": 20,
+                                        "webp_effort": 9, "gpu": "cpu", "max_workers": 4,
+                                        "diagnostics": ["verbose", "memory"], "timeout_seconds": 600,
+                                        "node_heap_mb": 8192}
     if stage_id == "archive_package":
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("workflow.py"), full_hash))
     if stage_id == "verification":
@@ -1876,9 +1890,118 @@ def build_archive(root: Path, config: dict, state: ProjectState, output_dir: Pat
     return {"status": "COMPLETED", "artifacts": [archive / "manifest.json", archive / "provenance.json"], "details": {"file_count": len(manifest["contents"]) + 1, "source_photographs_bundled": False, "metadata_only_source_index": True}}
 
 
+def verify_website_package_index(website: Path, index: dict) -> tuple[list[dict], list[str]]:
+    """Verify a complete, path-safe v2 static website file index."""
+    checks: list[dict] = []
+    failures: list[str] = []
+    if not isinstance(index, dict):
+        return checks, ["Website package index must be a JSON object"]
+    if index.get("schema_version") != "exhibition-archive.website-index.v2":
+        failures.append("Website package index schema is missing or unsupported")
+    entries = index.get("files")
+    if not isinstance(entries, list):
+        return checks, failures + ["Website package index files must be a list"]
+
+    listed: set[str] = set()
+    total_bytes = 0
+    root = website.resolve()
+    for entry in entries:
+        if not isinstance(entry, dict):
+            failures.append("Website package index contains a non-object file entry")
+            continue
+        raw_path = entry.get("path")
+        safe = isinstance(raw_path, str) and bool(raw_path) and "\\" not in raw_path
+        relative = PurePosixPath(raw_path) if safe else PurePosixPath("invalid")
+        safe = safe and not relative.is_absolute() and all(part not in {"", ".", ".."} for part in relative.parts)
+        if raw_path == "config/package-index.json":
+            safe = False
+        candidate = website.joinpath(*relative.parts) if safe else root / "__invalid_manifest_entry__"
+        target = candidate.resolve()
+        try:
+            target.relative_to(root)
+        except ValueError:
+            safe = False
+        if isinstance(raw_path, str) and raw_path in listed:
+            safe = False
+            failures.append(f"Website package index contains a duplicate path: {raw_path}")
+        if safe and isinstance(raw_path, str):
+            listed.add(raw_path)
+        exists = safe and not candidate.is_symlink() and target.is_file()
+        actual_size = target.stat().st_size if exists else None
+        size_ok = isinstance(entry.get("size_bytes"), int) and not isinstance(entry.get("size_bytes"), bool) and entry["size_bytes"] >= 0 and actual_size == entry.get("size_bytes")
+        digest_ok = exists and isinstance(entry.get("sha256"), str) and bool(re.fullmatch(r"[0-9a-f]{64}", entry["sha256"])) and sha256_file(target) == entry.get("sha256")
+        ok = bool(exists and size_ok and digest_ok)
+        checks.append({"website_path": raw_path, "ok": ok})
+        if not ok:
+            failures.append(f"Website package checksum/path validation failed: {raw_path}")
+        if isinstance(entry.get("size_bytes"), int) and not isinstance(entry.get("size_bytes"), bool) and entry["size_bytes"] >= 0:
+            total_bytes += entry["size_bytes"]
+
+    package_index_path = website / "config" / "package-index.json"
+    actual_paths = {p.relative_to(website).as_posix() for p in website.rglob("*") if p.is_file() and p != package_index_path}
+    if listed != actual_paths:
+        missing = sorted(actual_paths - listed)
+        extra = sorted(listed - actual_paths)
+        if missing:
+            failures.append(f"Website package index omits payload files: {', '.join(missing[:8])}")
+        if extra:
+            failures.append(f"Website package index lists files that are not in the package: {', '.join(extra[:8])}")
+    if not isinstance(index.get("file_count"), int) or isinstance(index.get("file_count"), bool) or index["file_count"] != len(entries):
+        failures.append("Website package index file_count does not match its file list")
+    if not isinstance(index.get("total_bytes"), int) or isinstance(index.get("total_bytes"), bool) or index["total_bytes"] != total_bytes:
+        failures.append("Website package index total_bytes does not match its file list")
+    return checks, failures
+
+
+def _website_reference_failures(website: Path) -> list[str]:
+    """Resolve static HTML, CSS, and JavaScript references within the package."""
+    failures: list[str] = []
+    root = website.resolve()
+    attribute = re.compile(r"(?:href|src)\s*=\s*['\"]([^'\"]+)['\"]", re.IGNORECASE)
+    script_ref = re.compile(r"(?:from\s+|import(?:\s+|\s*\()|fetch\s*\()\s*['\"]([^'\"]+)['\"]")
+    css_ref = re.compile(r"url\(\s*['\"]?([^'\")]+)", re.IGNORECASE)
+    for source in website.rglob("*"):
+        if not source.is_file() or source.suffix.casefold() not in {".html", ".js", ".css"}:
+            continue
+        content = source.read_text(encoding="utf-8", errors="replace")
+        if source.suffix.casefold() == ".js":
+            content = re.sub(r"/\*.*?\*/", "", content, flags=re.DOTALL)
+            content = re.sub(r"(?m)^\s*//.*$", "", content)
+        refs: list[str] = []
+        if source.suffix.casefold() == ".html":
+            refs.extend(attribute.findall(content))
+        if source.suffix.casefold() == ".js":
+            refs.extend(script_ref.findall(content))
+        if source.suffix.casefold() == ".css":
+            refs.extend(css_ref.findall(content))
+        for raw in refs:
+            value = raw.strip()
+            if not value or value.startswith(("#", "data:", "mailto:", "tel:", "javascript:")):
+                continue
+            if value.startswith(("http://", "https://", "//")):
+                failures.append(f"Public asset has an external dependency: {source.relative_to(website)} -> {value}")
+                continue
+            path_part = value.split("?", 1)[0].split("#", 1)[0]
+            if path_part.startswith("/"):
+                failures.append(f"Public asset uses a root-absolute reference: {source.relative_to(website)} -> {value}")
+                continue
+            target = (source.parent / path_part).resolve()
+            try:
+                target.relative_to(root)
+            except ValueError:
+                failures.append(f"Public asset reference escapes package: {source.relative_to(website)} -> {value}")
+                continue
+            if target.is_dir():
+                target = target / "index.html"
+            if not target.is_file():
+                failures.append(f"Public asset reference is missing: {source.relative_to(website)} -> {value}")
+    return failures
+
+
 def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectState | None = None, force_hash: bool = False) -> dict:
     output_root = output_path(root, config)
     website, archive = output_root / "website", output_root / "archive"
+    visitor_website = output_root / "website-visitor"
     manifest = read_json(archive / "manifest.json")
     failures = []
     checks = []
@@ -1911,12 +2034,12 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         if digest != image.get("sha256"):
             source_errors.append({"image_id": image.get("image_id"), "issue": "SHA256_MISMATCH"})
     if source_errors: failures.append(f"Source photo integrity gate failed for {len(source_errors)} files")
-    public_files = [p for p in website.rglob("*") if p.is_file()]
+    public_files = [p for site in (website, visitor_website) for p in site.rglob("*") if p.is_file()]
     public_text = []
     for p in public_files:
         if p.suffix.casefold() in {".json", ".html", ".js", ".css", ".md", ".txt"}:
             public_text.append((p, p.read_text(encoding="utf-8", errors="replace")))
-    forbidden = ["/Users/", "/private/", str(project_path(root, config, config["source"]["photo_directory"]))]
+    forbidden = ["/Users/", "/private/", "localhost", "127.0.0.1", str(project_path(root, config, config["source"]["photo_directory"]))]
     for path, content in public_text:
         for marker in forbidden:
             if marker and marker in content:
@@ -1930,18 +2053,26 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         failures.append("Website package index is missing")
     else:
         package_index = read_json(package_index_path)
-        for entry in package_index.get("files", []):
-            relative = Path(entry.get("path", ""))
-            target = (website / relative).resolve()
-            try:
-                target.relative_to(website.resolve())
-                safe_path = not relative.is_absolute() and ".." not in relative.parts
-            except ValueError:
-                safe_path = False
-            ok = safe_path and target.is_file() and target.stat().st_size == entry.get("size_bytes") and sha256_file(target) == entry.get("sha256")
-            checks.append({"website_path": entry.get("path"), "ok": ok})
-            if not ok:
-                failures.append(f"Website package checksum/path validation failed: {entry.get('path')}")
+        package_checks, package_failures = verify_website_package_index(website, package_index)
+        checks.extend(package_checks)
+        failures.extend(package_failures)
+        if package_index.get("project_id") != config.get("project_id"):
+            failures.append("Website package index project_id does not match the configured project")
+        if package_index.get("model_sha256") != expected_hash:
+            failures.append("Website package index model_sha256 does not match the selected baseline")
+    visitor_index_path = visitor_website / "config" / "package-index.json"
+    visitor_index = None
+    if not visitor_index_path.is_file():
+        failures.append("Visitor website package index is missing")
+    else:
+        visitor_index = read_json(visitor_index_path)
+        visitor_checks, visitor_failures = verify_website_package_index(visitor_website, visitor_index)
+        checks.extend(visitor_checks)
+        failures.extend(visitor_failures)
+        if visitor_index.get("profile") != "visitor":
+            failures.append("Visitor package index does not identify the visitor publication profile")
+        if visitor_index.get("project_id") != config.get("project_id") or visitor_index.get("model_sha256") != expected_hash:
+            failures.append("Visitor package index project or master PLY identity does not match the selected baseline")
     app_path, html_path = website / "viewer" / "app.js", website / "viewer" / "index.html"
     if app_path.is_file() and html_path.is_file():
         app_text = app_path.read_text(encoding="utf-8", errors="replace")
@@ -1949,6 +2080,22 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
         absolute_asset = re.compile(r"(?:href|src)\s*=\s*['\"]\/|from\s+['\"]\/|fetch\(['\"]\/(?:api|assets)\/|['\"]\/assets/")
         if absolute_asset.search(app_text) or absolute_asset.search(html_text):
             failures.append("Static viewer contains a root-absolute asset/API path and may fail under a nested deployment path")
+    failures.extend(_website_reference_failures(website))
+    failures.extend(_website_reference_failures(visitor_website))
+    health_path = website / "api" / "health.json"
+    if health_path.is_file():
+        health = read_json(health_path)
+        content_url = health.get("contentUrl")
+        content_target = (website / "viewer" / content_url).resolve() if isinstance(content_url, str) and content_url and "\\" not in content_url else None
+        try:
+            if content_target is None:
+                raise ValueError("missing or unsafe relative model URL")
+            content_target.relative_to(website.resolve())
+            content_ok = not content_url.startswith("/") and "://" not in content_url and content_target.is_file()
+        except ValueError:
+            content_ok = False
+        if not content_ok:
+            failures.append("Website health metadata does not resolve its model through a portable relative URL")
     navigation_doc = website / "config" / "navigation.json"
     if navigation_doc.is_file():
         navigation = read_json(navigation_doc)
@@ -1963,4 +2110,72 @@ def verify_outputs(root: Path, config: dict, output_dir: Path, state: ProjectSta
     expected_website = [website / "index.html", website / "viewer" / "app.js", website / "viewer" / "vendor" / "index.js", website / "config" / "navigation.json", packaged_model, package_index_path]
     for p in expected_website:
         if not p.is_file(): failures.append(f"Required website file missing: {p.relative_to(website)}")
-    return {"schema_version": "exhibition-archive.verification.v1", "status": "PASS" if not failures else "FAIL", "checks": checks, "model_identity_match": model_ok, "source_photo_count": source_index.get("image_count"), "source_photo_integrity_failure_count": len(source_errors), "source_photo_integrity_failures": source_errors, "full_hash_requested": force_hash, "public_text_file_count": len(public_text), "failure_count": len(failures), "failures": failures, "static_http_browser_validation": "see separate browser-validation evidence", "verified_at_utc": utc_now()}
+    visitor_required = [
+        visitor_website / "index.html", visitor_website / "js" / "viewer.js", visitor_website / "css" / "viewer.css",
+        visitor_website / "vendor" / "supersplat-viewer.js", visitor_website / "vendor" / "supersplat-viewer.css",
+        visitor_website / "config" / "settings.json", visitor_website / "config" / "exhibition.json",
+        visitor_website / "config" / "locales.json",
+        visitor_website / "assets" / "enclosure-collision.glb", visitor_index_path,
+    ]
+    for path in visitor_required:
+        if not path.is_file(): failures.append(f"Required visitor website file missing: {path.relative_to(visitor_website)}")
+    visitor_metadata_path = visitor_website / "config" / "exhibition.json"
+    visitor_metadata = read_json(visitor_metadata_path) if visitor_metadata_path.is_file() else {}
+    master_record = visitor_metadata.get("master", {})
+    if master_record.get("sha256") != expected_hash or master_record.get("size_bytes") != model.stat().st_size:
+        failures.append("Visitor master metadata does not match the selected accepted PLY identity")
+    conversion_record = visitor_metadata.get("conversion", {})
+    if conversion_record.get("input_sha256") != expected_hash:
+        failures.append("Visitor conversion input hash does not match the selected accepted PLY master")
+    collision_path = visitor_website / "assets" / "enclosure-collision.glb"
+    collision_record = visitor_metadata.get("collision", {})
+    if collision_record.get("source_model_sha256") != expected_hash:
+        failures.append("Visitor enclosure collision provenance does not match the selected accepted PLY")
+    if collision_path.is_file() and (sha256_file(collision_path) != collision_record.get("sha256") or collision_path.stat().st_size != collision_record.get("size_bytes")):
+        failures.append("Visitor enclosure collision mesh does not match its recorded integrity metadata")
+    if visitor_metadata.get("profile") != "visitor" or visitor_metadata.get("release_authorization") != "NEEDS_REVIEW":
+        failures.append("Visitor package profile or independent release authorization state is invalid")
+    if visitor_metadata.get("primary_format") == "sog":
+        sog_path = visitor_website / "assets" / "exhibition.sog"
+        sog_version_ok = bool(re.search(r"\bv3\.10\.3\b", str(conversion_record.get("tool_version", ""))))
+        if (not sog_path.is_file() or sha256_file(sog_path) != conversion_record.get("output_sha256")
+                or sog_path.stat().st_size != conversion_record.get("output_size_bytes")
+                or conversion_record.get("status") not in {"COMPLETED", "VALIDATED_EXTERNAL"} or not sog_version_ok):
+            failures.append("Visitor SOG primary asset is missing, invalid, or does not match its conversion integrity metadata")
+        try:
+            from .publisher import _sog_archive_metadata
+            sog_meta = _sog_archive_metadata(sog_path, int(master_record.get("gaussian_count") or 0))
+            if (sog_meta.get("format") != "sog"
+                    or conversion_record.get("input_gaussian_count") != master_record.get("gaussian_count")
+                    or not isinstance(conversion_record.get("input_sh_bands"), int)
+                    or conversion_record.get("input_sh_bands", -1) < 0):
+                failures.append("Visitor SOG format metadata is incomplete")
+        except (OSError, ValueError) as error:
+            failures.append(f"Visitor SOG archive failed structural validation: {error}")
+        if (visitor_website / "assets" / "exhibition.ply").exists():
+            failures.append("SOG-primary Visitor package unexpectedly duplicates the full PLY master")
+        models = visitor_metadata.get("models", {})
+        if not models.get("sog", {}).get("available") or models.get("ply", {}).get("available"):
+            failures.append("SOG-primary Visitor model availability flags are inconsistent")
+    elif visitor_metadata.get("primary_format") != "ply":
+        failures.append("Visitor package has an unsupported primary model format")
+    else:
+        visitor_ply = visitor_website / "assets" / "exhibition.ply"
+        if not visitor_ply.is_file() or sha256_file(visitor_ply) != expected_hash or visitor_ply.stat().st_size != model.stat().st_size:
+            failures.append("Visitor PLY publication does not match the accepted master model identity")
+        if (visitor_website / "assets" / "exhibition.sog").exists():
+            failures.append("PLY-primary Visitor package unexpectedly includes an unselected SOG model")
+        models = visitor_metadata.get("models", {})
+        if not models.get("ply", {}).get("available") or models.get("sog", {}).get("available"):
+            failures.append("PLY-primary Visitor model availability flags are inconsistent")
+    if collision_record.get("contains_interior_objects") is not False:
+        failures.append("Visitor collision data must contain only the accepted enclosure, floor, and ceiling")
+    visitor_html = visitor_website / "index.html"
+    if visitor_html.is_file():
+        html_text = visitor_html.read_text(encoding="utf-8", errors="replace").casefold()
+        for forbidden_control in ("guided tour", "route selector", "diagnostic", "geometry overlay", "technical status"):
+            if forbidden_control in html_text:
+                failures.append(f"Visitor presentation contains a removed technical control: {forbidden_control}")
+        if 'id="resetview"' not in html_text or 'id="helptoggle"' not in html_text:
+            failures.append("Visitor presentation is missing Reset View or navigation help")
+    return {"schema_version": "exhibition-archive.verification.v1", "status": "PASS" if not failures else "FAIL", "checks": checks, "model_identity_match": model_ok, "visitor_primary_format": visitor_metadata.get("primary_format"), "visitor_sog_status": visitor_metadata.get("conversion", {}).get("status"), "visitor_enclosure_collision": collision_record.get("contains_interior_objects") is False, "source_photo_count": source_index.get("image_count"), "source_photo_integrity_failure_count": len(source_errors), "source_photo_integrity_failures": source_errors, "full_hash_requested": force_hash, "public_text_file_count": len(public_text), "failure_count": len(failures), "failures": failures, "static_http_browser_validation": "see separate browser-validation evidence", "verified_at_utc": utc_now()}

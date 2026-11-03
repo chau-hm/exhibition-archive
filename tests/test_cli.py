@@ -45,6 +45,21 @@ class CliSmokeTests(unittest.TestCase):
         )
         self.assertIn("usage: exhibition-archive storage-report", result.stdout)
 
+    def test_external_sog_import_cli_exposes_provenance_inputs(self):
+        result = subprocess.run(
+            [str(LAUNCHER), "sog-import", "--help"],
+            cwd="/private/tmp",
+            text=True,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.STDOUT,
+            check=True,
+        )
+        self.assertIn("--converter-version", result.stdout)
+        self.assertIn("--conversion-command", result.stdout)
+        self.assertIn("--gpu-selection", result.stdout)
+        self.assertIn("--sh-iterations", result.stdout)
+        self.assertIn("--execution-metadata-json", result.stdout)
+
     def test_interrupted_execution_reconciliation_requires_explicit_process_confirmation(self):
         result = subprocess.run(
             [str(LAUNCHER), "reconcile-interrupted", "--help"],

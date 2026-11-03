@@ -1,0 +1,114 @@
+:root {
+  color-scheme: dark;
+  font-family: Inter, system-ui, -apple-system, "Segoe UI", sans-serif;
+  background: #151714;
+  color: #f4f2eb;
+  font-synthesis: none;
+  text-rendering: optimizeLegibility;
+}
+
+* { box-sizing: border-box; }
+html, body, #exhibition, #viewer { width: 100%; height: 100%; margin: 0; }
+body { overflow: hidden; }
+
+#exhibition { position: relative; isolation: isolate; background: #151714; }
+#viewer { position: absolute; inset: 0; background: #151714; }
+#viewer .sse-viewer { width: 100%; height: 100%; }
+#viewer canvas { touch-action: none; }
+
+#loading {
+  position: absolute;
+  z-index: 4;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  background: rgba(21, 23, 20, .92);
+  transition: opacity .3s ease;
+}
+#loading[hidden] { display: none; }
+.loading-card { display: flex; align-items: center; gap: 12px; color: #e6e2d8; font-size: 14px; }
+.spinner {
+  width: 18px;
+  height: 18px;
+  border: 2px solid #ffffff30;
+  border-top-color: #e5c79a;
+  border-radius: 50%;
+  animation: spin .8s linear infinite;
+}
+@keyframes spin { to { transform: rotate(360deg); } }
+.load-error .spinner { display: none; }
+
+.top-controls {
+  position: absolute;
+  z-index: 2;
+  inset: env(safe-area-inset-top, 12px) env(safe-area-inset-right, 14px) auto env(safe-area-inset-left, 14px);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 12px;
+  pointer-events: none;
+}
+.top-controls h1, .top-actions, .top-actions > * { pointer-events: auto; }
+.top-controls h1 {
+  max-width: min(58vw, 560px);
+  margin: 0;
+  padding: 8px 12px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: #151714a8;
+  backdrop-filter: blur(12px);
+  font-size: 13px;
+  font-weight: 500;
+  letter-spacing: .02em;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.top-actions { display: flex; align-items: center; gap: 8px; }
+.top-actions button, .top-actions select, .bottom-controls > button {
+  min-height: 36px;
+  border: 1px solid #ffffff40;
+  border-radius: 999px;
+  background: #151714c9;
+  color: #f4f2eb;
+  padding: 9px 14px;
+  font: inherit;
+  font-size: 12px;
+  font-weight: 500;
+  line-height: 1.2;
+  backdrop-filter: blur(12px);
+  cursor: pointer;
+}
+.top-actions select { appearance: none; min-width: 106px; }
+.top-actions button:hover, .top-actions select:hover, .bottom-controls > button:hover { background: #30312c; }
+
+.bottom-controls {
+  position: absolute;
+  z-index: 2;
+  left: calc(env(safe-area-inset-left, 14px) + 12px);
+  bottom: calc(env(safe-area-inset-bottom, 14px) + 12px);
+}
+#helpPanel {
+  width: min(340px, calc(100vw - 28px));
+  margin-bottom: 8px;
+  padding: 14px 16px;
+  border: 1px solid #ffffff2b;
+  border-radius: 12px;
+  background: #151714ed;
+  box-shadow: 0 8px 32px #0008;
+  backdrop-filter: blur(14px);
+  color: #e8e5dc;
+  font-size: 12px;
+  line-height: 1.6;
+}
+#navigationInstructions { display: grid; gap: 5px; margin: 0; padding-left: 20px; }
+button:focus-visible, select:focus-visible { outline: 2px solid #e5c79a; outline-offset: 3px; }
+
+@media (max-width: 600px) {
+  .top-controls { padding: 8px; gap: 6px; }
+  .top-controls h1 { max-width: 38vw; padding: 8px 10px; font-size: 12px; }
+  .top-actions { gap: 5px; }
+  .top-actions button, .top-actions select, .bottom-controls > button { padding: 9px 10px; font-size: 11px; }
+  .top-actions select { min-width: 88px; }
+  #helpPanel { font-size: 11px; }
+}

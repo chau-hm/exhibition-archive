@@ -1,0 +1,14 @@
+{
+  "name": "exhibition-archive-publication-assets",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build:visitor-viewer": "node scripts/build_visitor_viewer.mjs"
+  },
+  "devDependencies": {
+    "@playcanvas/supersplat-viewer": "1.42.0",
+    "@playcanvas/splat-transform": "3.10.3",
+    "esbuild": "0.25.12",
+    "playcanvas": "2.23.3"
+  }
+}

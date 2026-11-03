@@ -1,0 +1,12 @@
+{
+  "viewer": {
+    "name": "@playcanvas/supersplat-viewer",
+    "version": "1.42.0",
+    "license": "MIT"
+  },
+  "engine": {
+    "name": "playcanvas",
+    "version": "2.23.3",
+    "license": "MIT"
+  }
+}
