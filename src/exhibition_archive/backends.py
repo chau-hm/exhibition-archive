@@ -216,15 +216,30 @@ def image_inventory(image_dir: Path) -> dict[str, Any]:
     return {"image_count": len(records), "images": records, "formats": dict(sorted({ext: sum(1 for x in records if x["extension"] == ext) for ext in {x["extension"] for x in records}}.items())), "known_unsupported_images": unsupported, "duplicates": duplicates}
 
 
-def _safe_child(base: Path, path: Path) -> bool:
-    base_resolved, path_resolved = base.resolve(), path.resolve()
-    return path_resolved == base_resolved or base_resolved in path_resolved.parents
+def _safe_child(authorized_roots: Path | tuple[Path, ...], path: Path) -> bool:
+    """Return whether ``path`` resolves inside any explicitly authorized root.
+
+    Project state and backend artifacts can live in different configured
+    directories. Resolve both roots and the candidate so traversal and existing
+    symlinks that escape every authorized tree remain rejected.
+    """
+    roots = (authorized_roots,) if isinstance(authorized_roots, Path) else authorized_roots
+    try:
+        resolved_path = path.resolve()
+        for root in roots:
+            resolved_root = root.resolve()
+            if resolved_path == resolved_root or resolved_root in resolved_path.parents:
+                return True
+    except (OSError, RuntimeError):
+        return False
+    return False
 
 
 def create_attempt_dir(project_root: Path, output_root: Path, stage: str, execution_id: int, retained_attempt_limit: int | None = None) -> Path:
     parent = output_root / "backend-runs" / stage
-    if not _safe_child(project_root, parent):
-        raise BackendError("Backend output path escapes the project workspace", failure_kind="UNSAFE_OUTPUT")
+    authorized_roots = (project_root, output_root)
+    if not _safe_child(authorized_roots, parent):
+        raise BackendError("Backend output path escapes the configured project or output directories", failure_kind="UNSAFE_OUTPUT")
     parent.mkdir(parents=True, exist_ok=True)
     existing = sorted(p for p in parent.iterdir() if p.is_dir())
     if retained_attempt_limit is not None:
@@ -234,8 +249,8 @@ def create_attempt_dir(project_root: Path, output_root: Path, stage: str, execut
             raise BackendError(f"Retained {stage} attempts reached the configured limit ({retained_attempt_limit}); no attempts were deleted. Archive or remove engine-owned attempts manually before launching another.", failure_kind="RESOURCE_LIMIT", details={"retained_attempt_limit": retained_attempt_limit, "existing_attempts": [str(x) for x in existing]})
     path = parent / f"{utc_stamp()}-execution-{execution_id:04d}"
     path.mkdir(mode=0o700, parents=False, exist_ok=False)
-    if not _safe_child(project_root, path):
-        raise BackendError("Resolved attempt path escapes the project workspace", failure_kind="UNSAFE_OUTPUT")
+    if not _safe_child(authorized_roots, path):
+        raise BackendError("Resolved attempt path escapes the configured project or output directories", failure_kind="UNSAFE_OUTPUT")
     return path
 
 
