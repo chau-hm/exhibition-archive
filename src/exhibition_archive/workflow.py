@@ -13,7 +13,7 @@ from .navigation import generate_navigation, read_colmap_reconstruction, render_
 from .backends import (BackendError, CHECKPOINT_REPLACEMENT_OVERLAP_ASSUMPTION, IMAGE_SUFFIXES, build_sfm_command, build_training_command,
                        check_resources, create_attempt_dir, discover_checkpoints, discover_environment, discover_model_files,
                        execute_process, finalize_attempt_record, finalize_stage_attempt, image_inventory as backend_image_inventory, prepare_training_dataset,
-                       training_preset_configuration,
+                       parse_spirula_sfm_reprojection_summary, training_preset_configuration,
                        process_alive,
                        validate_colmap_directory, validate_gaussian_ply)
 from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_preparation_required,
@@ -23,7 +23,8 @@ from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_pr
                            prepare_spirula_dataset, preparation_settings_for,
                            validate_preparation_stage_outputs)
 from .lidar import (attempt_similarity_alignment, discover_input_files,
-                    inspect_optional_lidar)
+                    inspect_optional_lidar, propose_lidar_ground_plane,
+                    read_ply_xyz_sample)
 from .state import ProjectState, utc_now
 
 
@@ -35,7 +36,7 @@ STAGES = [
     {"id": "artwork_association", "deps": ["photo_inventory", "capture_preflight"], "inputs": ["image inventory", "optional geometry and review state"], "outputs": ["inventory, observations, association graph"], "mode": "adopt or configured Phase2EV adapter", "resource": "low when adopted"},
     {"id": "sfm", "deps": ["photo_inventory"], "inputs": ["source images or existing COLMAP reconstruction"], "outputs": ["validated cameras, registered images, sparse points and provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "high when freshly executed"},
     {"id": "lidar_registration", "deps": ["photo_inventory", "lidar_inspection", "sfm"], "inputs": ["independently inspected raw point cloud and validated sparse SfM geometry"], "outputs": ["scale-aware alignment report and optional aligned preview"], "mode": "optional FPFH/RANSAC global registration; rejection is recoverable", "resource": "bounded CPU geometry"},
-    {"id": "navigation", "deps": ["sfm"], "inputs": ["trusted camera poses, geometry evidence, coordinate frame and review decisions"], "outputs": ["versioned navigation proposal or approved artifact"], "mode": "adopt_existing or generate_from_sfm", "resource": "low"},
+    {"id": "navigation", "deps": ["sfm", "lidar_registration"], "inputs": ["trusted camera poses, optional validated aligned LiDAR geometry, coordinate frame and review decisions"], "outputs": ["versioned navigation proposal or approved artifact"], "mode": "adopt_existing or generate_from_sfm", "resource": "low"},
     {"id": "training", "deps": ["photo_inventory", "sfm"], "inputs": ["images and validated SfM"], "outputs": ["validated candidate 3DGS PLY and training provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "GPU intensive"},
     {"id": "first_visual", "deps": ["training"], "inputs": ["unreviewed candidate model, SfM, LiDAR and navigation diagnostics"], "outputs": ["private technical Reviewer and Visitor preview HTML"], "mode": "execute locally; no release approval", "resource": "model copy and local asset assembly"},
     {"id": "evaluation", "deps": ["training", "artwork_association"], "inputs": ["candidate model and fidelity evidence"], "outputs": ["model selection and limitations"], "mode": "adopt evidence / human gate" , "resource": "review dependent"},
@@ -244,6 +245,19 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
         sfm_details = json.loads((state.stage("sfm") or {}).get("details_json") or "{}")
         selected["sparse_reconstruction"] = {"path": sfm_details.get("reconstruction_directory"),
                                              "validation_path": sfm_details.get("sfm_validation_path")}
+        try:
+            from importlib.metadata import PackageNotFoundError, version
+            selected["registration_dependency"] = {"name": "open3d", "version": version("open3d"),
+                                                   "status": "AVAILABLE"}
+        except PackageNotFoundError:
+            selected["registration_dependency"] = {"name": "open3d", "version": None,
+                                                   "status": "UNAVAILABLE_OPTIONAL"}
+        if (state.stage("sfm") or {}).get("status") == "NEEDS_REVIEW":
+            try:
+                from .sfm_review import geometry_proposal_scope
+                selected["geometry_review_scope"] = geometry_proposal_scope(root, config, state)
+            except Exception as exc:
+                selected["geometry_review_scope"] = {"status": "UNAVAILABLE", "reason": str(exc)}
     if stage_id == "viewer_package":
         viewer_source = Path(__file__).resolve().parents[2] / "templates" / "viewer"
         for name in ("app.js", "index.html", "style.css", "vendor/index.js", "vendor/index.css"):
@@ -690,7 +704,7 @@ def _navigation_input_value(root: Path, config: dict, value: Any) -> tuple[Any, 
     return value, []
 
 
-def _navigation_source(root: Path, config: dict) -> tuple[dict[str, Any], dict[str, Any]]:
+def _navigation_source(root: Path, config: dict, state: ProjectState | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Resolve trusted poses, coordinate frame and geometry for fresh navigation generation."""
     nav_cfg = config.get("integrations", {}).get("navigation", {})
     sfm_cfg = config.get("integrations", {}).get("sfm", {})
@@ -725,6 +739,14 @@ def _navigation_source(root: Path, config: dict) -> tuple[dict[str, Any], dict[s
             if not reconstruction_value:
                 raise WorkflowError("generate_from_sfm requires integrations.sfm.directory or the validated fresh-SfM summary")
             reconstruction_dir = Path(reconstruction_value).expanduser().resolve()
+        if state is not None:
+            try:
+                from .sfm_review import geometry_proposal_scope
+                geometry_scope = geometry_proposal_scope(root, config, state)
+            except Exception:
+                geometry_scope = None
+            if geometry_scope:
+                reconstruction_dir = Path(geometry_scope["reconstruction_directory"]).resolve()
         trust = None
         if nav_cfg.get("trusted_pose_classification"):
             trust, paths = _navigation_input_value(root, config, nav_cfg["trusted_pose_classification"])
@@ -741,6 +763,58 @@ def _navigation_source(root: Path, config: dict) -> tuple[dict[str, Any], dict[s
         floor_default = None
         coordinate_frame = {**reconstruction["source_reconstruction"]["coordinate_frame"], **coordinate_frame}
         coordinate_frame.setdefault("source_to_viewer", {"uniform_scale": 1, "rotation": [[1,0,0],[0,1,0],[0,0,1]], "translation": [0,0,0], "verified": False})
+    aligned_lidar_diagnostics: dict[str, Any] = {"status": "NOT_AVAILABLE", "navigation_consumed": False}
+    if not center_doc:
+        lidar_dir = output_path(root, config) / "lidar"
+        lidar_stage_row = state.stage("lidar_registration") if state is not None else None
+        try:
+            lidar_stage_details = json.loads((lidar_stage_row or {}).get("details_json") or "{}")
+        except (TypeError, ValueError):
+            lidar_stage_details = {}
+        alignment_path = Path(lidar_stage_details.get("alignment_report_path") or lidar_dir / "alignment-report.json").expanduser()
+        if not alignment_path.is_absolute():
+            alignment_path = root / alignment_path
+        aligned_preview_value = lidar_stage_details.get("aligned_preview_path")
+        aligned_preview_path = Path(aligned_preview_value).expanduser() if aligned_preview_value else None
+        if aligned_preview_path is None and alignment_path.is_file():
+            try:
+                aligned_preview_value = read_json(alignment_path).get("aligned_preview_path")
+                aligned_preview_path = Path(aligned_preview_value).expanduser() if aligned_preview_value else None
+            except (OSError, ValueError, TypeError):
+                aligned_preview_path = None
+        if aligned_preview_path is not None and not aligned_preview_path.is_absolute():
+            aligned_preview_path = root / aligned_preview_path
+        if (alignment_path.is_file() and not alignment_path.is_symlink() and aligned_preview_path is not None and
+                aligned_preview_path.is_file() and not aligned_preview_path.is_symlink()):
+            try:
+                alignment = read_json(alignment_path)
+                allowed_root = lidar_dir.resolve()
+                if allowed_root not in alignment_path.resolve().parents or allowed_root not in aligned_preview_path.resolve().parents:
+                    raise ValueError("Alignment diagnostics resolve outside the configured LiDAR output directory")
+                if alignment.get("accepted") is True and alignment.get("status") == "ACCEPTED" and alignment.get("aligned_preview_status") == "WRITTEN":
+                    sample = read_ply_xyz_sample(aligned_preview_path, maximum=20_000)
+                    camera_centers = [row.get("camera_center") for row in cameras if row.get("camera_center") is not None]
+                    plane_candidate = propose_lidar_ground_plane(sample["points"], camera_centers)
+                    aligned_lidar_diagnostics = {
+                        "status": "ALIGNED_GEOMETRY_CONSUMED_FOR_NAVIGATION_DIAGNOSTICS",
+                        "navigation_consumed": True,
+                        "alignment_report": str(alignment_path.resolve()),
+                        "aligned_preview": str(aligned_preview_path.resolve()),
+                        "coordinate_frame": "COLMAP arbitrary non-metric reconstruction coordinates",
+                        "sample": {key: sample.get(key) for key in
+                                   ("point_count", "sampled_point_count", "sample_stride", "invalid_sampled_point_count", "bounding_box")},
+                        "ground_plane_candidate": plane_candidate,
+                    }
+                    source_files.extend([str(alignment_path.resolve()), str(aligned_preview_path.resolve())])
+                    if not nav_cfg.get("floor_plane") and plane_candidate.get("status") == "PROPOSED":
+                        floor_default = {
+                            "normal": plane_candidate["normal"], "offset": plane_candidate["offset"],
+                            "coordinate_frame": "source", "classification": plane_candidate["classification"],
+                            "source": plane_candidate["source"], "evidence": plane_candidate["evidence"],
+                        }
+            except (OSError, ValueError, TypeError, KeyError) as exc:
+                aligned_lidar_diagnostics = {"status": "UNVERIFIED", "navigation_consumed": False,
+                                             "reason": f"Accepted alignment could not be sampled for navigation: {exc}"}
     floor_value = nav_cfg.get("floor_plane", floor_default)
     if isinstance(floor_value, str):
         floor_value, paths = _navigation_input_value(root, config, floor_value); source_files.extend(paths)
@@ -758,6 +832,8 @@ def _navigation_source(root: Path, config: dict) -> tuple[dict[str, Any], dict[s
     source = {"source_reconstruction": source_rec, "coordinate_frame": coordinate_frame, "cameras": cameras,
               "camera_models": camera_models, "sparse_points": sparse_points, "sparse_point_count": len(sparse_points),
               "floor_plane": floor_value, "ceiling": ceiling_value,
+              "aligned_lidar_geometry_used": aligned_lidar_diagnostics.get("navigation_consumed", False),
+              "aligned_lidar_diagnostics": aligned_lidar_diagnostics,
               "transitions": nav_cfg.get("transitions", []), "guided_paths": nav_cfg.get("guided_paths", []),
               "viewpoints": nav_cfg.get("viewpoints", []), "source_files": source_files,
               "source_model_sha256": nav_cfg.get("source_model_sha256")}
@@ -767,7 +843,7 @@ def _navigation_source(root: Path, config: dict) -> tuple[dict[str, Any], dict[s
 
 def execute_navigation_generation(root: Path, config: dict, state: ProjectState, output_dir: Path, execution_id: int) -> dict:
     try:
-        source, generation_config = _navigation_source(root, config)
+        source, generation_config = _navigation_source(root, config, state)
         proposal = generate_navigation(source, generation_config)
     except Exception as exc:
         proposal = {"schema_version": "exhibition-archive.navigation-fallback.v1",
@@ -815,6 +891,9 @@ def execute_navigation_generation(root: Path, config: dict, state: ProjectState,
                "review_path": str(review_path), "region_count": len(proposal.get("regions", [])),
                "trusted_camera_count": pose_evidence.get("used_camera_station_count", 0),
                "excluded_pose_count": pose_evidence.get("excluded_pose_count", 0),
+               "aligned_lidar_used": proposal.get("coverage_assumptions", {}).get("aligned_lidar_used", False),
+               "aligned_lidar_navigation_consumed": bool(proposal.get("provenance", {}).get("aligned_lidar_diagnostics", {}).get("navigation_consumed", False)),
+               "ground_plane_candidate_status": proposal.get("coverage_assumptions", {}).get("ground_plane"),
                "validation": proposal.get("validation", {"status": "UNVERIFIED"}), "publishing_ready": False,
                "training_dependency": False, "sfm_dependency": True}
     write_json(summary_path, summary)
@@ -855,16 +934,29 @@ def execute_lidar_inspection(root: Path, config: dict, output_dir: Path) -> dict
                         "photo_only_fallback_available": True}}
 
 
-def execute_lidar_registration(root: Path, config: dict, state: ProjectState, output_dir: Path) -> dict:
+def execute_lidar_registration(root: Path, config: dict, state: ProjectState, output_dir: Path,
+                               execution_id: int | None = None) -> dict:
     """Attempt bounded global registration; all optional alignment failures remain recoverable."""
-    target = output_path(root, config) / "lidar" / "alignment-report.json"
+    lidar_root = output_path(root, config) / "lidar"
+    # Stage execution IDs are monotonic and keep prior accepted alignment artifacts intact.
+    execution_label = f"{execution_id:06d}" if execution_id is not None else "untracked"
+    registration_dir = lidar_root / "registrations" / f"alignment-execution-{execution_label}"
+    registration_dir.mkdir(parents=True, exist_ok=True)
+    target = registration_dir / "alignment-report.json"
+    latest_report_path = lidar_root / "alignment-report.json"
     inspection_path = output_path(root, config) / "lidar" / "inspection.json"
-    (target.parent / "aligned-cloud-preview.ply").unlink(missing_ok=True)
     inspection = read_json(inspection_path) if inspection_path.is_file() else {
         "inspection_status": "NOT_DETECTED", "detected": False,
         "alignment_attempted": False, "warnings": ["No LiDAR inspection report is available."]}
     sfm_details = json.loads((state.stage("sfm") or {}).get("details_json") or "{}")
     reconstruction_value = sfm_details.get("reconstruction_directory")
+    try:
+        from .sfm_review import geometry_proposal_scope
+        geometry_scope = geometry_proposal_scope(root, config, state)
+    except Exception:
+        geometry_scope = None
+    if geometry_scope:
+        reconstruction_value = geometry_scope["reconstruction_directory"]
     if not reconstruction_value:
         sfm_cfg = config.get("integrations", {}).get("sfm", {})
         if sfm_cfg.get("directory"):
@@ -887,7 +979,8 @@ def execute_lidar_registration(root: Path, config: dict, state: ProjectState, ou
                       "reason": f"Optional LiDAR registration could not prepare valid sparse geometry: {exc}",
                       "training_consumed": False, "navigation_consumed": False}
             write_json(target, report)
-    artifacts = [target]
+    write_json(latest_report_path, report)
+    artifacts = [target, latest_report_path]
     aligned_preview = target.parent / "aligned-cloud-preview.ply"
     if aligned_preview.is_file():
         artifacts.append(aligned_preview)
@@ -897,7 +990,11 @@ def execute_lidar_registration(root: Path, config: dict, state: ProjectState, ou
                         "accepted": report.get("accepted", False),
                         "training_consumed": report.get("training_consumed", False),
                         "navigation_consumed": report.get("navigation_consumed", False),
+                        "geometry_review_scope": geometry_scope.get("review_scope") if geometry_scope else "NOT_REQUIRED_FOR_COMPLETED_SFM",
+                        "selected_sfm_component_id": geometry_scope.get("component_id") if geometry_scope else None,
                         "alignment_report_path": str(target.resolve()),
+                        "latest_alignment_report_path": str(latest_report_path.resolve()),
+                        "aligned_preview_path": str(aligned_preview.resolve()) if aligned_preview.is_file() else None,
                         "reason": report.get("reason")}}
 
 
@@ -1147,7 +1244,10 @@ def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir:
                                cfg.get("timeout_seconds", policy.get("sfm_timeout_seconds")), float(policy.get("poll_interval_seconds", 1.0)))
     command_record = read_json(attempt / "command.json")
     sparse_root = output / "sparse"
-    validation = validate_colmap_directory(sparse_root, dataset["images"], cfg.get("quality_gate", {}))
+    backend_reprojection_summary = parse_spirula_sfm_reprojection_summary(execution.get("log_path"))
+    validation = validate_colmap_directory(
+        sparse_root, dataset["images"], cfg.get("quality_gate", {}),
+        backend_reprojection_summary=backend_reprojection_summary)
     quality = validation["quality_gate"]
     partial_output = bool(execution.get("partial_output", False))
     if partial_output:
@@ -1175,7 +1275,7 @@ def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir:
         artifact_discovery_status="FOUND_VALIDATED", validation_result={"status": "PASSED_STRUCTURAL_VALIDATION", "quality_gate": quality, "backend_partial_output": partial_output, "validation_path": str(validation_path.resolve())},
         recovery_guidance="Spirula reported partial output; inspect the validated components and warnings before deciding whether a new authorized attempt is justified." if partial_output else "The process completed; downstream training remains blocked if the production SfM quality gate requires review.")
     primary = validation["components"][0]
-    summary = {"schema_version": "exhibition-archive.sfm-summary.v2", "project_id": config["project_id"], "backend": "spirula", "backend_version": capabilities["tool"]["version"], "execution_status": "COMPLETED_WITH_PARTIAL_OUTPUT" if partial_output else "COMPLETED", "backend_partial_output": partial_output, "quality_gate": quality, "registered_image_count": primary["registered_image_count"], "source_image_count": dataset["image_count"], "registered_image_ratio": validation["registered_image_ratio"], "camera_count": primary["camera_count"], "camera_pose_count": primary["registered_image_count"], "camera_distribution": primary["camera_distribution"], "sparse_point_count": primary["sparse_point_count"], "component_count": validation["component_count"], "mean_track_length": primary["mean_track_length"], "mean_point_reprojection_error_px": primary["mean_point_reprojection_error_px"], "warnings": validation["warnings"], "reconstruction_directory": validation["primary_component"], "effective_image_directory": str(image_dir.resolve()), "image_derivative_provenance": derivative_provenance, "input_manifest": str(input_manifest_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "command": command, "environment_overrides_private_record": str(private_environment_path.resolve()), "resource_check": resources, "source_photo_hashes_recorded": True, "produced_file_count": len(produced), "limitations": ["Technical COLMAP integrity does not guarantee a suitable 3DGS training set or faithful artwork reconstruction.", "Camera-center coordinates are arbitrary non-metric SfM units and do not by themselves establish artwork-surface coverage or visitor-safe navigation.", "The installed help does not enumerate all accepted source image formats; this run records what Spirula actually accepts."]}
+    summary = {"schema_version": "exhibition-archive.sfm-summary.v2", "project_id": config["project_id"], "backend": "spirula", "backend_version": capabilities["tool"]["version"], "execution_status": "COMPLETED_WITH_PARTIAL_OUTPUT" if partial_output else "COMPLETED", "backend_partial_output": partial_output, "quality_gate": quality, "registered_image_count": primary["registered_image_count"], "source_image_count": dataset["image_count"], "registered_image_ratio": validation["registered_image_ratio"], "camera_count": primary["camera_count"], "camera_pose_count": primary["registered_image_count"], "camera_distribution": primary["camera_distribution"], "sparse_point_count": primary["sparse_point_count"], "component_count": validation["component_count"], "mean_track_length": primary["mean_track_length"], "mean_point_reprojection_error_px": primary["mean_point_reprojection_error_px"], "reprojection_metrics": primary.get("reprojection_metrics"), "backend_observation_reprojection_summary": validation.get("backend_observation_reprojection_summary"), "warnings": validation["warnings"], "reconstruction_directory": validation["primary_component"], "effective_image_directory": str(image_dir.resolve()), "image_derivative_provenance": derivative_provenance, "input_manifest": str(input_manifest_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "command": command, "environment_overrides_private_record": str(private_environment_path.resolve()), "resource_check": resources, "source_photo_hashes_recorded": True, "produced_file_count": len(produced), "limitations": ["Technical COLMAP integrity does not guarantee a suitable 3DGS training set or faithful artwork reconstruction.", "Camera-center coordinates are arbitrary non-metric SfM units and do not by themselves establish artwork-surface coverage or visitor-safe navigation.", "The installed help does not enumerate all accepted source image formats; this run records what Spirula actually accepts."]}
     summary_path = output_dir / "sfm-summary.json"
     write_json(summary_path, summary)
     artifacts = [summary_path, validation_path, input_manifest_path, attempt / "command.json", attempt / "spirula.log"]
@@ -1759,7 +1859,7 @@ def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str,
             return execute_navigation_generation(root, config, state, output_dir, execution_id)
         return adopt_stage(root, config, state, stage_id, output_dir)
     if stage_id == "lidar_registration":
-        return execute_lidar_registration(root, config, state, output_dir)
+        return execute_lidar_registration(root, config, state, output_dir, execution_id)
     if stage_id == "first_visual":
         from .preview import build_first_visual_preview
         return build_first_visual_preview(root, config, state, output_dir, execution_id)
@@ -1813,6 +1913,14 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                "blocked": [], "skipped": [], "failed": None}
     authorization_ids = authorization_ids or []
     scoped_sfm_training = None
+    scoped_sfm_geometry = None
+    sfm_stage_for_scope = state.stage("sfm") or {}
+    if sfm_stage_for_scope.get("status") == "NEEDS_REVIEW":
+        try:
+            from .sfm_review import geometry_proposal_scope
+            scoped_sfm_geometry = geometry_proposal_scope(root, config, state)
+        except Exception:
+            scoped_sfm_geometry = None
     if not package_only and _integration_mode(config, "training") == "spirula_fresh":
         from .sfm_review import training_acceptance_for_run
         current_training_scope = training_acceptance_for_run(root, config, state)
@@ -1845,20 +1953,29 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 state.end_run(run_id, summary["status"], summary)
                 return summary
             blocked = [dep for dep in stage["deps"] if state.stage(dep) is None or state.stage(dep)["status"] not in {"COMPLETED", "ADOPTED"}]
+            if sid in {"lidar_registration", "navigation"} and "sfm" in blocked and scoped_sfm_geometry:
+                blocked.remove("sfm")
             if sid == "training" and "sfm" in blocked and _integration_mode(config, "training") == "spirula_fresh":
                 from .sfm_review import training_acceptance_for_run
                 scoped_sfm_training = training_acceptance_for_run(root, config, state)
                 if scoped_sfm_training and scoped_sfm_training["conditional_scope"]:
                     blocked.remove("sfm")
             if blocked:
-                if sid == "lidar_registration" and "sfm" in blocked and scoped_sfm_training:
+                if sid == "lidar_registration" and "sfm" in blocked and scoped_sfm_training and not scoped_sfm_geometry:
                     summary["skipped"].append(sid)
                     summary["stages"][sid] = "SKIPPED_SFM_COMPONENT_REVIEW_SCOPE"
                     continue
-                if sid == "navigation" and "sfm" in blocked and scoped_sfm_training:
+                if sid == "navigation" and "sfm" in blocked and scoped_sfm_training and not scoped_sfm_geometry:
                     summary["skipped"].append(sid)
                     summary["stages"][sid] = "SKIPPED_OUTSIDE_SFM_ACCEPTANCE_SCOPE"
                     continue
+                if sid == "training" and "sfm" in blocked and scoped_sfm_geometry:
+                    message = "The SfM geometry decision permits registration and an unapproved navigation proposal only; record the separate experimental-training component acceptance before continuing."
+                    summary["status"] = "NEEDS_REVIEW"
+                    summary["blocked"].append({"stage": sid, "reason": message, "authorization_required": False})
+                    summary["stop_reason"] = message
+                    state.end_run(run_id, summary["status"], summary)
+                    return summary
                 if sid == "evaluation" and scoped_sfm_training:
                     message = "The SfM decision permits experimental training only; evaluation and later archive stages require their own current review scope."
                     summary["status"] = "NEEDS_REVIEW"
@@ -1892,7 +2009,8 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
             if sid == "sfm" and prior and prior.get("status") == "NEEDS_REVIEW" and prior.get("input_fingerprint") == fp:
                 from .sfm_review import training_acceptance_for_run
                 scoped_sfm_training = training_acceptance_for_run(root, config, state)
-                if scoped_sfm_training and scoped_sfm_training["conditional_scope"]:
+                if ((scoped_sfm_training and scoped_sfm_training["conditional_scope"]) or
+                        scoped_sfm_geometry):
                     summary["stages"][sid] = "RETAINED_NEEDS_REVIEW_WITH_TRAINING_SCOPE"
                     summary["needs_review"].append(sid)
                     continue
@@ -1935,6 +2053,8 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
             if sid == "navigation" and prior and prior.get("input_fingerprint") == fp and prior.get("status") == "NEEDS_REVIEW":
                 summary["stages"][sid] = "NEEDS_REVIEW"
                 summary["needs_review"].append(sid)
+                if stop_after_stage == "first_visual":
+                    continue
                 summary["stop_reason"] = "The current navigation proposal is awaiting explicit review; use navigation review or change the inputs before generating a new proposal."
                 state.end_run(run_id, "NEEDS_REVIEW", summary)
                 return summary

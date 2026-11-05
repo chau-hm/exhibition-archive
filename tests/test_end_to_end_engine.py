@@ -1,4 +1,5 @@
 import json
+import importlib.util
 import math
 import struct
 from pathlib import Path
@@ -11,11 +12,12 @@ from exhibition_archive.cli import build_parser, cmd_run, main
 from exhibition_archive.input_prep import materialize_image_only_dataset
 from exhibition_archive.lidar import (PlyInspectionError, _alignment_validation_evidence, _inverse_similarity_transform, _similarity_fit_numpy,
                                       attempt_similarity_alignment, discover_input_files,
-                                      inspect_optional_lidar, inspect_ply)
+                                      inspect_optional_lidar, inspect_ply, propose_lidar_ground_plane,
+                                      read_ply_xyz_sample)
 from exhibition_archive.navigation import generate_navigation
 from exhibition_archive.preview import build_first_visual_preview
 from exhibition_archive.state import ProjectState
-from exhibition_archive.workflow import STAGES, run_workflow
+from exhibition_archive.workflow import STAGES, _navigation_source, run_workflow
 from exhibition_archive.workflow import _training_resolution_request
 from exhibition_archive.backends import BackendError, training_preset_configuration
 
@@ -113,6 +115,29 @@ def test_photo_only_and_invalid_lidar_fallback(tmp_path):
     assert rejected["training_consumed"] is False
 
 
+def test_valid_lidar_without_open3d_reports_actionable_optional_fallback(tmp_path):
+    source = tmp_path / "input"
+    output = tmp_path / "output"
+    source.mkdir()
+    points = [[float(x), float(y), float(z)] for x in range(4) for y in range(4) for z in range(4)]
+    cloud = source / "depth.ply"
+    write_cloud(cloud, points)
+    discovery = discover_input_files(source)
+    inspection = inspect_optional_lidar(discovery, source, output)
+
+    with patch.dict("sys.modules", {"open3d": None}):
+        report = attempt_similarity_alignment(inspection, points + [[0.5, 0.5, 0.5]] * 50, output / "registration")
+
+    assert inspection["inspection_status"] == "VALID"
+    assert report["status"] == "REJECTED"
+    assert report["alignment_attempted"] is False
+    expected_missing_dependency = "numpy" if importlib.util.find_spec("numpy") is None else "open3d"
+    assert report["registration_dependency"]["name"] == expected_missing_dependency
+    assert report["registration_dependency"]["status"] == "UNAVAILABLE"
+    assert report["training_consumed"] is False
+    assert report["navigation_consumed"] is False
+
+
 def test_alignment_rejects_insufficient_or_degenerate_geometry(tmp_path):
     cloud = tmp_path / "cloud.ply"
     preview = tmp_path / "preview.ply"
@@ -151,6 +176,58 @@ def test_aligned_lidar_preview_transform_maps_lidar_back_into_sfm_frame():
     assert recovered == pytest.approx(point_sfm)
 
 
+def test_accepted_versioned_alignment_is_handed_to_navigation_as_a_proposal(tmp_path):
+    root = tmp_path / "project"
+    output = root / "output"
+    lidar_dir = output / "lidar" / "registrations" / "alignment-execution-000042"
+    lidar_dir.mkdir(parents=True)
+    aligned = lidar_dir / "aligned-cloud-preview.ply"
+    write_cloud(aligned, [[float(x), float(y), 0.0]
+                          for x in range(12) for y in range(10)])
+    alignment = lidar_dir / "alignment-report.json"
+    alignment.write_text(json.dumps({
+        "status": "ACCEPTED", "accepted": True, "aligned_preview_status": "WRITTEN",
+        "aligned_preview_path": str(aligned),
+    }), encoding="utf-8")
+    reconstruction_dir = root / "sfm" / "sparse" / "0"
+    reconstruction_dir.mkdir(parents=True)
+    camera_centers = [{"camera_center": [float(x), float(y), 1.5]}
+                      for x, y in ((0, 0), (2, 0), (4, 0), (0, 2), (2, 2), (4, 2))]
+
+    class FixtureState:
+        def stage(self, stage_id):
+            if stage_id == "lidar_registration":
+                return {"details_json": json.dumps({
+                    "alignment_report_path": str(alignment),
+                    "aligned_preview_path": str(aligned),
+                })}
+            return None
+
+    config = {"output_directory": "output", "project_id": "alignment-handoff-fixture",
+              "integrations": {"sfm": {"directory": "sfm/sparse/0"},
+                               "navigation": {"mode": "generate_from_sfm"}}}
+    reconstructed = {
+        "cameras": camera_centers,
+        "sparse_points": [[0.0, 0.0, 0.0]],
+        "camera_models": [],
+        "source_reconstruction": {"coordinate_frame": {"up_axis": "z"}},
+    }
+
+    plane_proposal = {"status": "PROPOSED", "classification": "PROPOSED_REQUIRES_HUMAN_GROUND_IDENTIFICATION",
+                      "normal": [0.0, 0.0, 1.0], "offset": 0.0, "source": "synthetic proposal",
+                      "evidence": {"fixture": True}}
+    with patch("exhibition_archive.workflow.read_colmap_reconstruction", return_value=reconstructed), \
+            patch("exhibition_archive.workflow.propose_lidar_ground_plane", return_value=plane_proposal):
+        source, _settings = _navigation_source(root, config, FixtureState())
+
+    assert source["aligned_lidar_geometry_used"] is True, source["aligned_lidar_diagnostics"]
+    assert source["aligned_lidar_diagnostics"]["status"] == "ALIGNED_GEOMETRY_CONSUMED_FOR_NAVIGATION_DIAGNOSTICS"
+    assert source["aligned_lidar_diagnostics"]["ground_plane_candidate"]["status"] == "PROPOSED"
+    assert source["floor_plane"]["classification"] == "PROPOSED_REQUIRES_HUMAN_GROUND_IDENTIFICATION"
+    assert str(alignment.resolve()) in source["source_files"]
+    assert str(aligned.resolve()) in source["source_files"]
+
+
 def test_training_preset_configuration_captures_defaults_and_command_overrides():
     help_output = ("Usage: spirula train 3dgs [OPTIONS]\n"
                    "  --quality  [high]  Quality preset\n"
@@ -181,6 +258,19 @@ def test_ply_inspection_records_bounds_colors_normals_and_units(tmp_path, format
     assert report["coordinate_units"]["status"] == "UNKNOWN_OR_UNDECLARED"
 
 
+@pytest.mark.parametrize("format_name", ["ascii", "binary_little_endian", "binary_big_endian"])
+def test_bounded_ply_xyz_sample_supports_ascii_and_binary(tmp_path, format_name):
+    path = tmp_path / "cloud.ply"
+    write_cloud(path, [[-1, 0, 2], [3, 4, 5]], fmt=format_name, colors=True)
+
+    sample = read_ply_xyz_sample(path, maximum=2)
+
+    assert sample["point_count"] == 2
+    assert sample["sampled_point_count"] == 2
+    assert sample["bounding_box"]["x"] == [-1.0, 3.0]
+    assert sample["points"] == [[-1.0, 0.0, 2.0], [3.0, 4.0, 5.0]]
+
+
 def test_invalid_nonfinite_ply_is_reported_without_consumption(tmp_path):
     path = tmp_path / "invalid.ply"
     write_cloud(path, [[0, 0, 0], [float("nan"), 1, 2]])
@@ -198,6 +288,31 @@ def test_similarity_fit_recovers_uniform_scale_rotation_and_translation():
     assert math.isclose(np.cbrt(np.linalg.det(transform[:3, :3])), 2.5, rel_tol=1e-9)
     assert np.allclose(transform[:3, 3], [4, -2, 7], atol=1e-9)
     assert evidence["p95"] < 1e-9
+
+
+def test_lidar_plane_is_only_proposed_when_camera_trajectory_supports_it():
+    np = pytest.importorskip("numpy")
+    cloud = [[float(x), float(y), 0.0] for x in range(-10, 11) for y in range(-10, 11)]
+    cameras = [[2.0 * math.cos(angle), 2.0 * math.sin(angle), 1.0]
+               for angle in np.linspace(0.0, 2.0 * math.pi, 12, endpoint=False)]
+
+    candidate = propose_lidar_ground_plane(cloud, cameras)
+
+    assert candidate["status"] == "PROPOSED"
+    assert candidate["classification"] == "PROPOSED_REQUIRES_HUMAN_GROUND_IDENTIFICATION"
+    assert candidate["evidence"]["plane_inlier_count"] == len(cloud)
+    assert candidate["limitations"]
+
+
+def test_lidar_ground_plane_falls_back_for_degenerate_camera_trajectory():
+    pytest.importorskip("numpy")
+    cloud = [[float(x), float(y), 0.0] for x in range(-10, 11) for y in range(-10, 11)]
+    cameras = [[float(index), 0.0, 1.0] for index in range(8)]
+
+    candidate = propose_lidar_ground_plane(cloud, cameras)
+
+    assert candidate["status"] == "UNVERIFIED"
+    assert "camera centers" in candidate["reason"].casefold()
 
 
 def test_image_only_dataset_preserves_source_bytes_and_manifest(tmp_path):

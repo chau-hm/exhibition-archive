@@ -283,6 +283,82 @@ def check_resources(path: Path, policy: dict[str, Any], stage: str) -> dict[str,
             "filesystem_total_bytes": usage.total, "checked_path": str(path.resolve())}
 
 
+def _project_colmap_observation(model_id: int, parameters: tuple[float, ...],
+                                camera_xyz: tuple[float, float, float]) -> tuple[float, float] | None:
+    """Project a camera-space point for the COLMAP models used by the Engine.
+
+    Unsupported camera models deliberately return None: an unavailable metric is
+    safer than treating the points3D.bin error scalar as meaningful when it is
+    known to be unset by a backend.
+    """
+    x, y, z = camera_xyz
+    if not all(math.isfinite(value) for value in camera_xyz) or z <= 1e-12:
+        return None
+    xn, yn = x / z, y / z
+    if model_id == 0:  # SIMPLE_PINHOLE: f, cx, cy
+        f, cx, cy = parameters
+        return f * xn + cx, f * yn + cy
+    if model_id == 1:  # PINHOLE: fx, fy, cx, cy
+        fx, fy, cx, cy = parameters
+        return fx * xn + cx, fy * yn + cy
+    if model_id == 2:  # SIMPLE_RADIAL: f, cx, cy, k1
+        f, cx, cy, k1 = parameters
+        r2 = xn * xn + yn * yn
+        radial = 1.0 + k1 * r2
+        return f * xn * radial + cx, f * yn * radial + cy
+    if model_id == 3:  # RADIAL: f, cx, cy, k1, k2
+        f, cx, cy, k1, k2 = parameters
+        r2 = xn * xn + yn * yn
+        radial = 1.0 + k1 * r2 + k2 * r2 * r2
+        return f * xn * radial + cx, f * yn * radial + cy
+    if model_id == 4:  # OPENCV: fx, fy, cx, cy, k1, k2, p1, p2
+        fx, fy, cx, cy, k1, k2, p1, p2 = parameters
+        r2 = xn * xn + yn * yn
+        radial = 1.0 + k1 * r2 + k2 * r2 * r2
+        xd = xn * radial + 2.0 * p1 * xn * yn + p2 * (r2 + 2.0 * xn * xn)
+        yd = yn * radial + p1 * (r2 + 2.0 * yn * yn) + 2.0 * p2 * xn * yn
+        return fx * xd + cx, fy * yd + cy
+    return None
+
+
+def _rotation_from_colmap_pose(pose: tuple[float, ...]) -> tuple[tuple[float, ...], ...]:
+    qw, qx, qy, qz = pose[:4]
+    norm = math.sqrt(qw * qw + qx * qx + qy * qy + qz * qz)
+    qw, qx, qy, qz = (value / norm for value in (qw, qx, qy, qz))
+    return (
+        (1 - 2 * (qy * qy + qz * qz), 2 * (qx * qy - qz * qw), 2 * (qx * qz + qy * qw)),
+        (2 * (qx * qy + qz * qw), 1 - 2 * (qx * qx + qz * qz), 2 * (qy * qz - qx * qw)),
+        (2 * (qx * qz - qy * qw), 2 * (qy * qz + qx * qw), 1 - 2 * (qx * qx + qy * qy)),
+    )
+
+
+def parse_spirula_sfm_reprojection_summary(path: Path | str | None) -> dict[str, Any] | None:
+    """Read Spirula's documented observation-weighted summary line, if present."""
+    if path is None:
+        return None
+    log_path = Path(path)
+    if not log_path.is_file():
+        return None
+    pattern = re.compile(
+        r"Reprojection error:\s*mean\s+([0-9.eE+-]+)\s+px,\s*median\s+([0-9.eE+-]+)\s+px,\s*over\s+(\d+)\s+observations",
+        re.IGNORECASE,
+    )
+    found = None
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+            for line_number, line in enumerate(stream, 1):
+                match = pattern.search(line)
+                if match:
+                    values = (float(match.group(1)), float(match.group(2)))
+                    if all(math.isfinite(value) and value >= 0 for value in values):
+                        found = {"mean_px": values[0], "median_px": values[1],
+                                 "observation_count": int(match.group(3)),
+                                 "source": "spirula_log_summary", "source_line": line_number}
+    except OSError:
+        return None
+    return found
+
+
 def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = None) -> dict[str, Any]:
     def exact(stream, size, what):
         data = stream.read(size)
@@ -310,7 +386,7 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
             raise BackendError("Unexpected trailing bytes in cameras.bin", failure_kind="SFM_INVALID")
     images: dict[int, dict] = {}
     names: set[str] = set()
-    image_point_ids: dict[int, list[int]] = {}
+    image_observations: dict[int, list[tuple[float, float, int]]] = {}
     camera_centers: list[dict[str, Any]] = []
     quaternion_norm_warnings: list[str] = []
     with images_path.open("rb") as stream:
@@ -327,11 +403,11 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
                 if len(name_bytes) > 1024*1024: raise BackendError("COLMAP image name exceeds 1 MiB", failure_kind="SFM_INVALID")
             name = name_bytes.decode("utf-8", errors="strict")
             n_points2d = struct.unpack("<Q", exact(stream, 8, "2D point count"))[0]
-            ids = []
+            observations = []
             for _p in range(n_points2d):
                 x, y, point_id = struct.unpack("<2dQ", exact(stream, 24, "2D point"))
                 if not math.isfinite(x) or not math.isfinite(y): raise BackendError(f"Non-finite 2D point in image {name}", failure_kind="SFM_INVALID")
-                ids.append(point_id)
+                observations.append((x, y, point_id))
             if image_id in images or name in names or camera_id not in cameras or not all(math.isfinite(x) for x in pose):
                 raise BackendError(f"Invalid, duplicate, or unresolved COLMAP image record: {name}", failure_kind="SFM_INVALID")
             qw, qx, qy, qz, tx, ty, tz = pose
@@ -348,11 +424,14 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
             )
             center = tuple(-(rotation[0][axis]*tx + rotation[1][axis]*ty + rotation[2][axis]*tz) for axis in range(3))
             camera_centers.append({"image_name": name, "xyz_sfm_units": center})
-            images[image_id] = {"name": name, "camera_id": camera_id, "points2d": n_points2d, "pose": pose, "quaternion_norm": qnorm}
-            image_point_ids[image_id] = ids
+            images[image_id] = {"name": name, "camera_id": camera_id, "points2d": n_points2d,
+                                "pose": pose, "rotation": _rotation_from_colmap_pose(pose),
+                                "quaternion_norm": qnorm}
+            image_observations[image_id] = observations
             names.add(name)
         if stream.read(1): raise BackendError("Unexpected trailing bytes in images.bin", failure_kind="SFM_INVALID")
     points, track_lengths, errors, reciprocal_failures = set(), [], [], 0
+    point_rows: list[tuple[int, tuple[float, float, float], float, list[tuple[int, int]]]] = []
     with points_path.open("rb") as stream:
         count = struct.unpack("<Q", exact(stream, 8, "3D point count"))[0]
         for _ in range(count):
@@ -364,17 +443,50 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
             if point_id in points or not all(math.isfinite(x) for x in xyz) or not math.isfinite(error):
                 raise BackendError("Invalid or duplicate COLMAP 3D point record", failure_kind="SFM_INVALID")
             points.add(point_id); track_lengths.append(n_track); errors.append(error)
+            track: list[tuple[int, int]] = []
             for _track in range(n_track):
                 image_id, point2d_idx = struct.unpack("<ii", exact(stream, 8, "track item"))
                 image_row = images.get(image_id)
                 if image_row is None or point2d_idx < 0 or point2d_idx >= image_row["points2d"]:
                     raise BackendError("COLMAP track refers to an unknown image or 2D feature", failure_kind="SFM_INVALID")
-                if image_point_ids[image_id][point2d_idx] != point_id: reciprocal_failures += 1
+                if image_observations[image_id][point2d_idx][2] != point_id: reciprocal_failures += 1
+                track.append((image_id, point2d_idx))
+            point_rows.append((point_id, xyz, error, track))
         if stream.read(1): raise BackendError("Unexpected trailing bytes in points3D.bin", failure_kind="SFM_INVALID")
-    for image_id, point_ids in image_point_ids.items():
-        for point_id in point_ids:
+    for image_id, observations in image_observations.items():
+        for _x, _y, point_id in observations:
             if point_id != 0xFFFFFFFFFFFFFFFF and point_id not in points:
                 raise BackendError(f"COLMAP image {images[image_id]['name']} references a missing 3D point", failure_kind="SFM_INVALID")
+
+    per_point_errors: list[float] = []
+    observation_errors: list[float] = []
+    projected_observation_count = 0
+    projection_failures = 0
+    for _point_id, xyz, _stored_error, track in point_rows:
+        residuals = []
+        for image_id, point2d_index in track:
+            image = images[image_id]
+            observation = image_observations[image_id][point2d_index]
+            if observation[2] != _point_id:
+                continue
+            camera = cameras[image["camera_id"]]
+            rotation = image["rotation"]
+            translation = image["pose"][4:7]
+            camera_xyz = tuple(sum(rotation[row][column] * xyz[column] for column in range(3)) + translation[row]
+                               for row in range(3))
+            projected = _project_colmap_observation(camera["model_id"], camera["parameters"], camera_xyz)
+            if projected is None:
+                projection_failures += 1
+                continue
+            residual = math.hypot(projected[0] - observation[0], projected[1] - observation[1])
+            if not math.isfinite(residual):
+                projection_failures += 1
+                continue
+            residuals.append(residual)
+            observation_errors.append(residual)
+            projected_observation_count += 1
+        if residuals:
+            per_point_errors.append(sum(residuals) / len(residuals))
     source_names = {row["relative_path"]: row["image_id"] for row in (image_inventory_rows or [])}
     mapped, unmatched = [], []
     for row in images.values():
@@ -402,6 +514,62 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
         camera_distribution = {"pose_count": len(positions), "coordinate_frame": "COLMAP reconstruction; arbitrary non-metric SfM units", "axis_bounds": bounds, "centroid_xyz_sfm_units": centroid, "rms_distance_from_centroid_sfm_units": spread_rms, "bounding_box_diagonal_sfm_units": bbox_diagonal, "interpretation": "Pose-center distribution only; does not establish real-world scale, coverage of artwork surfaces, or visitor-safe navigation."}
     else:
         camera_distribution = None
+    stored_errors_informative = bool(errors) and any(value > 1e-9 for value in errors)
+    recomputation_complete = (not reciprocal_failures and projection_failures == 0 and
+                              projected_observation_count == sum(track_lengths) and
+                              len(per_point_errors) == len(point_rows) and bool(per_point_errors))
+    if recomputation_complete:
+        gate_errors = per_point_errors
+        gate_metric_source = "recomputed_from_colmap_camera_models_poses_points_and_tracks"
+        metric_status = "VERIFIED"
+    elif stored_errors_informative:
+        gate_errors = errors
+        gate_metric_source = "colmap_points3D_error_fields"
+        metric_status = "VERIFIED_FROM_NATIVE_COLMAP_POINT_ERROR_FIELDS"
+    else:
+        gate_errors = []
+        gate_metric_source = None
+        metric_status = "UNAVAILABLE_OR_UNINFORMATIVE"
+    sorted_gate_errors = sorted(gate_errors)
+    sorted_observation_errors = sorted(observation_errors)
+    def percentile(values: list[float], fraction: float) -> float | None:
+        if not values:
+            return None
+        position = (len(values) - 1) * fraction
+        lower = int(math.floor(position))
+        upper = int(math.ceil(position))
+        weight = position - lower
+        return values[lower] * (1.0 - weight) + values[upper] * weight
+    reprojection_metrics = {
+        "quality_gate_metric": "mean_per_point_mean_observation_reprojection_error_px",
+        "quality_gate_value_px": (sum(gate_errors) / len(gate_errors)) if gate_errors else None,
+        "quality_gate_source": gate_metric_source,
+        "quality_gate_validation_status": metric_status,
+        "per_point_mean_observation_error_px": {
+            "count": len(per_point_errors),
+            "mean": (sum(per_point_errors) / len(per_point_errors)) if recomputation_complete else None,
+            "median": percentile(sorted(per_point_errors), 0.5) if recomputation_complete else None,
+            "p90": percentile(sorted(per_point_errors), 0.9) if recomputation_complete else None,
+            "source": "COLMAP cameras.bin + images.bin observations + points3D.bin tracks",
+            "status": "VERIFIED" if recomputation_complete else "INCOMPLETE",
+        },
+        "observation_error_px": {
+            "count": projected_observation_count,
+            "mean": (sum(observation_errors) / len(observation_errors)) if observation_errors else None,
+            "median": percentile(sorted_observation_errors, 0.5),
+            "p90": percentile(sorted_observation_errors, 0.9),
+            "source": "COLMAP camera models + poses + 3D points + 2D observations",
+            "status": "VERIFIED" if recomputation_complete else "PARTIAL",
+        },
+        "points3D_error_field": {
+            "count": len(errors),
+            "mean": (sum(errors) / len(errors)) if errors else None,
+            "all_zero_or_uninformative": bool(errors) and not stored_errors_informative,
+            "interpretation": "Stored scalar field is retained as source evidence; it is not used as zero when uninformative.",
+        },
+        "track_reciprocal_reference_mismatches": reciprocal_failures,
+        "projection_failures": projection_failures,
+    }
     return {
         "format": "COLMAP_BINARY", "directory": str(directory.resolve()), "camera_count": len(cameras),
         "registered_image_count": len(images), "sparse_point_count": len(points),
@@ -413,13 +581,43 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
         "mapped_source_image_ids": mapped, "unmatched_source_image_names": unmatched,
         "mean_track_length": (sum(track_lengths)/len(track_lengths)) if track_lengths else None,
         "median_track_length": sorted(track_lengths)[len(track_lengths)//2] if track_lengths else None,
-        "mean_point_reprojection_error_px": (sum(errors)/len(errors)) if errors else None,
-        "p50_point_reprojection_error_px": p50, "p90_point_reprojection_error_px": p90,
+        "mean_point_reprojection_error_px": reprojection_metrics["quality_gate_value_px"],
+        "p50_point_reprojection_error_px": percentile(sorted_gate_errors, 0.5),
+        "p90_point_reprojection_error_px": percentile(sorted_gate_errors, 0.9),
+        "mean_stored_points3D_error_px": (sum(errors)/len(errors)) if errors else None,
+        "reprojection_metrics": reprojection_metrics,
         "track_reciprocal_reference_mismatches": reciprocal_failures,
     }
 
 
-def validate_colmap_directory(sparse_root: Path, image_rows: list[dict], thresholds: dict[str, Any] | None = None) -> dict[str, Any]:
+def _verify_backend_observation_summary(summary: dict[str, Any] | None,
+                                       primary: dict[str, Any], component_count: int) -> dict[str, Any] | None:
+    if not summary:
+        return None
+    recomputed = primary.get("reprojection_metrics", {}).get("observation_error_px", {})
+    expected_count = recomputed.get("count")
+    computed_mean, computed_median = recomputed.get("mean"), recomputed.get("median")
+    checks = {
+        "single_component_output": component_count == 1,
+        "observation_count_matches": expected_count == summary.get("observation_count"),
+        "mean_matches_recomputation_to_log_precision": (
+            computed_mean is not None and summary.get("mean_px") is not None and
+            abs(computed_mean - summary["mean_px"]) <= 0.0011),
+        "median_matches_recomputation_to_log_precision": (
+            computed_median is not None and summary.get("median_px") is not None and
+            abs(computed_median - summary["median_px"]) <= 0.0011),
+    }
+    return {**summary, "metric_type": "mean_and_median_observation_reprojection_error",
+            "validation_status": "VERIFIED" if all(checks.values()) else "REJECTED_MISMATCH",
+            "recomputed_observation_statistics": {"count": expected_count,
+                                                   "mean_px": computed_mean,
+                                                   "median_px": computed_median},
+            "validation_tolerance_px": 0.0011,
+            "validation_checks": checks}
+
+
+def validate_colmap_directory(sparse_root: Path, image_rows: list[dict], thresholds: dict[str, Any] | None = None,
+                               backend_reprojection_summary: dict[str, Any] | None = None) -> dict[str, Any]:
     thresholds = thresholds or {}
     has_direct_model = all((sparse_root / name).is_file() for name in ("cameras.bin", "images.bin", "points3D.bin"))
     model_dirs = ([sparse_root] if has_direct_model else
@@ -440,9 +638,14 @@ def validate_colmap_directory(sparse_root: Path, image_rows: list[dict], thresho
     if ratio < 0.95: warnings.append("NOT_ALL_SOURCE_IMAGES_REGISTERED")
     if len(components) > 1: warnings.append("MULTIPLE_RECONSTRUCTION_COMPONENTS")
     if primary["mean_track_length"] is None: warnings.append("TRACK_LENGTH_UNKNOWN")
-    if primary["mean_point_reprojection_error_px"] is None: warnings.append("REPROJECTION_ERROR_UNKNOWN")
-    elif primary["mean_point_reprojection_error_px"] > max_mean_error: warnings.append("MEAN_POINT_REPROJECTION_ERROR_ABOVE_CONFIGURED_LIMIT")
-    elif primary["mean_point_reprojection_error_px"] <= 1e-9: warnings.append("REPROJECTION_ERROR_ZERO_OR_UNINFORMATIVE")
+    metric_status = primary.get("reprojection_metrics", {}).get("quality_gate_validation_status")
+    if primary["mean_point_reprojection_error_px"] is None:
+        warnings.append("REPROJECTION_ERROR_UNKNOWN")
+    elif metric_status not in {"VERIFIED", "VERIFIED_FROM_NATIVE_COLMAP_POINT_ERROR_FIELDS"}:
+        warnings.append("REPROJECTION_ERROR_UNVERIFIED")
+    elif primary["mean_point_reprojection_error_px"] > max_mean_error:
+        warnings.append("MEAN_POINT_REPROJECTION_ERROR_ABOVE_CONFIGURED_LIMIT")
+    backend_summary = _verify_backend_observation_summary(backend_reprojection_summary, primary, len(components))
     if primary["camera_quaternion_norm_warning_image_names"]: warnings.append("CAMERA_ROTATION_QUATERNION_NORM_OUTSIDE_TOLERANCE")
     if primary["track_reciprocal_reference_mismatches"]: warnings.append("TRACK_RECIPROCITY_MISMATCH")
     if primary["camera_count"] < 1 or primary["registered_image_count"] < 2 or primary["sparse_point_count"] < 1:
@@ -459,6 +662,7 @@ def validate_colmap_directory(sparse_root: Path, image_rows: list[dict], thresho
         "thresholds": {"minimum_registered_ratio": min_ratio, "minimum_registered_images": min_images, "maximum_mean_point_reprojection_error_px": max_mean_error},
         "component_count": len(components), "components": components,
         "primary_component": primary["directory"], "warnings": warnings,
+        "backend_observation_reprojection_summary": backend_summary,
         "interpretation": "Technical COLMAP integrity and coarse capture coverage only; does not guarantee 3DGS suitability or artwork fidelity.",
     }
 

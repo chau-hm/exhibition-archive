@@ -213,6 +213,27 @@ class GeometryGenerationTests(unittest.TestCase):
         self.assertEqual(check["status"], "INVALID")
         self.assertEqual(check["initial_camera_validation"]["error"], "default_camera_outside_vertical_bounds")
 
+    def test_aligned_lidar_plane_is_recorded_as_a_review_only_navigation_input(self):
+        points = [[x, y, 2] for x, y in [(0, 0), (1, 0), (2, 0), (2, 1), (1, 2), (0, 2), (0, 1)]]
+        source = source_for(points, ceiling=False)
+        source["floor_plane"] = {"normal": [0, 0, 1], "offset": 0, "coordinate_frame": "viewer",
+                                 "classification": "PROPOSED_REQUIRES_HUMAN_GROUND_IDENTIFICATION",
+                                 "source": "aligned synthetic LiDAR candidate",
+                                 "evidence": {"plane_inlier_count": 250}}
+        source["aligned_lidar_geometry_used"] = True
+        source["aligned_lidar_diagnostics"] = {"status": "ALIGNED_GEOMETRY_CONSUMED_FOR_NAVIGATION_DIAGNOSTICS",
+                                                "navigation_consumed": True, "sampled_point_count": 300}
+
+        artifact = generate_navigation(source, {"scene_type": "outdoor", "camera_clearance_units": 0})
+
+        self.assertTrue(artifact["coverage_assumptions"]["aligned_lidar_used"])
+        self.assertEqual(artifact["coverage_assumptions"]["ground_plane"],
+                         "PROPOSED_REQUIRES_HUMAN_IDENTIFICATION")
+        self.assertTrue(artifact["coverage_assumptions"]["aligned_lidar_diagnostics"]["navigation_consumed"])
+        self.assertIn("GROUND_PLANE_PROPOSAL_REQUIRES_HUMAN_IDENTIFICATION",
+                      [warning["code"] for warning in artifact["validation"]["warnings"]])
+        self.assertFalse(artifact["review"]["approved"])
+
     def test_approval_keeps_inferred_ceiling_classification_explicit(self):
         points = [[x, y, 2] for x in range(5) for y in range(5)]
         artifact = generate_navigation(source_for(points), {"camera_clearance_units": 0})

@@ -1,10 +1,14 @@
 from __future__ import annotations
 
 import json
+import io
+import sqlite3
 import struct
 import tempfile
 import unittest
+from contextlib import redirect_stdout
 from pathlib import Path
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from exhibition_archive.adapters import sha256_file, write_json
@@ -16,6 +20,8 @@ from exhibition_archive.backends import (
 )
 from exhibition_archive.sfm_review import (
     component_acceptance_status,
+    geometry_proposal_scope,
+    review_sfm_geometry_component,
     review_sfm_component,
     training_component_scope,
 )
@@ -27,6 +33,7 @@ from exhibition_archive.workflow import (
     run_workflow,
     stage_fingerprint,
 )
+from exhibition_archive.cli import cmd_sfm_revalidate
 
 BACKEND = {
     "tool": {"executable": "/opt/test/spirula", "version": "test-1.2"},
@@ -40,7 +47,8 @@ TRAINING_STAGE = {"id": "training", "deps": ["photo_inventory", "sfm"], "inputs"
 NAVIGATION_STAGE = {"id": "navigation", "deps": ["sfm"], "inputs": [], "outputs": [], "mode": "fixture", "resource": "test"}
 
 
-def _write_component(path: Path, names: list[str], *, point_error: float = 0.0) -> None:
+def _write_component(path: Path, names: list[str], *, point_error: float = 0.0,
+                     observation_offset_px: float = 0.0) -> None:
     path.mkdir(parents=True, exist_ok=True)
     with (path / "cameras.bin").open("wb") as stream:
         stream.write(struct.pack("<Q", 1))
@@ -49,15 +57,15 @@ def _write_component(path: Path, names: list[str], *, point_error: float = 0.0) 
     with (path / "images.bin").open("wb") as stream:
         stream.write(struct.pack("<Q", len(names)))
         for index, name in enumerate(names, start=1):
-            stream.write(struct.pack("<I7dI", index, 1.0, 0.0, 0.0, 0.0, float(index), 0.0, 0.0, 1))
+            stream.write(struct.pack("<I7dI", index, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1))
             stream.write(name.encode("utf-8") + b"\0")
             if index <= 2:
-                stream.write(struct.pack("<Q2dQ", 1, 10.0 + index, 12.0, 1))
+                stream.write(struct.pack("<Q2dQ", 1, 32.0 + observation_offset_px, 24.0, 1))
             else:
                 stream.write(struct.pack("<Q", 0))
     with (path / "points3D.bin").open("wb") as stream:
         stream.write(struct.pack("<Q", 1))
-        stream.write(struct.pack("<Q3d3BdQ", 1, 0.0, 0.0, 0.0, 128, 128, 128, point_error, 2))
+        stream.write(struct.pack("<Q3d3BdQ", 1, 0.0, 0.0, 5.0, 128, 128, 128, point_error, 2))
         stream.write(struct.pack("<4i", 1, 0, 2, 0))
 
 
@@ -138,8 +146,29 @@ class SfmReviewTests(unittest.TestCase):
                                     rationale="Synthetic regression fixture only",
                                     limitations=["TEST_ONLY; experimental training scope only"])
 
-    def test_single_component_acceptance_records_audited_scope_and_preserves_zero_error_warning(self):
-        self.make_sfm(source_count=8, component_sizes=(8,))
+    def test_read_only_project_state_cannot_initialize_or_write_database(self):
+        root = Path(self.temp.name) / "read-only-state"
+        writable = ProjectState(root)
+        writable.close()
+        database = root / "workflow.sqlite3"
+        before = sha256_file(database)
+
+        reader = ProjectState(root, read_only=True)
+        try:
+            self.assertTrue(reader.read_only)
+            self.assertEqual(reader.db.execute("SELECT COUNT(*) FROM stage_states").fetchone()[0], 0)
+            with self.assertRaises(sqlite3.OperationalError):
+                reader.db.execute("CREATE TABLE forbidden_write(value TEXT)")
+        finally:
+            reader.close()
+
+        self.assertEqual(sha256_file(database), before)
+        self.assertFalse(Path(str(database) + "-wal").exists())
+        self.assertFalse(Path(str(database) + "-shm").exists())
+
+    def test_single_component_acceptance_records_audited_scope_and_preserves_historical_warning(self):
+        self.make_sfm(source_count=8, component_sizes=(8,),
+                      historical_warnings=("REPROJECTION_ERROR_ZERO_OR_UNINFORMATIVE",))
         result = self.accept()
         self.assertEqual(result["status"], "ACCEPTED_FOR_EXPERIMENTAL_TRAINING")
         stage = self.state.stage("sfm")
@@ -150,6 +179,8 @@ class SfmReviewTests(unittest.TestCase):
         self.assertIn("REPROJECTION_ERROR_ZERO_OR_UNINFORMATIVE", decision["original_quality_warnings"])
         self.assertEqual(decision["selected_component"]["registered_image_count"], 8)
         self.assertEqual(decision["selected_component"]["mean_point_reprojection_error_px"], 0.0)
+        self.assertEqual(decision["current_revalidation_quality_gate"], "SFM_VALID")
+        self.assertNotIn("REPROJECTION_ERROR_ZERO_OR_UNINFORMATIVE", decision["current_revalidation_warnings"])
         self.assertEqual(decision["historical_preparation_toolchain"], None)
         self.assertIn("python", decision["reviewer_environment"])
         self.assertEqual(self.state.db.execute("SELECT COUNT(*) FROM review_history").fetchone()[0], 1)
@@ -158,7 +189,7 @@ class SfmReviewTests(unittest.TestCase):
         self.assertEqual(scope["registered_image_count"], 8)
 
     def test_multi_component_acceptance_applies_only_to_selected_component_and_keeps_original_warnings(self):
-        self.make_sfm(historical_warnings=("SPIRULA_REPORTED_PARTIAL_OUTPUT",))
+        self.make_sfm(historical_warnings=("SPIRULA_REPORTED_PARTIAL_OUTPUT", "REPROJECTION_ERROR_ZERO_OR_UNINFORMATIVE"))
         result = self.accept("0")
         self.assertEqual(result["decision"]["original_quality_gate"], "SFM_NEEDS_REVIEW")
         self.assertIn("NOT_ALL_SOURCE_IMAGES_REGISTERED", result["decision"]["original_quality_warnings"])
@@ -293,6 +324,89 @@ class SfmReviewTests(unittest.TestCase):
             review_sfm_component(self.root, self.config, self.state, component_id="0",
                                  decision="accept-experimental-training", reviewer="TEST_ONLY reviewer",
                                  rationale="Synthetic acceptance", limitations=[])
+
+    def test_geometry_proposal_review_is_separate_and_never_authorizes_training(self):
+        self.make_sfm(source_count=8, component_sizes=(8,))
+
+        decision = review_sfm_geometry_component(
+            self.root, self.config, self.state, component_id="0", reviewer="TEST_ONLY reviewer",
+            rationale="Authorize synthetic alignment diagnostics and a navigation proposal only",
+            limitations=["Synthetic geometry fixture; no real-world registration validation."])
+
+        self.assertEqual(decision["status"], "ACCEPTED_FOR_GEOMETRY_PROPOSALS")
+        self.assertFalse(decision["decision"]["training_authorized"])
+        self.assertFalse(decision["decision"]["navigation_approval_granted"])
+        self.assertEqual(geometry_proposal_scope(self.root, self.config, self.state)["component_id"], "0")
+        with self.assertRaisesRegex(BackendError, "component-scoped experimental-training acceptance"):
+            training_component_scope(self.root, self.config, self.state)
+        status = component_acceptance_status(self.root, self.config, self.state)
+        self.assertEqual(status["components"][0]["geometry_proposal_status"], "ACCEPTED_FOR_GEOMETRY_PROPOSALS")
+        self.assertEqual(self.state.stage("sfm")["status"], "NEEDS_REVIEW")
+
+    def test_geometry_proposal_review_requires_current_clean_quality_revalidation(self):
+        self.make_sfm(source_count=12, component_sizes=(8, 2))
+
+        with self.assertRaisesRegex(BackendError, "requires a current SFM_VALID revalidation"):
+            review_sfm_geometry_component(
+                self.root, self.config, self.state, component_id="0", reviewer="TEST_ONLY reviewer",
+                rationale="Reject geometry proposal on incomplete fixture",
+                limitations=["Synthetic multi-component SfM fixture."])
+
+    def test_sfm_revalidate_cli_reports_metrics_without_mutating_historical_artifacts(self):
+        self.make_sfm(source_count=8, component_sizes=(8,),
+                      historical_warnings=("REPROJECTION_ERROR_ZERO_OR_UNINFORMATIVE",))
+        validation_path = self.root / "output" / "work" / "sfm-validation.json"
+        prior_hash = sha256_file(validation_path)
+        database_hash = sha256_file(self.state.path)
+        cache_count = self.state.db.execute("SELECT COUNT(*) FROM fingerprint_cache").fetchone()[0]
+        captured = io.StringIO()
+
+        with redirect_stdout(captured):
+            result = cmd_sfm_revalidate(SimpleNamespace(project=str(self.root)))
+
+        output = json.loads(captured.getvalue())
+        self.assertEqual(result, 0)
+        self.assertEqual(output["current_revalidation_quality_gate"], "SFM_VALID")
+        self.assertEqual(output["components"][0]["reprojection_metrics"]["quality_gate_value_px"], 0.0)
+        self.assertEqual(output["mutation"], "READ_ONLY; no SfM artifacts or durable stage state changed")
+        self.assertEqual(sha256_file(validation_path), prior_hash)
+        self.assertEqual(sha256_file(self.state.path), database_hash)
+        self.assertEqual(self.state.db.execute("SELECT COUNT(*) FROM fingerprint_cache").fetchone()[0], cache_count)
+
+    def test_geometry_scope_can_continue_optional_geometry_stages_without_training_acceptance(self):
+        self.make_sfm(source_count=8, component_sizes=(8,))
+        self.config["integrations"]["navigation"] = {"mode": "generate_from_sfm"}
+        review_sfm_geometry_component(
+            self.root, self.config, self.state, component_id="0", reviewer="TEST_ONLY reviewer",
+            rationale="Allow geometry proposal stages for a synthetic test",
+            limitations=["No training or navigation approval is included."])
+        lidar_stage = {"id": "lidar_registration", "deps": ["sfm"], "inputs": [], "outputs": [],
+                       "mode": "fixture", "resource": "test"}
+        navigation_stage = {"id": "navigation", "deps": ["sfm", "lidar_registration"], "inputs": [],
+                            "outputs": [], "mode": "fixture", "resource": "test"}
+
+        def execute(_root, _config, _state, sid, output_dir, _execution_id, *_args):
+            path = output_dir / f"{sid}-fixture.json"
+            path.parent.mkdir(parents=True, exist_ok=True)
+            write_json(path, {"fixture": True, "stage": sid})
+            return {"status": "COMPLETED", "artifacts": [path], "details": {"fixture": True}}
+
+        def fingerprint(_root, _config, state, sid, *_args, **_kwargs):
+            prior = state.stage(sid)
+            return prior["input_fingerprint"] if sid == "sfm" and prior else f"fixture-{sid}"
+
+        with patch("exhibition_archive.workflow.STAGES", [
+                {"id": "sfm", "deps": [], "inputs": [], "outputs": [], "mode": "fixture", "resource": "test"},
+                lidar_stage, navigation_stage]), \
+             patch("exhibition_archive.workflow._execute_stage", side_effect=execute), \
+             patch("exhibition_archive.workflow.stage_fingerprint", side_effect=fingerprint):
+            result = run_workflow(self.root, self.config, self.state)
+
+        self.assertIn("lidar_registration", result["completed"])
+        self.assertIn("navigation", result["completed"])
+        self.assertEqual(self.state.stage("sfm")["status"], "NEEDS_REVIEW")
+        self.assertEqual(self.state.db.execute(
+            "SELECT COUNT(*) FROM stage_executions WHERE stage_id='lidar_registration'").fetchone()[0], 1)
 
 
 if __name__ == "__main__":

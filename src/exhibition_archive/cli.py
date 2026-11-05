@@ -631,6 +631,47 @@ def cmd_sfm_review(args) -> int:
         state.close()
 
 
+def cmd_sfm_revalidate(args) -> int:
+    """Read-only validation of adopted/existing SfM artifacts and their provenance."""
+    from .sfm_review import build_sfm_snapshot
+    root, config = load_project(args.project)
+    state = ProjectState(root, read_only=True)
+    try:
+        snapshot = build_sfm_snapshot(root, config, state)
+        print(json.dumps({
+            "project_id": config["project_id"], "workspace": str(root.resolve()),
+            "sfm_execution": snapshot["sfm_execution"],
+            "original_quality_gate": snapshot["original_quality_gate"],
+            "original_quality_warnings": snapshot["original_quality_warnings"],
+            "current_revalidation_quality_gate": snapshot["revalidation_quality_gate"],
+            "current_revalidation_warnings": snapshot["revalidation_warnings"],
+            "thresholds": snapshot["current_revalidation_thresholds"],
+            "components": snapshot["components"],
+            "current_revalidation_metrics": snapshot["current_revalidation_metrics"],
+            "backend_observation_reprojection_summary": snapshot["backend_observation_reprojection_summary"],
+            "binding_sha256": snapshot["binding_sha256"],
+            "mutation": "READ_ONLY; no SfM artifacts or durable stage state changed",
+        }, indent=2, ensure_ascii=False))
+        return 0
+    finally:
+        state.close()
+
+
+def cmd_sfm_geometry_review(args) -> int:
+    from .sfm_review import review_sfm_geometry_component
+    root, config = load_project(args.project)
+    state = ProjectState(root)
+    try:
+        with state.lock():
+            result = review_sfm_geometry_component(root, config, state, component_id=args.component,
+                                                   reviewer=args.reviewer, rationale=args.rationale,
+                                                   limitations=args.limitation)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
+    finally:
+        state.close()
+
+
 def cmd_navigation(args) -> int:
     root, config = load_project(args.project)
     state = ProjectState(root)
@@ -1040,6 +1081,17 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--reviewer", required=True); p.add_argument("--rationale", required=True)
     p.add_argument("--limitation", action="append", default=[], help="Unresolved limitation; required once or more for conditional acceptance")
     p.set_defaults(func=cmd_sfm_review)
+    p = sub.add_parser("sfm-revalidate", help="Read-only revalidate existing COLMAP artifacts without rerunning SfM",
+                       description="Read-only revalidation of existing COLMAP artifacts and current reprojection metrics. Does not rerun SfM or rewrite historical reports.")
+    p.add_argument("project")
+    p.set_defaults(func=cmd_sfm_revalidate)
+    p = sub.add_parser("sfm-geometry-review", help="Authorize only diagnostic registration and unapproved navigation proposals for one validated component",
+                       description="Record a separate component-bound review for diagnostic LiDAR registration and an unapproved navigation proposal only. Does not authorize training or navigation approval.")
+    p.add_argument("project"); p.add_argument("--component", required=True)
+    p.add_argument("--reviewer", required=True); p.add_argument("--rationale", required=True)
+    p.add_argument("--limitation", action="append", required=True,
+                   help="Unresolved limitation; repeat for each known geometry or alignment limitation")
+    p.set_defaults(func=cmd_sfm_geometry_review)
     p = sub.add_parser("navigation", help="Assess, generate, validate, inspect, or review navigation geometry")
     nav = p.add_subparsers(dest="navigation_action", required=True)
     for action, help_text in (("assess", "Inspect configured geometry and navigation readiness"),

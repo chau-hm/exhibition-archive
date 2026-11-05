@@ -7,13 +7,19 @@ from typing import Any
 from urllib.parse import quote
 
 from .adapters import sha256_file
-from .backends import BackendError, image_inventory, validate_colmap_directory
+from .backends import (BackendError, image_inventory,
+                       parse_spirula_sfm_reprojection_summary, validate_colmap_directory)
 from .dataset_prep import effective_sfm_dataset
 from .state import utc_now
 
 GATE_PREFIX = "sfm-component-acceptance:"
+GEOMETRY_GATE_PREFIX = "sfm-component-geometry-proposal:"
 ACCEPT_DECISION = "ACCEPT_EXPERIMENTAL_TRAINING"
 TRAINING_PURPOSE = "EXPERIMENTAL_3DGS_TRAINING_ONLY"
+GEOMETRY_DECISION = "ACCEPT_GEOMETRY_PROPOSALS_ONLY"
+GEOMETRY_PURPOSE = "DIAGNOSTIC_REGISTRATION_AND_UNAPPROVED_NAVIGATION_PROPOSALS_ONLY"
+GEOMETRY_FORBIDDEN_PURPOSES = [TRAINING_PURPOSE, "NAVIGATION_APPROVAL", "PUBLICATION_APPROVAL",
+                               "FINAL_MODEL_QUALITY_APPROVAL", "ARCHIVE_PACKAGING_APPROVAL"]
 FORBIDDEN_PURPOSES = [
     "FINAL_MODEL_QUALITY_APPROVAL",
     "NAVIGATION_APPROVAL",
@@ -201,7 +207,10 @@ def build_sfm_snapshot(root: Path, config: dict, state) -> dict[str, Any]:
     inventory = image_inventory(image_dir)
     sfm_cfg = config.get("integrations", {}).get("sfm", {})
     component_root = _sfm_component_root(root, config, stage_details)
-    validation = validate_colmap_directory(component_root, inventory["images"], sfm_cfg.get("quality_gate", {}))
+    backend_summary = parse_spirula_sfm_reprojection_summary(stage_details.get("log_path"))
+    validation = validate_colmap_directory(
+        component_root, inventory["images"], sfm_cfg.get("quality_gate", {}),
+        backend_reprojection_summary=backend_summary)
     if validation.get("quality_gate") == "SFM_INVALID":
         raise BackendError("Structurally invalid COLMAP output cannot be accepted for training", failure_kind="SFM_INVALID",
                            details=validation)
@@ -257,6 +266,7 @@ def build_sfm_snapshot(root: Path, config: dict, state) -> dict[str, Any]:
             "sparse_point_count": row["sparse_point_count"],
             "mean_track_length": row.get("mean_track_length"),
             "mean_point_reprojection_error_px": row.get("mean_point_reprojection_error_px"),
+            "reprojection_metrics": row.get("reprojection_metrics"),
             "camera_quaternion_norm_warning_image_names": row.get("camera_quaternion_norm_warning_image_names", []),
             "track_reciprocal_reference_mismatches": row.get("track_reciprocal_reference_mismatches", 0),
         })
@@ -279,6 +289,10 @@ def build_sfm_snapshot(root: Path, config: dict, state) -> dict[str, Any]:
         "current_revalidation_quality_gate": validation["quality_gate"],
         "current_revalidation_warnings": list(validation["warnings"]),
         "current_revalidation_thresholds": validation["thresholds"],
+            "current_revalidation_metrics": [
+                {"component_id": row["component_id"], "reprojection_metrics": row.get("reprojection_metrics")}
+                for row in components],
+            "backend_observation_reprojection_summary": validation.get("backend_observation_reprojection_summary"),
     }
     return {**binding, "quality_gate": original_quality, "quality_warnings": original_warnings,
             "revalidation_quality_gate": validation["quality_gate"],
@@ -291,6 +305,10 @@ def build_sfm_snapshot(root: Path, config: dict, state) -> dict[str, Any]:
 
 def _gate_id(component_id: str) -> str:
     return GATE_PREFIX + quote(component_id, safe="")
+
+
+def _geometry_gate_id(component_id: str) -> str:
+    return GEOMETRY_GATE_PREFIX + quote(component_id, safe="")
 
 
 def _component(snapshot: dict, component_id: str) -> dict:
@@ -348,6 +366,8 @@ def review_sfm_component(root: Path, config: dict, state, *, component_id: str, 
         "current_revalidation_quality_gate": snapshot["current_revalidation_quality_gate"],
         "current_revalidation_warnings": snapshot["current_revalidation_warnings"],
         "current_revalidation_thresholds": snapshot["current_revalidation_thresholds"],
+        "current_revalidation_metrics": snapshot["current_revalidation_metrics"],
+        "backend_observation_reprojection_summary": snapshot["backend_observation_reprojection_summary"],
         "decision": decision_value,
         "reviewer": reviewer,
         "rationale": rationale,
@@ -365,6 +385,127 @@ def review_sfm_component(root: Path, config: dict, state, *, component_id: str, 
     return {"gate_id": gate_id, "status": gate_status, "decision": record,
             "binding_sha256": snapshot["binding_sha256"],
             "review_history_id": review_id}
+
+
+def review_sfm_geometry_component(root: Path, config: dict, state, *, component_id: str,
+                                  reviewer: str, rationale: str,
+                                  limitations: list[str] | None = None) -> dict[str, Any]:
+    """Authorize only diagnostic registration and unapproved navigation proposals."""
+    reviewer, rationale = reviewer.strip(), rationale.strip()
+    limitations = [str(item).strip() for item in (limitations or []) if str(item).strip()]
+    if not reviewer or not rationale:
+        raise ValueError("Reviewer and rationale must be non-empty")
+    if not limitations:
+        raise ValueError("Geometry proposal acceptance requires at least one explicit limitation")
+    snapshot = build_sfm_snapshot(root, config, state)
+    if snapshot["revalidation_quality_gate"] != "SFM_VALID":
+        raise BackendError("Geometry proposal review requires a current SFM_VALID revalidation; current status is "
+                           f"{snapshot['revalidation_quality_gate']}", failure_kind="QUALITY_GATE_BLOCKED",
+                           details=snapshot["validation"])
+    component = _component(snapshot, component_id)
+    record = {
+        "schema_version": "exhibition-archive.sfm-geometry-review.v1",
+        "project_id": config["project_id"], "workspace": str(Path(root).resolve()),
+        "sfm_execution_id": snapshot["sfm_execution"]["execution_id"],
+        "sfm_plan_identity": {
+            "execution_plan_id": snapshot["sfm_execution"]["execution_plan_id"],
+            "stage_input_fingerprint": snapshot["sfm_execution"]["stage_input_fingerprint"],
+            "stage_output_digest": snapshot["sfm_execution"]["stage_output_digest"],
+        },
+        "selected_component": component,
+        "reconstruction_binding_sha256": snapshot["binding_sha256"],
+        "reconstruction_artifact_digests": {item["component_id"]: item["artifact_tree_sha256"]
+                                             for item in snapshot["components"]},
+        "source_image_inventory_sha256": snapshot["source_image_inventory_sha256"],
+        "original_quality_gate": snapshot["original_quality_gate"],
+        "original_quality_warnings": snapshot["original_quality_warnings"],
+        "current_revalidation_quality_gate": snapshot["revalidation_quality_gate"],
+        "current_revalidation_warnings": snapshot["revalidation_warnings"],
+        "current_revalidation_metrics": snapshot["current_revalidation_metrics"],
+        "backend_observation_reprojection_summary": snapshot["backend_observation_reprojection_summary"],
+        "decision": GEOMETRY_DECISION, "reviewer": reviewer, "rationale": rationale,
+        "unresolved_limitations": limitations,
+        "permitted_downstream_purpose": GEOMETRY_PURPOSE,
+        "forbidden_purposes": GEOMETRY_FORBIDDEN_PURPOSES,
+        "navigation_approval_granted": False, "training_authorized": False,
+        "decision_timestamp_utc": utc_now(), "audit_identity": "sfmgeo_" + uuid.uuid4().hex,
+        "binding_sha256": snapshot["binding_sha256"],
+    }
+    gate_id = _geometry_gate_id(component_id)
+    review_id = state.record_review_decision(gate_id, "ACCEPTED_FOR_GEOMETRY_PROPOSALS", required=True,
+                                             reviewer=reviewer, decision=GEOMETRY_DECISION, payload=record)
+    return {"gate_id": gate_id, "status": "ACCEPTED_FOR_GEOMETRY_PROPOSALS", "decision": record,
+            "binding_sha256": snapshot["binding_sha256"], "review_history_id": review_id}
+
+
+def _current_geometry_review(state, snapshot: dict, component_id: str) -> tuple[str, dict | None]:
+    gate = state.db.execute("SELECT status,decision_json FROM review_gates WHERE gate_id=?",
+                            (_geometry_gate_id(component_id),)).fetchone()
+    if not gate:
+        return "NOT_REVIEWED", None
+    try:
+        decision = json.loads(gate["decision_json"] or "{}")
+    except (TypeError, ValueError):
+        return "INVALID_RECORD", None
+    if not isinstance(decision, dict):
+        return "INVALID_RECORD", None
+    if gate["status"] != "ACCEPTED_FOR_GEOMETRY_PROPOSALS" or decision.get("decision") != GEOMETRY_DECISION:
+        return "INVALID_RECORD", decision
+    component = _component(snapshot, component_id)
+    if (decision.get("schema_version") != "exhibition-archive.sfm-geometry-review.v1" or
+            decision.get("project_id") != snapshot["project_id"] or
+            decision.get("workspace") != snapshot["workspace"] or
+            decision.get("sfm_execution_id") != snapshot["sfm_execution"]["execution_id"] or
+            decision.get("binding_sha256") != snapshot["binding_sha256"] or
+            decision.get("selected_component") != component or
+            decision.get("permitted_downstream_purpose") != GEOMETRY_PURPOSE or
+            decision.get("forbidden_purposes") != GEOMETRY_FORBIDDEN_PURPOSES or
+            decision.get("current_revalidation_quality_gate") != "SFM_VALID" or
+            not isinstance(decision.get("unresolved_limitations"), list) or
+            not decision.get("unresolved_limitations") or
+            not isinstance(decision.get("reviewer"), str) or not decision["reviewer"].strip() or
+            not isinstance(decision.get("rationale"), str) or not decision["rationale"].strip() or
+            not str(decision.get("audit_identity", "")).startswith("sfmgeo_") or
+            decision.get("navigation_approval_granted") is not False or
+            decision.get("training_authorized") is not False or
+            snapshot["revalidation_quality_gate"] != "SFM_VALID"):
+        return "STALE", decision
+    return "ACCEPTED_FOR_GEOMETRY_PROPOSALS", decision
+
+
+def geometry_proposal_scope(root: Path, config: dict, state) -> dict[str, Any] | None:
+    """Return a single validated component allowed for geometry proposals only."""
+    stage = state.stage("sfm") or {}
+    if stage.get("status") not in {"NEEDS_REVIEW", "COMPLETED", "ADOPTED"}:
+        return None
+    snapshot = build_sfm_snapshot(root, config, state)
+    if snapshot["revalidation_quality_gate"] != "SFM_VALID":
+        return None
+    if stage.get("status") in {"COMPLETED", "ADOPTED"}:
+        if len(snapshot["components"]) != 1:
+            return None
+        component = snapshot["components"][0]
+        return {"component_id": component["component_id"],
+                "reconstruction_directory": component["directory"],
+                "registered_image_count": component["registered_image_count"],
+                "binding_sha256": snapshot["binding_sha256"],
+                "review_scope": "CURRENT_SFM_VALID_SINGLE_COMPONENT"}
+    accepted = []
+    for component in snapshot["components"]:
+        status, _record = _current_geometry_review(state, snapshot, component["component_id"])
+        if status == "ACCEPTED_FOR_GEOMETRY_PROPOSALS":
+            accepted.append(component)
+    selected_id = config.get("integrations", {}).get("sfm", {}).get("geometry_component_id")
+    if selected_id:
+        accepted = [row for row in accepted if row["component_id"] == str(selected_id)]
+    if len(accepted) != 1:
+        return None
+    component = accepted[0]
+    return {"component_id": component["component_id"],
+            "reconstruction_directory": component["directory"],
+            "registered_image_count": component["registered_image_count"],
+            "binding_sha256": snapshot["binding_sha256"],
+            "review_scope": "ACCEPTED_GEOMETRY_PROPOSALS_ONLY"}
 
 
 def _current_gate_decision(state, snapshot: dict, component_id: str) -> tuple[str, dict | None]:
@@ -434,14 +575,21 @@ def component_acceptance_status(root: Path, config: dict, state) -> dict[str, An
     rows = []
     for component in snapshot["components"]:
         status, decision = _current_gate_decision(state, snapshot, component["component_id"])
+        geometry_status, geometry_decision = _current_geometry_review(state, snapshot, component["component_id"])
         rows.append({"component_id": component["component_id"], "status": status,
                      "registered_image_count": component["registered_image_count"],
                      "registered_image_membership_sha256": component["registered_image_membership_sha256"],
-                     "decision": decision})
+                     "decision": decision,
+                     "geometry_proposal_status": geometry_status,
+                     "geometry_proposal_decision": geometry_decision,
+                     "current_reprojection_metrics": component.get("reprojection_metrics")})
     return {"binding_sha256": snapshot["binding_sha256"], "quality_gate": snapshot["quality_gate"],
             "quality_warnings": snapshot["quality_warnings"],
             "current_revalidation_quality_gate": snapshot["revalidation_quality_gate"],
-            "current_revalidation_warnings": snapshot["revalidation_warnings"], "components": rows}
+            "current_revalidation_warnings": snapshot["revalidation_warnings"],
+            "current_revalidation_metrics": snapshot["current_revalidation_metrics"],
+            "backend_observation_reprojection_summary": snapshot["backend_observation_reprojection_summary"],
+            "components": rows}
 
 
 def training_component_scope(root: Path, config: dict, state) -> dict[str, Any]:

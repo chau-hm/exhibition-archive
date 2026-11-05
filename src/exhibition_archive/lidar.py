@@ -25,7 +25,12 @@ ALIGNMENT_VALIDATION_POLICY = {
     "minimum_correspondences": 12,
     "minimum_bidirectional_overlap": 0.20,
     "maximum_normalized_p95_residual": 0.03,
-    "overlap_distance_basis": "3% of each source bounding-box diagonal after scale normalization; intended as a conservative geometric screen, not a survey tolerance.",
+    "overlap_distance_basis": "3% of each source bounding-box diagonal after independent normalization; a conservative screening tolerance, not a survey tolerance.",
+    "global_ransac_iterations": 200_000,
+    "global_random_seed": 2024,
+    "local_similarity_refinement_iterations": 12,
+    "local_refinement_trim_fraction": 0.80,
+    "maximum_refinement_correspondence_distance": 0.03,
 }
 
 
@@ -257,6 +262,136 @@ def inspect_optional_lidar(discovery: dict[str, Any], input_directory: str | Pat
     return {**result, "inspection_report_path": str(target.resolve())}
 
 
+def read_ply_xyz_sample(path: str | Path, maximum: int = 20_000) -> dict[str, Any]:
+    """Read a deterministic, bounded XYZ sample from a scalar-vertex PLY."""
+    file = Path(path).expanduser().resolve()
+    if maximum < 1:
+        raise ValueError("maximum must be positive")
+    header, error = _read_header(file)
+    if header is None:
+        raise PlyInspectionError(error or "Could not read PLY header")
+    fmt = _format_from_header(header)
+    if fmt not in {"ascii", "binary_little_endian", "binary_big_endian"}:
+        raise PlyInspectionError(f"Unsupported PLY format: {fmt}")
+    vertex = next((element for element in header["elements"] if element["name"] == "vertex"), None)
+    if not vertex or header["elements"].index(vertex) != 0 or any(row["list"] for row in vertex["properties"]):
+        raise PlyInspectionError("PLY must begin with a scalar-valued vertex element")
+    properties = vertex["properties"]
+    names = [row["name"] for row in properties]
+    if len(names) != len(set(names)) or not {"x", "y", "z"}.issubset(names) or any(row["type"] not in PLY_TYPES for row in properties):
+        raise PlyInspectionError("PLY vertex must provide scalar XYZ coordinates with supported types")
+    count = int(vertex["count"])
+    stride = max(1, math.ceil(count / maximum))
+    positions = [names.index(name) for name in ("x", "y", "z")]
+    endian = "<" if fmt == "binary_little_endian" else ">"
+    row_struct = struct.Struct(endian + "".join(PLY_TYPES[row["type"]][0] for row in properties))
+    points, invalid_count = [], 0
+    minima, maxima = [math.inf] * 3, [-math.inf] * 3
+    with file.open("rb") as stream:
+        stream.seek(header["body_offset"])
+        for index in range(count):
+            if fmt == "ascii":
+                raw = stream.readline()
+                if not raw:
+                    raise PlyInspectionError(f"PLY vertex data is truncated at row {index}")
+                try:
+                    values = [float(value) for value in raw.split()]
+                except ValueError as exc:
+                    raise PlyInspectionError(f"Invalid numeric PLY vertex at row {index}") from exc
+                if len(values) != len(properties):
+                    raise PlyInspectionError(f"Malformed PLY vertex row {index}")
+            else:
+                raw = stream.read(row_struct.size)
+                if len(raw) != row_struct.size:
+                    raise PlyInspectionError(f"PLY vertex data is truncated at row {index}")
+                values = [float(value) for value in row_struct.unpack(raw)]
+            xyz = [values[position] for position in positions]
+            if not all(math.isfinite(value) for value in xyz):
+                invalid_count += 1
+                continue
+            for axis, value in enumerate(xyz):
+                minima[axis] = min(minima[axis], value)
+                maxima[axis] = max(maxima[axis], value)
+            if index % stride == 0 or index == count - 1:
+                points.append(xyz)
+    return {"path": str(file), "point_count": count, "sampled_point_count": len(points),
+            "sample_stride": stride, "invalid_sampled_point_count": invalid_count,
+            "points": points, "bounding_box": {axis: [minima[i], maxima[i]]
+                                                  for i, axis in enumerate(("x", "y", "z"))}}
+
+
+def propose_lidar_ground_plane(points: list[list[float]], camera_centers: list[list[float]], *,
+                               seed: int = 2024) -> dict[str, Any]:
+    """Propose a dominant camera-aligned plane; never treat it as approved ground."""
+    try:
+        import numpy as np
+    except ImportError:
+        return {"status": "UNAVAILABLE", "reason": "NumPy is unavailable for bounded plane diagnostics."}
+    cloud = np.asarray(points, dtype=float)
+    cameras = np.asarray(camera_centers, dtype=float)
+    cloud = cloud[np.isfinite(cloud).all(axis=1)] if cloud.ndim == 2 and cloud.shape[1:] == (3,) else np.empty((0, 3))
+    cameras = cameras[np.isfinite(cameras).all(axis=1)] if cameras.ndim == 2 and cameras.shape[1:] == (3,) else np.empty((0, 3))
+    if len(cloud) < 100 or len(cameras) < 6:
+        return {"status": "UNVERIFIED", "reason": "At least 100 aligned LiDAR sample points and 6 camera centers are required for a stable plane proposal.",
+                "point_count": int(len(cloud)), "camera_count": int(len(cameras))}
+    centered_cameras = cameras - cameras.mean(axis=0)
+    eigenvalues, eigenvectors = np.linalg.eigh(np.cov(centered_cameras.T))
+    if (eigenvalues[1] <= 1e-12 or eigenvalues[2] <= 1e-12 or
+            eigenvalues[0] / eigenvalues[1] > 0.15 or eigenvalues[1] / eigenvalues[2] < 0.05):
+        return {"status": "UNVERIFIED", "reason": "Camera centers do not support a stable, approximately planar trajectory reference.",
+                "camera_trajectory_covariance_eigenvalues": eigenvalues.tolist()}
+    trajectory_normal = eigenvectors[:, 0]
+    diagonal = float(np.linalg.norm(cloud.max(axis=0) - cloud.min(axis=0)))
+    if not math.isfinite(diagonal) or diagonal <= 1e-9:
+        return {"status": "UNVERIFIED", "reason": "Aligned LiDAR sample has degenerate spatial extent."}
+    # The 0.3%-of-diagonal band screens points for a planar candidate while
+    # scaling with arbitrary SfM units; it is not a survey accuracy claim.
+    distance_tolerance = diagonal * 0.003
+    cosine_tolerance = math.cos(math.radians(15.0))
+    rng = np.random.default_rng(seed)
+    best_indices = None
+    best_normal = None
+    best_offset = None
+    for _ in range(400):
+        selected = rng.choice(len(cloud), size=3, replace=False)
+        first, second, third = cloud[selected]
+        normal = np.cross(second - first, third - first)
+        norm = float(np.linalg.norm(normal))
+        if norm <= 1e-10:
+            continue
+        normal /= norm
+        if abs(float(np.dot(normal, trajectory_normal))) < cosine_tolerance:
+            continue
+        offset = -float(np.dot(normal, first))
+        inliers = np.flatnonzero(np.abs(cloud @ normal + offset) <= distance_tolerance)
+        if best_indices is None or len(inliers) > len(best_indices):
+            best_indices, best_normal, best_offset = inliers, normal, offset
+    minimum_inliers = max(100, math.ceil(len(cloud) * 0.05))
+    if best_indices is None or len(best_indices) < minimum_inliers:
+        return {"status": "UNVERIFIED", "reason": "No camera-trajectory-aligned plane has sufficient sampled support.",
+                "point_count": int(len(cloud)), "camera_count": int(len(cameras)),
+                "minimum_inliers": minimum_inliers, "distance_tolerance_sfm_units": distance_tolerance}
+    camera_sides = cameras @ best_normal + best_offset
+    if float(np.median(camera_sides)) < 0:
+        best_normal, best_offset, camera_sides = -best_normal, -best_offset, -camera_sides
+    above_fraction = float(np.mean(camera_sides >= -distance_tolerance))
+    if above_fraction < 0.9:
+        return {"status": "UNVERIFIED", "reason": "Camera centers do not lie consistently on one side of the candidate plane.",
+                "camera_side_fraction": above_fraction, "plane_inlier_count": int(len(best_indices))}
+    return {"status": "PROPOSED", "classification": "PROPOSED_REQUIRES_HUMAN_GROUND_IDENTIFICATION",
+            "normal": best_normal.tolist(), "offset": float(best_offset),
+            "coordinate_frame": "source", "source": "accepted aligned DepthEye sample plus registered camera trajectory",
+            "evidence": {"point_count": int(len(cloud)), "camera_count": int(len(cameras)),
+                         "plane_inlier_count": int(len(best_indices)),
+                         "plane_inlier_fraction": float(len(best_indices) / len(cloud)),
+                         "camera_side_fraction": above_fraction,
+                         "camera_trajectory_covariance_eigenvalues": eigenvalues.tolist(),
+                         "distance_tolerance_sfm_units": distance_tolerance,
+                         "normal_to_camera_trajectory_plane_degrees": math.degrees(math.acos(min(1.0, abs(float(np.dot(best_normal, trajectory_normal))))))},
+            "limitations": ["A dominant plane may be a platform, canopy, equipment surface, or ground; this is not semantic or safety validation.",
+                            "Plane thresholds use arbitrary SfM units and require human inspection before navigation approval."]}
+
+
 def attempt_similarity_alignment(lidar_inspection: dict[str, Any], sfm_points: list[list[float]],
                                  output_directory: str | Path) -> dict[str, Any]:
     """Try feature-based, scale-aware global registration; reject weak evidence without failing SfM."""
@@ -283,16 +418,22 @@ def attempt_similarity_alignment(lidar_inspection: dict[str, Any], sfm_points: l
         write_json(output / "alignment-report.json", report)
         return report
     lidar_source_path = Path(lidar_inspection.get("selected", {}).get("path", ""))
-    lidar_path = Path(lidar_inspection.get("preview_path", ""))
-    if not lidar_source_path.is_file() or not lidar_path.is_file():
+    lidar_preview_path = Path(lidar_inspection.get("preview_path", ""))
+    if not lidar_source_path.is_file() or not lidar_preview_path.is_file():
         report["reason"] = "The selected LiDAR file is no longer present at its inspected path."
         write_json(output / "alignment-report.json", report)
         return report
     try:
         import numpy as np
-        import open3d as o3d
     except ImportError as exc:
-        report["reason"] = "Optional Open3D registration support is not installed; photo-only reconstruction remains available."
+        report["reason"] = "Optional NumPy geometry support is not installed; photo-only reconstruction remains available."
+        report["registration_dependency"] = {"name": "numpy", "status": "UNAVAILABLE", "error": str(exc)}
+        write_json(output / "alignment-report.json", report)
+        return report
+    try:
+        import open3d as o3d
+    except (ImportError, OSError) as exc:
+        report["reason"] = "Optional Open3D registration support is unavailable; photo-only reconstruction remains available. Install the project extra `.[lidar-registration]` to enable it."
         report["registration_dependency"] = {"name": "open3d", "status": "UNAVAILABLE", "error": str(exc)}
         write_json(output / "alignment-report.json", report)
         return report
@@ -300,7 +441,7 @@ def attempt_similarity_alignment(lidar_inspection: dict[str, Any], sfm_points: l
     report["registration_dependency"] = {"name": "open3d", "version": getattr(o3d, "__version__", "unknown"),
                                          "status": "AVAILABLE"}
     try:
-        lidar_cloud = o3d.io.read_point_cloud(str(lidar_path), remove_nan_points=False, remove_infinite_points=False)
+        lidar_cloud = o3d.io.read_point_cloud(str(lidar_source_path), remove_nan_points=False, remove_infinite_points=False)
         lidar_array = np.asarray(lidar_cloud.points, dtype=float)
         sfm_array = np.asarray(sfm_points, dtype=float)
         lidar_array = lidar_array[np.isfinite(lidar_array).all(axis=1)]
@@ -311,6 +452,8 @@ def attempt_similarity_alignment(lidar_inspection: dict[str, Any], sfm_points: l
             lidar_array = lidar_array[::math.ceil(len(lidar_array) / 500_000)]
         if len(sfm_array) > 500_000:
             sfm_array = sfm_array[::math.ceil(len(sfm_array) / 500_000)]
+        lidar_bounds = {"minimum": lidar_array.min(axis=0).tolist(), "maximum": lidar_array.max(axis=0).tolist()}
+        sfm_bounds = {"minimum": sfm_array.min(axis=0).tolist(), "maximum": sfm_array.max(axis=0).tolist()}
         lidar_center, sfm_center = lidar_array.mean(axis=0), sfm_array.mean(axis=0)
         lidar_scale = float(np.linalg.norm(lidar_array.max(axis=0) - lidar_array.min(axis=0)))
         sfm_scale = float(np.linalg.norm(sfm_array.max(axis=0) - sfm_array.min(axis=0)))
@@ -337,19 +480,31 @@ def attempt_similarity_alignment(lidar_inspection: dict[str, Any], sfm_points: l
         target_features = o3d.pipelines.registration.compute_fpfh_feature(
             target_down, o3d.geometry.KDTreeSearchParamHybrid(radius=feature_radius, max_nn=100))
         registration = o3d.pipelines.registration
+        if hasattr(o3d.utility, "random") and hasattr(o3d.utility.random, "seed"):
+            o3d.utility.random.seed(ALIGNMENT_VALIDATION_POLICY["global_random_seed"])
         result = registration.registration_ransac_based_on_feature_matching(
             source_down, target_down, source_features, target_features, True,
             0.03,
             registration.TransformationEstimationPointToPoint(False), 4,
             [registration.CorrespondenceCheckerBasedOnEdgeLength(0.9),
              registration.CorrespondenceCheckerBasedOnDistance(0.03)],
-            registration.RANSACConvergenceCriteria(200_000, 0.999))
+            registration.RANSACConvergenceCriteria(ALIGNMENT_VALIDATION_POLICY["global_ransac_iterations"], 0.999))
         correspondences = np.asarray(result.correspondence_set, dtype=int)
+        report["input_point_counts"] = {
+            "sfm_sample_used": len(sfm_array),
+            "lidar_source_total_reported": lidar_inspection.get("selected", {}).get("point_count"),
+            "lidar_finite_points_loaded": len(lidar_array),
+            "lidar_inspection_preview_points": lidar_inspection.get("selected", {}).get("preview", {}).get("point_count"),
+        }
+        report["input_bounds"] = {"sfm": sfm_bounds, "lidar": lidar_bounds}
         report["global_registration"] = {"source_downsampled_count": len(source_down.points),
                                          "target_downsampled_count": len(target_down.points),
                                          "feature_correspondence_count": len(correspondences),
                                          "voxel_size_normalized": voxel,
-                                         "global_method": "FPFH + RANSAC with edge-length and distance checkers"}
+                                         "global_method": "FPFH + RANSAC with edge-length and distance checkers",
+                                         "ransac_iterations": ALIGNMENT_VALIDATION_POLICY["global_ransac_iterations"],
+                                         "random_seed": ALIGNMENT_VALIDATION_POLICY["global_random_seed"],
+                                         "normal_radius_voxels": 2.5, "feature_radius_voxels": 5.0}
         minimum_correspondences = ALIGNMENT_VALIDATION_POLICY["minimum_correspondences"]
         if len(correspondences) < minimum_correspondences:
             raise ValueError(f"Global feature registration found only {len(correspondences)} correspondences; at least {minimum_correspondences} are required.")
@@ -357,7 +512,10 @@ def attempt_similarity_alignment(lidar_inspection: dict[str, Any], sfm_points: l
         target_down_array = np.asarray(target_down.points)
         source_match = source_down_array[correspondences[:, 0]]
         target_match = target_down_array[correspondences[:, 1]]
-        transform_normalized, fit_residuals = _similarity_fit_numpy(source_match, target_match, np)
+        initial_transform_normalized, initial_fit_residuals = _similarity_fit_numpy(source_match, target_match, np)
+        transform_normalized, fit_residuals, refinement = _refine_similarity_open3d(
+            source_down_array, target_down_array, initial_transform_normalized,
+            ALIGNMENT_VALIDATION_POLICY["maximum_refinement_correspondence_distance"], np, o3d)
         rotation = transform_normalized[:3, :3]
         normalized_scale = float(np.cbrt(np.linalg.det(rotation)))
         if not math.isfinite(normalized_scale) or normalized_scale <= 0:
@@ -376,37 +534,106 @@ def attempt_similarity_alignment(lidar_inspection: dict[str, Any], sfm_points: l
         reverse_overlap, reverse_p95 = _nearest_overlap(transformed_lidar_normalized, source, overlap_distance, np, o3d)
         p95 = max(forward_p95, reverse_p95)
         validation = _alignment_validation_evidence(
-            len(correspondences), forward_overlap, reverse_overlap, p95, fit_residuals["p95"])
+            refinement["final_correspondence_count"], forward_overlap, reverse_overlap,
+            p95, fit_residuals["p95"])
         accepted = validation["accepted"]
+        rotation_only = rotation / normalized_scale
         report.update({"accepted": accepted, "status": "ACCEPTED" if accepted else "REJECTED",
                        "reason": None if accepted else "Global alignment did not satisfy the configured overlap and residual evidence checks.",
+                       "initial_normalized_similarity_transform_sfm_to_lidar_row_major": initial_transform_normalized.tolist(),
                        "similarity_transform_sfm_to_lidar_row_major": transform.tolist(),
                        "similarity_transform_lidar_to_sfm_row_major": _inverse_similarity_transform(transform.tolist()),
                        "scale_lidar_units_per_sfm_unit": scale,
+                       "rotation_sfm_to_lidar_row_major": rotation_only.tolist(),
+                       "translation_lidar_units": translation.tolist(),
                        "registration_evidence": {"forward_overlap_fraction": forward_overlap,
                                                  "reverse_overlap_fraction": reverse_overlap,
                                                  "bidirectional_p95_normalized_residual": p95,
                                                  "feature_fit_residuals": fit_residuals,
+                                                 "initial_feature_fit_residuals": initial_fit_residuals,
+                                                 "local_similarity_refinement": refinement,
+                                                 "global_ransac_correspondence_count": len(correspondences),
                                                  "sfm_point_count_used": len(sfm_array),
                                                  "lidar_point_count_used": len(lidar_array),
                                                  "validation_checks": validation["checks"]},
-                       "evidence": ["Scale ambiguity was handled by fitting a 7-DoF similarity transform to global FPFH/RANSAC correspondences.",
-                                    "Registration was screened in both directions for overlap and normalized p95 residual.",
+                       "evidence": ["Unknown scale was handled with independent bounding-box normalization and a positive 7-DoF similarity fit.",
+                                    "FPFH/RANSAC provided global initialization, followed by trimmed mutual-nearest-neighbor similarity refinement.",
+                                    "Acceptance checks include correspondence support, bidirectional overlap, and normalized residuals; these are a geometry screen, not proof against every symmetric-scene ambiguity.",
                                     "No point was removed from either source; the source LiDAR file was not modified."],
                        "warnings": [] if accepted else ["The transform was not accepted for downstream use."]})
         if accepted:
             report["aligned_preview_path"] = str((output / "aligned-cloud-preview.ply").resolve())
-            report["aligned_preview_status"] = _transform_preview(lidar_path,
+            report["aligned_preview_status"] = _transform_preview(lidar_preview_path,
                                                                     Path(report["aligned_preview_path"]),
                                                                     np.asarray(report["similarity_transform_lidar_to_sfm_row_major"], dtype=float))
             report["aligned_preview_coordinate_system"] = "COLMAP arbitrary non-metric reconstruction coordinates"
-        report["downstream_consumption"] = {"training": False, "navigation": False,
-                                             "reason": "The current Engine has no validated LiDAR consumer; accepted alignment is diagnostic evidence only."}
+        report["downstream_consumption"] = {
+            "training": False,
+            "navigation": False,
+            "reason": ("Training initialization from raw LiDAR is not enabled. An accepted aligned preview is eligible for navigation geometry proposals only after a separate component-scoped geometry review."
+                       if accepted else "No downstream LiDAR use is permitted because alignment was rejected."),
+        }
     except Exception as exc:
         report.update({"accepted": False, "status": "REJECTED", "reason": str(exc),
                        "warnings": ["LiDAR alignment was rejected; the photo-based reconstruction remains authoritative."]})
     write_json(output / "alignment-report.json", report)
     return report
+
+
+def _refine_similarity_open3d(source, target, initial_transform, max_distance: float, np, o3d):
+    """Refine a global initializer with trimmed mutual-nearest-neighbor 7-DoF fits."""
+    transform = np.asarray(initial_transform, dtype=float).copy()
+    source_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(source))
+    target_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(target))
+    target_tree = o3d.geometry.KDTreeFlann(target_cloud)
+    iterations = int(ALIGNMENT_VALIDATION_POLICY["local_similarity_refinement_iterations"])
+    trim_fraction = float(ALIGNMENT_VALIDATION_POLICY["local_refinement_trim_fraction"])
+    sample_stride = max(1, math.ceil(len(source) / 30_000))
+    final_count, final_residual = 0, math.inf
+    completed_iterations = 0
+    converged = False
+    for iteration in range(iterations):
+        transformed = source @ transform[:3, :3].T + transform[:3, 3]
+        transformed_cloud = o3d.geometry.PointCloud(o3d.utility.Vector3dVector(transformed))
+        transformed_tree = o3d.geometry.KDTreeFlann(transformed_cloud)
+        source_indices, target_indices, distances = [], [], []
+        for source_index in range(0, len(source), sample_stride):
+            count, nearest_target, squared = target_tree.search_knn_vector_3d(transformed[source_index].tolist(), 1)
+            if count != 1 or not squared or squared[0] > max_distance * max_distance:
+                continue
+            target_index = int(nearest_target[0])
+            reverse_count, nearest_source, _reverse_squared = transformed_tree.search_knn_vector_3d(
+                target[target_index].tolist(), 1)
+            if reverse_count != 1 or int(nearest_source[0]) != source_index:
+                continue
+            source_indices.append(source_index)
+            target_indices.append(target_index)
+            distances.append(math.sqrt(float(squared[0])))
+        if len(source_indices) < ALIGNMENT_VALIDATION_POLICY["minimum_correspondences"]:
+            raise ValueError(f"Mutual-neighbor refinement retained only {len(source_indices)} correspondences.")
+        cutoff = float(np.percentile(np.asarray(distances), trim_fraction * 100.0))
+        keep = [index for index, distance in enumerate(distances) if distance <= min(max_distance, cutoff)]
+        if len(keep) < ALIGNMENT_VALIDATION_POLICY["minimum_correspondences"]:
+            raise ValueError("Trimmed mutual-neighbor refinement retained too few correspondences.")
+        source_match = source[np.asarray([source_indices[index] for index in keep], dtype=int)]
+        target_match = target[np.asarray([target_indices[index] for index in keep], dtype=int)]
+        refined, fit = _similarity_fit_numpy(source_match, target_match, np)
+        delta = float(np.max(np.abs(refined - transform)))
+        transform = refined
+        final_count, final_residual = len(keep), fit["p95"]
+        completed_iterations = iteration + 1
+        if delta <= 1e-8:
+            converged = True
+            break
+    fit = {**fit, "p95": final_residual}
+    return transform, fit, {
+                "method": "trimmed mutual-nearest-neighbor positive 7-DoF similarity fit",
+                "iterations": completed_iterations, "maximum_iterations": iterations,
+                "trim_fraction": trim_fraction, "maximum_correspondence_distance_normalized": max_distance,
+                "final_correspondence_count": final_count,
+                "sample_stride": sample_stride,
+                "converged_by_parameter_delta": converged,
+            }
 
 
 def _alignment_validation_evidence(correspondence_count: int, forward_overlap: float,

@@ -898,6 +898,9 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     if plane:
         plane_viewer = _plane_in_viewer(plane, frame, scale, rotation, translation)
         basis = _plane_basis(plane_viewer, frame)
+        if str(plane_viewer.get("classification", "")).startswith("PROPOSED_"):
+            warnings.append({"code": "GROUND_PLANE_PROPOSAL_REQUIRES_HUMAN_IDENTIFICATION", "severity": "REVIEW",
+                             "message": "A dominant aligned LiDAR plane is only a geometric candidate; a reviewer must confirm it is ground before approving navigation."})
     else:
         plane_viewer = None
         basis = None
@@ -1189,9 +1192,12 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                 "coverage_assumptions": {"scene_type": scene_type,
                                          "boundary": "CAMERA_TRAJECTORY_ALPHA_SHAPE_PROPOSAL",
                                          "coordinate_up_axis": frame.get("up_axis", "UNSPECIFIED"),
-                                         "ground_plane": "GEOMETRY_INPUT_REQUIRED" if not plane_viewer else "GEOMETRY_SUPPORTED_OR_REVIEWED",
+                                         "ground_plane": ("GEOMETRY_INPUT_REQUIRED" if not plane_viewer else
+                                                          "PROPOSED_REQUIRES_HUMAN_IDENTIFICATION" if str(plane_viewer.get("classification", "")).startswith("PROPOSED_") else
+                                                          "GEOMETRY_SUPPORTED_OR_REVIEWED"),
                                          "physical_walls_or_ceiling_inferred": False,
                                          "aligned_lidar_used": bool(source.get("aligned_lidar_geometry_used", False)),
+                                         "aligned_lidar_diagnostics": source.get("aligned_lidar_diagnostics", {"status": "NOT_AVAILABLE"}),
                                          "visitor_boundary_verified": False},
                 "camera_clearance": {"horizontal_units": float(config.get("camera_clearance_units", 0.0)), "distance_unit": "reconstruction/viewer scene units; metric scale is not assumed", "interior_object_collision": False},
                 "guided_paths": source.get("guided_paths", config.get("guided_paths", [])), "viewpoints": source.get("viewpoints", config.get("viewpoints", [])),
@@ -1200,7 +1206,9 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                 "validation": {}, "provenance": {"generator": "exhibition_archive.navigation", "generator_version": "0.1.0",
                                                   "algorithm": "camera-neighbor components + 2D alpha shape with convex review fallback", "configuration": config,
                                                   "input_station_ids": [row["station_id"] for row in projected],
-                                                  "source_files": source.get("source_files", []), "derived_without_external_services": True}}
+                                                  "source_files": source.get("source_files", []),
+                                                  "aligned_lidar_diagnostics": source.get("aligned_lidar_diagnostics", {"status": "NOT_AVAILABLE"}),
+                                                  "derived_without_external_services": True}}
     result = validate_navigation_artifact(artifact)
     containment = []
     for region in regions:
@@ -1214,7 +1222,9 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                             "all_stations_inside_or_on": not outside})
     result["station_containment"] = containment
     result["warnings"] = warnings
-    result["evidence_assessment"] = {"floor": "SUPPORTED" if plane_viewer else "MISSING", "ceiling": "SUPPORTED_OR_REVIEW_CANDIDATE" if ceiling_cfg else "MISSING",
+    result["evidence_assessment"] = {"floor": ("MISSING" if not plane_viewer else
+                                                   "PROPOSED_REQUIRES_HUMAN_IDENTIFICATION" if str(plane_viewer.get("classification", "")).startswith("PROPOSED_") else
+                                                   "SUPPORTED"), "ceiling": "SUPPORTED_OR_REVIEW_CANDIDATE" if ceiling_cfg else "MISSING",
                                      "architectural_walls": "UNCONFIRMED unless evidence/review is attached", "scale": frame_doc["scale_status"],
                                      "region_connectivity": "EXPLICIT_TRANSITIONS_ONLY"}
     if any(item["outside_trusted_station_ids"] for item in containment):

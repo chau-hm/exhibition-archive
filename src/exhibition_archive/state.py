@@ -15,15 +15,32 @@ def utc_now() -> str:
 class ProjectState:
     """SQLite state with process-level exclusion for mutations to one project."""
 
-    def __init__(self, root: Path):
+    def __init__(self, root: Path, *, read_only: bool = False):
         self.root = root.resolve()
         self.path = self.root / "workflow.sqlite3"
-        self.root.mkdir(parents=True, exist_ok=True)
-        self.db = sqlite3.connect(self.path, timeout=30)
+        self.read_only = read_only
+        if read_only:
+            if not self.path.is_file():
+                raise FileNotFoundError(f"Read-only workflow database does not exist: {self.path}")
+            wal_path = Path(str(self.path) + "-wal")
+            shm_path = Path(str(self.path) + "-shm")
+            if wal_path.exists() != shm_path.exists():
+                raise RuntimeError("Read-only workflow database has an incomplete WAL sidecar pair; stop the Engine and retry after SQLite closes the workspace cleanly.")
+            # An idle WAL database has all committed rows checkpointed in the
+            # main file. immutable=1 lets revalidation read it without trying
+            # to create -shm beside a workspace the operator has made read-only.
+            immutable = "&immutable=1" if not wal_path.exists() else ""
+            self.db = sqlite3.connect(self.path.as_uri() + f"?mode=ro{immutable}", uri=True, timeout=30)
+        else:
+            self.root.mkdir(parents=True, exist_ok=True)
+            self.db = sqlite3.connect(self.path, timeout=30)
         self.db.row_factory = sqlite3.Row
-        self.db.execute("PRAGMA journal_mode=WAL")
         self.db.execute("PRAGMA foreign_keys=ON")
-        self.db.executescript("""
+        if read_only:
+            self.db.execute("PRAGMA query_only=ON")
+        else:
+            self.db.execute("PRAGMA journal_mode=WAL")
+            self.db.executescript("""
         CREATE TABLE IF NOT EXISTS workflow_runs(
           run_id INTEGER PRIMARY KEY, started_at TEXT NOT NULL, ended_at TEXT,
           mode TEXT NOT NULL, status TEXT NOT NULL, summary_json TEXT NOT NULL DEFAULT '{}');
@@ -57,7 +74,7 @@ class ProjectState:
           expires_at TEXT NOT NULL, consumed_at TEXT, execution_id INTEGER,
           stale_reason TEXT);
         """)
-        self.db.commit()
+            self.db.commit()
 
     @contextlib.contextmanager
     def lock(self):
@@ -187,8 +204,9 @@ class ProjectState:
             for block in iter(lambda: stream.read(4 * 1024 * 1024), b""):
                 digest.update(block)
         value = digest.hexdigest()
-        self.db.execute("INSERT INTO fingerprint_cache(path,size_bytes,mtime_ns,sha256,verified_at) VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,sha256=excluded.sha256,verified_at=excluded.verified_at", (str(path), stat.st_size, stat.st_mtime_ns, value, utc_now()))
-        self.db.commit()
+        if not self.read_only:
+            self.db.execute("INSERT INTO fingerprint_cache(path,size_bytes,mtime_ns,sha256,verified_at) VALUES(?,?,?,?,?) ON CONFLICT(path) DO UPDATE SET size_bytes=excluded.size_bytes,mtime_ns=excluded.mtime_ns,sha256=excluded.sha256,verified_at=excluded.verified_at", (str(path), stat.st_size, stat.st_mtime_ns, value, utc_now()))
+            self.db.commit()
         return value
 
     def close(self):

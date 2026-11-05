@@ -34,6 +34,17 @@ class CliSmokeTests(unittest.TestCase):
         self.assertIn("--component", result.stdout)
         self.assertIn("--limitation", result.stdout)
 
+    def test_sfm_revalidation_and_geometry_proposal_review_commands_are_available(self):
+        revalidate = subprocess.run(
+            [str(LAUNCHER), "sfm-revalidate", "--help"], cwd="/private/tmp",
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
+        geometry = subprocess.run(
+            [str(LAUNCHER), "sfm-geometry-review", "--help"], cwd="/private/tmp",
+            text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
+        self.assertIn("Read-only revalidation", revalidate.stdout)
+        self.assertIn("an unapproved navigation proposal", geometry.stdout)
+        self.assertIn("--limitation", geometry.stdout)
+
     def test_storage_report_cli_is_available(self):
         result = subprocess.run(
             [str(LAUNCHER), "storage-report", "--help"],

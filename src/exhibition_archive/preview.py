@@ -108,11 +108,26 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
             selected["source_path"] = Path(selected.pop("path")).name
         selected.pop("inspection_error", None)
         write_json(diagnostics / "lidar-inspection.json", lidar_report)
-    for source, name in ((lidar_input / "lidar-preview.ply", "raw-lidar-preview.ply"),
-                         (lidar_input / "aligned-cloud-preview.ply", "aligned-lidar-preview.ply"),
-                         (lidar_input / "alignment-report.json", "lidar-alignment-report.json")):
-        if source.is_file():
-            shutil.copy2(source, diagnostics / name)
+    lidar_stage_details = _details(state.stage("lidar_registration") or {})
+    alignment_source = _optional_path(lidar_stage_details.get("alignment_report_path")) or (lidar_input / "alignment-report.json")
+    aligned_source = _optional_path(lidar_stage_details.get("aligned_preview_path"))
+    if aligned_source is None and alignment_source.is_file():
+        try:
+            aligned_source = _optional_path(read_json(alignment_source).get("aligned_preview_path"))
+        except (OSError, ValueError, TypeError):
+            aligned_source = None
+    diagnostic_sources = [(lidar_input / "lidar-preview.ply", "raw-lidar-preview.ply"),
+                          (alignment_source, "lidar-alignment-report.json")]
+    if aligned_source is not None:
+        diagnostic_sources.append((aligned_source, "aligned-lidar-preview.ply"))
+    for source, name in diagnostic_sources:
+        if source.is_symlink() or not source.is_file():
+            continue
+        try:
+            source.resolve().relative_to(lidar_input.resolve())
+        except ValueError:
+            continue
+        shutil.copy2(source, diagnostics / name)
 
     discovery_path = output_path(root, config) / "inputs" / "discovery.json"
     input_discovery: dict[str, Any] = {}
@@ -148,7 +163,7 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
         "engine_git_commit": _git_commit(Path(__file__).resolve().parents[2]),
         "source_images": _source_image_stats(root, config),
         "sfm": _public_sfm_summary(sfm_details, camera_rows, sparse_count),
-        "lidar": _public_lidar_summary(lidar_report, lidar_input / "alignment-report.json"),
+        "lidar": _public_lidar_summary(lidar_report, lidar_input / "alignment-report.json", navigation_details),
         "training": {"status": training_details.get("model_status", "UNREVIEWED_CANDIDATE"),
                      "backend_version": training_details.get("backend_version"),
                      "iterations": training_details.get("training_iterations_requested"),
@@ -399,11 +414,15 @@ def _public_sfm_summary(details: dict, cameras: list[dict], sparse_count: int) -
             "registered_image_ratio": details.get("registered_image_ratio"),
             "camera_pose_count": len(cameras), "sparse_point_count": sparse_count,
             "mean_point_reprojection_error_px": details.get("mean_point_reprojection_error_px"),
+            "reprojection_metrics": details.get("reprojection_metrics"),
+            "backend_observation_reprojection_summary": details.get("backend_observation_reprojection_summary"),
             "warnings": details.get("warnings", [])}
 
 
-def _public_lidar_summary(report: dict, alignment_path: Path) -> dict[str, Any]:
+def _public_lidar_summary(report: dict, alignment_path: Path,
+                          navigation_details: dict | None = None) -> dict[str, Any]:
     alignment = read_json(alignment_path) if alignment_path.is_file() else {}
+    navigation_details = navigation_details or {}
     selected = report.get("selected", {})
     return {"detected": report.get("detected", False),
             "inspection_status": report.get("inspection_status", "NOT_DETECTED"),
@@ -413,7 +432,9 @@ def _public_lidar_summary(report: dict, alignment_path: Path) -> dict[str, Any]:
             "alignment_status": alignment.get("status", report.get("alignment_status", "NOT_ATTEMPTED")),
             "alignment_accepted": alignment.get("accepted", False),
             "training_consumed": alignment.get("training_consumed", False),
-            "navigation_consumed": alignment.get("navigation_consumed", False),
+            "navigation_consumed": navigation_details.get(
+                "aligned_lidar_navigation_consumed", alignment.get("navigation_consumed", False)),
+            "navigation_use_status": navigation_details.get("ground_plane_candidate_status", "NOT_USED"),
             "warnings": report.get("warnings", []) + alignment.get("warnings", [])}
 
 
