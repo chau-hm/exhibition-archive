@@ -57,7 +57,11 @@ class AuthorizationTests(unittest.TestCase):
         self.tmp.cleanup()
 
     def plan(self, stage="sfm"):
-        return expensive_execution_plan(self.root, self.config, self.state, stage, backend_info=BACKEND)
+        effective_configuration = {"status": "CAPTURED", "quality": "BACKEND_DEFAULT",
+                                   "effective_parameters": {"--num-iterations": "100"}}
+        with patch("exhibition_archive.workflow.training_preset_configuration",
+                   return_value=effective_configuration):
+            return expensive_execution_plan(self.root, self.config, self.state, stage, backend_info=BACKEND)
 
     def test_plan_binds_inputs_resources_command_and_training_cap(self):
         first = self.plan("sfm")

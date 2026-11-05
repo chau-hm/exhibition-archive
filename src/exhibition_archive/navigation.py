@@ -75,6 +75,61 @@ def _read_c_string(stream) -> str:
         value.extend(char)
 
 
+def read_colmap_camera_poses(directory: str | Path) -> list[dict[str, Any]]:
+    """Read registered camera poses without loading sparse 3D points into memory."""
+    root = Path(directory)
+    cameras_path, images_path = root / "cameras.bin", root / "images.bin"
+    missing = [str(path) for path in (cameras_path, images_path) if not path.is_file()]
+    if missing:
+        raise ValueError(f"COLMAP camera reconstruction is incomplete: {missing}")
+    model_params = {0: 3, 1: 4, 2: 4, 3: 5, 4: 8, 5: 8, 6: 12, 7: 5, 8: 4, 9: 5, 10: 12, 11: 16}
+    camera_ids: set[int] = set()
+    with cameras_path.open("rb") as stream:
+        raw_count = stream.read(8)
+        if len(raw_count) != 8:
+            raise ValueError("COLMAP cameras.bin is truncated before its count")
+        count = struct.unpack("<Q", raw_count)[0]
+        for _ in range(count):
+            header = stream.read(24)
+            if len(header) != 24:
+                raise ValueError("COLMAP cameras.bin is truncated in a camera record")
+            camera_id, model_id, _width, _height = struct.unpack("<iiQQ", header)
+            if model_id not in model_params:
+                raise ValueError(f"Unsupported COLMAP camera model id {model_id}")
+            params = stream.read(model_params[model_id] * 8)
+            if len(params) != model_params[model_id] * 8:
+                raise ValueError("COLMAP cameras.bin is truncated in camera parameters")
+            camera_ids.add(camera_id)
+    rows = []
+    with images_path.open("rb") as stream:
+        raw_count = stream.read(8)
+        if len(raw_count) != 8:
+            raise ValueError("COLMAP images.bin is truncated before its count")
+        count = struct.unpack("<Q", raw_count)[0]
+        for _ in range(count):
+            record = stream.read(64)
+            if len(record) != 64:
+                raise ValueError("COLMAP images.bin is truncated in an image pose")
+            image_id = struct.unpack_from("<I", record, 0)[0]
+            qvec = list(struct.unpack_from("<4d", record, 4))
+            tvec = list(struct.unpack_from("<3d", record, 36))
+            camera_id = struct.unpack_from("<I", record, 60)[0]
+            name = _read_c_string(stream)
+            raw_points = stream.read(8)
+            if len(raw_points) != 8:
+                raise ValueError("COLMAP images.bin is truncated before its 2D-point count")
+            point_count = struct.unpack("<Q", raw_points)[0]
+            stream.seek(point_count * 24, 1)
+            if camera_id not in camera_ids:
+                raise ValueError(f"COLMAP image {image_id} refers to missing camera {camera_id}")
+            if not all(math.isfinite(value) for value in (*qvec, *tvec)):
+                raise ValueError(f"COLMAP image {image_id} contains a non-finite pose")
+            rows.append({"image_id": image_id, "image_name": name, "camera_id": camera_id,
+                         "qvec_wxyz": qvec, "tvec": tvec,
+                         "camera_center": colmap_camera_center(qvec, tvec), "registered": True})
+    return rows
+
+
 def read_colmap_reconstruction(directory: str | Path, trust: dict[str, Any] | None = None) -> dict[str, Any]:
     """Read camera/image poses and sparse XYZ coordinates from a COLMAP binary model."""
     root = Path(directory)
@@ -833,6 +888,9 @@ def _validate_initial_camera(artifact: dict[str, Any]) -> dict[str, Any]:
 def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Generate an explicitly unapproved navigation proposal from normalized SfM evidence."""
     config = config or {}
+    scene_type = str(config.get("scene_type", "auto")).casefold()
+    if scene_type not in {"auto", "indoor", "outdoor"}:
+        raise ValueError("scene_type must be one of auto, indoor, or outdoor")
     frame = dict(source.get("coordinate_frame", {}))
     scale, rotation, translation, transform_verified = _transform_spec(frame)
     plane = source.get("floor_plane") or source.get("geometry", {}).get("floor_plane") or config.get("floor_plane")
@@ -843,7 +901,7 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     else:
         plane_viewer = None
         basis = None
-        warnings.append({"code": "FLOOR_UNOBSERVED", "severity": "BLOCKING", "message": "No floor plane was supplied; camera height is not sufficient evidence to manufacture one."})
+        warnings.append({"code": "FLOOR_UNOBSERVED", "severity": "BLOCKING", "message": "No ground/floor plane was supplied; camera height is not sufficient evidence to manufacture one."})
     cameras = source.get("stations", source.get("cameras", []))
     projected: list[dict[str, Any]] = []
     pose_exclusions: list[dict[str, Any]] = []
@@ -983,7 +1041,11 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
             ceiling_evidence = ceiling_cfg.get("evidence", [])
         else:
             ceiling_value, ceiling_class, ceiling_evidence = None, "CEILING_UNOBSERVED", []
-            warnings.append({"code": "CEILING_UNOBSERVED", "severity": "BLOCKING", "message": f"No ceiling bound is available for {rid}; public movement cannot be enabled until reviewed."})
+            code = "OPEN_AIR_VERTICAL_LIMIT_UNVERIFIED" if scene_type == "outdoor" else "CEILING_UNOBSERVED"
+            message = (f"No artificial ceiling was inferred for open-air region {rid}; the vertical navigation limit remains unverified."
+                       if scene_type == "outdoor" else
+                       f"No ceiling bound is available for {rid}; public movement cannot be enabled until reviewed.")
+            warnings.append({"code": code, "severity": "REVIEW" if scene_type == "outdoor" else "BLOCKING", "message": message})
         station_ids = [row.get("station_id") or row.get("camera_id") or row.get("image_id") or row.get("image_name") for row in component]
         region_station_assignments[rid] = component
         region = {"id": rid, "polygon_uv": polygon, "coordinate_frame": "navigation_local_uv",
@@ -1000,8 +1062,9 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                          "geometry_supported": False} for _ in polygon],
                   "vertical_bounds": {"floor": {"value": floor_value, "classification": floor_class, "clearance": default_floor_clearance, "evidence": floor_evidence},
                                        "ceiling": None if ceiling_value is None else {"value": ceiling_value, "classification": ceiling_class, "clearance": default_ceiling_clearance, "evidence": ceiling_evidence}},
-                  "uncertainty": ["Camera trajectories do not prove the entire enclosed footprint is traversable.",
-                                  "Boundary walls are not confirmed unless separately reviewed or supplied as geometric planes."]}
+                  "uncertainty": ["Camera trajectories do not prove the entire footprint is traversable.",
+                                  "The proposed boundary is a conservative camera-coverage limit, not a physical wall.",
+                                  "Ground and vertical limits remain unverified unless independently supported."]}
         regions.append(region)
     sparse_uvh = []
     sparse_input = source.get("sparse_points") or []
@@ -1073,7 +1136,8 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     source_rec["sparse_point_count"] = source.get("sparse_point_count", len(source.get("sparse_points", [])))
     transform_matrix = [[scale * rotation[i][j] for j in range(3)] + [translation[i]] for i in range(3)] + [[0, 0, 0, 1]]
     frame_doc = {"source_frame": frame.get("name", frame.get("convention", "UNSPECIFIED_SFM_FRAME")),
-                 "navigation_frame": "floor-aligned local u/v with positive height along floor normal",
+                 "navigation_frame": ("floor-aligned local u/v with positive height along the evidenced floor normal"
+                                      if basis else "provisional local u/v/h from camera positions; up-axis and ground plane unverified"),
                  "viewer_frame": frame.get("viewer_frame", "PlayCanvas model frame"),
                  "source_to_viewer_matrix_row_major": transform_matrix,
                  "viewer_to_navigation": {"origin_viewer": basis["origin"] if basis else None,
@@ -1115,8 +1179,20 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                 "pose_evidence": pose_doc, "regions": regions, "transitions": transitions,
                 "floor_constraints": [{"region_id": r["id"], **r["vertical_bounds"]["floor"]} for r in regions],
                 "ceiling_constraints": [{"region_id": r["id"], **(r["vertical_bounds"].get("ceiling") or {"value": None, "classification": "CEILING_UNOBSERVED"})} for r in regions],
-                "space_assumption": {"initial_model": "single floor-aligned level per region", "multi_level_suspected": pose_doc["vertical_spread"]["possible_multi_level_or_slope"],
+                "space_assumption": {"scene_type": scene_type,
+                                     "initial_model": ("open-air camera-coverage footprint; no walls or ceiling inferred" if scene_type == "outdoor" else
+                                                       "single floor-aligned level per region" if scene_type == "indoor" else
+                                                       "scene enclosure type unclassified; camera-coverage proposal only"),
+                                     "physical_walls_or_ceiling_inferred": False,
+                                     "multi_level_suspected": pose_doc["vertical_spread"]["possible_multi_level_or_slope"],
                                      "requires_review_when_suspected": True},
+                "coverage_assumptions": {"scene_type": scene_type,
+                                         "boundary": "CAMERA_TRAJECTORY_ALPHA_SHAPE_PROPOSAL",
+                                         "coordinate_up_axis": frame.get("up_axis", "UNSPECIFIED"),
+                                         "ground_plane": "GEOMETRY_INPUT_REQUIRED" if not plane_viewer else "GEOMETRY_SUPPORTED_OR_REVIEWED",
+                                         "physical_walls_or_ceiling_inferred": False,
+                                         "aligned_lidar_used": bool(source.get("aligned_lidar_geometry_used", False)),
+                                         "visitor_boundary_verified": False},
                 "camera_clearance": {"horizontal_units": float(config.get("camera_clearance_units", 0.0)), "distance_unit": "reconstruction/viewer scene units; metric scale is not assumed", "interior_object_collision": False},
                 "guided_paths": source.get("guided_paths", config.get("guided_paths", [])), "viewpoints": source.get("viewpoints", config.get("viewpoints", [])),
                 "review": {"status": "REQUIRED", "approved": False, "decisions": [], "warnings": warnings,

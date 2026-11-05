@@ -22,7 +22,7 @@ TRAINING_CAPABILITIES = {
         "presets": ["3dgs"],
         "arguments": ["--train-resolution-divisor", "--device", "--steps-per-save",
                       "--save-only-latest-checkpoint", "--save-full-checkpoint", "--resume",
-                      "--quality", "--view-sampling", "--cache-images", "--load-masks"],
+                      "--quality", "--view-sampling", "--cache-images", "--load-masks", "--scene-center"],
         "checkpoint": {
             "latest_only_retention": "VERIFIED_BY_HELP",
             "latest_only_prunes_older": "VERIFIED_BY_HELP",
@@ -51,6 +51,7 @@ class TrainingCheckpointTests(unittest.TestCase):
             resume_dir = root / "previous-attempt" / "outputs" / "baseline-run"
             cfg = {"preset": "3dgs", "iterations": 30000, "resolution_divisor": 1,
                    "device": "auto", "quality": "high", "steps_per_save": 5000,
+                   "scene_center": "none",
                    "save_only_latest_checkpoint": True, "save_full_checkpoint": True,
                    "view_sampling": "uniform", "cache_images": "disk", "load_masks": False}
             command = build_training_command(Path("/opt/spirula"), root / "dataset", root / "new-attempt",
@@ -63,6 +64,7 @@ class TrainingCheckpointTests(unittest.TestCase):
             self.assertIn(("--num-iterations", "30000"), args)
             self.assertIn(("--train-resolution-divisor", "1"), args)
             self.assertIn(("--quality", "high"), args)
+            self.assertIn(("--scene-center", "none"), args)
             self.assertIn(("--view-sampling", "uniform"), args)
             self.assertIn(("--cache-images", "disk"), args)
             self.assertIn(("--load-masks", "0"), args)

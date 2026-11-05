@@ -4,6 +4,7 @@ import argparse
 import json
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import sys
@@ -21,6 +22,182 @@ from .adapters import sha256_file, validate_navigation
 
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
+
+
+def _first_visual_config(input_directory: str | Path, output_directory: str | Path,
+                         project_id: str, lidar_mode: str = "auto",
+                         scene_type: str = "auto") -> tuple[Path, dict]:
+    source = Path(input_directory).expanduser().resolve()
+    output = Path(output_directory).expanduser().resolve()
+    if not source.is_dir():
+        raise ValueError(f"Input directory does not exist: {source}")
+    if not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{1,127}", project_id or ""):
+        raise ValueError("--project-id must be 2–128 letters, digits, dots, underscores, or hyphens and start with a letter or digit")
+    if lidar_mode not in {"auto", "none"}:
+        raise ValueError("--lidar must be auto or none")
+    if scene_type not in {"auto", "indoor", "outdoor"}:
+        raise ValueError("--scene-type must be auto, indoor, or outdoor")
+    if source == output or source in output.parents or output in source.parents:
+        raise ValueError("Input and output paths must be separate, non-overlapping directories")
+    workspace = output / ".engine"
+    from .dataset_prep import HEIF_SUFFIXES
+    heif_present = any(path.is_file() and path.suffix.casefold() in HEIF_SUFFIXES
+                       for path in source.rglob("*"))
+    image_directory = str(source) if heif_present else "derived/input-images"
+    derived_manifest = None if heif_present else "derived/input-images-manifest.json"
+    sfm = {"mode": "spirula_fresh", "image_directory": image_directory,
+           "quality": "high", "data_type": "individual",
+           "quality_gate": {"minimum_registered_ratio": 0.7,
+                            "minimum_registered_images": 24,
+                            "maximum_mean_point_reprojection_error_px": 2,
+                            "allow_training_with_warnings": False}}
+    model = {"mode": "spirula_fresh", "run_type": "candidate", "preset": "3dgs",
+             "data_format": "colmap", "image_directory": image_directory,
+             "iterations": 30000, "resolution_divisor": 1, "quality": "high",
+             "scene_center": "none", "device": "auto", "steps_per_save": 5000,
+             "save_only_latest_checkpoint": True, "save_full_checkpoint": True}
+    if derived_manifest:
+        sfm["derived_image_manifest"] = derived_manifest
+        sfm["image_directory"] = "derived/input-images"
+        model["image_directory"] = "derived/input-images"
+    config = {
+        "schema_version": "exhibition-archive.project.v1",
+        "project_id": project_id,
+        "created_at_utc": utc_now(),
+        "source": {"photo_directory": str(source), "read_only": True,
+                   "originals_modified": False,
+                   "derived_image_directories": [] if heif_present else ["derived/input-images"]},
+        "output_directory": "..",
+        "viewer": {"title": project_id, "theme": "dark"},
+        "publication": {"public_site": False, "include_source_photographs": False,
+                        "include_private_review_notes": False},
+        "archive_policy": {"bundle_source_photographs": False},
+        "retry_policy": {"automatic_retries": 0, "max_failed_attempts": 2},
+        "resource_policy": {"max_training_iterations": 30000,
+                            "max_concurrent_backend_processes": 1,
+                            "minimum_free_disk_bytes_sfm": 10 * 1024**3,
+                            "minimum_free_disk_bytes_training": 20 * 1024**3,
+                            "checkpoint_replacement_reserve_bytes": 20 * 1024**3,
+                            "checkpoint_replacement_reserve_basis": "NOT_RECORDED",
+                            "sfm_timeout_seconds": 21600,
+                            "training_timeout_seconds": 86400,
+                            "poll_interval_seconds": 1,
+                            "retained_attempt_limit": 5,
+                            "log_retention": "keep_all"},
+        "integrations": {"sfm": sfm, "model": model,
+                         "lidar": {"enabled": lidar_mode == "auto"},
+                         "navigation": {"mode": "generate_from_sfm", "scene_type": "auto",
+                                        "region_connection_scale": 2.5, "alpha_scale": 1.6,
+                                        "margin_units": 0, "camera_clearance_units": 0}},
+        "first_visual_profile": {"name": "first-visual", "training_passes": 1,
+                                 "roi_retraining": False, "parameter_sweeps": False,
+                                 "image_resolution_policy": "source resolution; no max_image_size; 3DGS divisor 1"},
+    }
+    config["integrations"]["navigation"]["scene_type"] = scene_type
+    if workspace.exists() and (workspace / "project.json").is_file():
+        existing_root, existing = load_project(workspace)
+        if (Path(existing["source"]["photo_directory"]).expanduser().resolve() != source or
+                existing.get("project_id") != project_id or output_path(existing_root, existing) != output):
+            raise ValueError(f"The output directory already belongs to another Engine project: {workspace}")
+        if bool(existing.get("integrations", {}).get("lidar", {}).get("enabled", True)) != (lidar_mode == "auto"):
+            raise ValueError("The existing project uses a different LiDAR policy; change it explicitly in project.json before resuming")
+        if existing.get("integrations", {}).get("navigation", {}).get("scene_type", "auto") != scene_type:
+            raise ValueError("The existing project uses a different scene_type; change it explicitly in project.json before resuming")
+        return existing_root, existing
+    return workspace, config
+
+
+def _first_visual_preflight(input_directory: str | Path, output_directory: str | Path,
+                            project_id: str, lidar_mode: str = "auto",
+                            scene_type: str = "auto") -> dict:
+    from .lidar import discover_input_files
+    from .backends import (BackendError, build_sfm_command, build_training_command,
+                           discover_environment, image_inventory, training_preset_configuration)
+    root, config = _first_visual_config(input_directory, output_directory, project_id, lidar_mode, scene_type)
+    source = Path(config["source"]["photo_directory"])
+    output = output_path(root, config)
+    discovery = discover_input_files(source, hash_images=False, hash_ply=False)
+    report = {"status": "READY_TO_PLAN", "project_id": project_id, "input_directory": str(source),
+              "output_directory": str(output), "workspace": str(root), "photo_count": discovery["image_count"],
+              "image_formats": discovery["image_formats"], "ply_candidates": discovery["ply_files"],
+              "unsupported_raw_images": discovery["unsupported_raw_images"],
+              "ignored_file_count": discovery["ignored_file_count"],
+              "raw_lidar_status": discovery["raw_lidar_status"],
+              "photo_only_fallback_available": True,
+              "configuration": config, "planned_stages": ["photo_inventory", "lidar_inspection (optional)", "capture_preflight", "sfm_dataset_prep (when required)",
+                  "artwork_association", "sfm", "lidar_registration (optional)", "navigation", "training", "first_visual"],
+              "side_effects": "NONE; dry-run does not create a workspace, project manifest, SQLite database, cache, or derived image copy",
+              "dry_run_scope": "PLY headers are classified; full vertex scanning, preview generation, SfM, training, and registration are deferred to the authorized local run.",
+              "blockers": [], "warnings": []}
+    try:
+        image_index = image_inventory(source)
+        report["photo_validation"] = {"status": "PASS", "image_count": image_index["image_count"],
+                                       "formats": image_index["formats"], "duplicate_basenames": image_index["duplicates"]}
+    except BackendError as exc:
+        report["photo_validation"] = {"status": "BLOCKED", "reason": str(exc), "details": exc.details}
+        report["blockers"].append(str(exc))
+    try:
+        capabilities = discover_environment()
+        executable = Path(capabilities["tool"]["executable"])
+        configured_image_path = Path(config["integrations"]["sfm"]["image_directory"]).expanduser()
+        image_path = (configured_image_path if configured_image_path.is_absolute() else root / configured_image_path).resolve()
+        sfm_command = build_sfm_command(executable, image_path, output / "backend-runs" / "sfm" / "<next-attempt>" / "workspace",
+                                        config["integrations"]["sfm"], capabilities)
+        training_command = build_training_command(executable,
+            output / "backend-runs" / "training" / "<next-attempt>" / "dataset",
+            output / "backend-runs" / "training" / "<next-attempt>", config["integrations"]["model"],
+            capabilities, f"{project_id}-<next-execution>")
+        training_effective_configuration = training_preset_configuration(
+            executable, config["integrations"]["model"]["preset"],
+            config["integrations"]["model"]["quality"], training_command)
+        if training_effective_configuration["status"] != "CAPTURED":
+            report["blockers"].append(
+                "Could not capture Spirula's effective defaults for the selected 3DGS preset and quality; "
+                "review the installed CLI help before authorizing training.")
+        report["backend"] = {"status": "AVAILABLE", "name": capabilities["tool"]["name"],
+                             "executable": capabilities["tool"]["executable"],
+                             "version": capabilities["tool"]["version"],
+                             "training_resolution_divisor": config["integrations"]["model"]["resolution_divisor"],
+                             "training_iterations": config["integrations"]["model"]["iterations"],
+                             "training_effective_configuration": training_effective_configuration,
+                             "sfm_command": sfm_command, "training_command_template": training_command,
+                             "training_process_launched": False}
+    except Exception as exc:
+        report["backend"] = {"status": "UNAVAILABLE_OR_UNSUPPORTED", "reason": str(exc)}
+        report["blockers"].append(f"Required Spirula SfM/training backend is not ready: {exc}")
+    from .dataset_prep import contains_heif, heif_converter_identity
+    if contains_heif(source):
+        try:
+            report["heif_converter"] = heif_converter_identity()
+        except Exception as exc:
+            report["heif_converter"] = {"status": "UNAVAILABLE", "reason": str(exc)}
+            report["blockers"].append(f"HEIC/HEIF input requires the existing libheif preparation pathway: {exc}")
+    else:
+        report["heif_converter"] = {"status": "NOT_REQUIRED"}
+    visitor_vendor = PRODUCT_ROOT / "templates" / "visitor" / "vendor"
+    required_viewer_files = [visitor_vendor / name for name in ("supersplat-viewer.css", "supersplat-viewer.js",
+        "SUPERSPLAT-VIEWER-LICENSE.txt", "PLAYCANVAS-LICENSE.txt", "THIRD_PARTY-NOTICES.md", "runtime.json", "visitor-app.js")]
+    missing_viewer_files = [str(path) for path in required_viewer_files if not path.is_file()]
+    report["viewer_runtime"] = {"status": "READY" if not missing_viewer_files else "INCOMPLETE",
+                                "missing_files": missing_viewer_files}
+    if missing_viewer_files:
+        report["blockers"].append("Bundled Visitor runtime files are missing.")
+    if discovery["unsupported_raw_images"]:
+        report["blockers"].append("Unsupported raw-camera image files were found: " + ", ".join(row["relative_path"] for row in discovery["unsupported_raw_images"]))
+    if discovery["raw_lidar_status"] == "AMBIGUOUS_MULTIPLE_CANDIDATES":
+        report["warnings"].append("Multiple raw point-cloud PLY candidates are ambiguous. LiDAR will be left unselected; photo-only reconstruction remains planned.")
+    if discovery["image_count"] < 2:
+        report["blockers"].append("At least two supported photographs are required.")
+    if lidar_mode == "auto" and not discovery["ply_files"]:
+        report["warnings"].append("No LiDAR PLY was detected; the photo-only pathway remains available.")
+    if lidar_mode == "auto":
+        try:
+            import open3d
+            report["optional_lidar_registration"] = {"status": "AVAILABLE", "version": open3d.__version__}
+        except ImportError:
+            report["optional_lidar_registration"] = {"status": "UNAVAILABLE_OPTIONAL", "effect": "LiDAR inspection continues; registration will be recoverably rejected and photos remain primary."}
+    report["status"] = "BLOCKED" if report["blockers"] else "READY"
+    return report
 
 
 def _root_for_init(args) -> tuple[Path, dict]:
@@ -125,19 +302,110 @@ def cmd_authorize(args) -> int:
 
 
 def cmd_run(args) -> int:
-    root, config = load_project(args.project)
+    input_directory = getattr(args, "input", None)
+    output_directory = getattr(args, "output", None)
+    profile = getattr(args, "profile", None)
+    until = getattr(args, "until", None)
+    if until == "visitor" and profile is None:
+        profile = "first-visual"
+    if input_directory:
+        if not output_directory or not getattr(args, "project_id", None):
+            raise ValueError("A folder-based run requires --input, --output, and the operator-supplied --project-id")
+        if getattr(args, "project", None):
+            raise ValueError("Use either a project positional argument or --input/--output, not both")
+        if profile not in {None, "first-visual"} or until not in {None, "visitor"}:
+            raise ValueError("Folder-based run supports --profile first-visual and --until visitor")
+        profile = profile or "first-visual"
+        until = until or "visitor"
+        if getattr(args, "dry_run", False):
+            preflight = _first_visual_preflight(input_directory, output_directory, args.project_id,
+                                                getattr(args, "lidar", "auto"), getattr(args, "scene_type", "auto"))
+            print(json.dumps(preflight, indent=2))
+            return 0 if preflight["status"] == "READY" else 2
+        preflight = _first_visual_preflight(input_directory, output_directory, args.project_id,
+                                            getattr(args, "lidar", "auto"), getattr(args, "scene_type", "auto"))
+        if preflight["blockers"]:
+            print(json.dumps(preflight, indent=2))
+            return 2
+        root = Path(preflight["workspace"])
+        config = preflight["configuration"]
+        project_file = root / "project.json"
+        if not project_file.is_file():
+            output = Path(output_directory).expanduser().resolve()
+            if output.exists() and any(output.iterdir()):
+                raise FileExistsError(f"Output directory is non-empty and has no existing Engine project; refusing to overwrite it: {output}")
+            root.mkdir(parents=True, exist_ok=True)
+            write_json(project_file, config)
+            initial_state = ProjectState(root)
+            initial_state.close()
+    else:
+        if getattr(args, "dry_run", False):
+            raise ValueError("--dry-run requires --input, --output, and --project-id")
+        if not getattr(args, "project", None):
+            raise ValueError("run/resume requires a project workspace or --input/--output/--project-id")
+        root, config = load_project(args.project)
+    if profile and profile != "first-visual":
+        raise ValueError("Only the first-visual profile is currently implemented")
+    if until and until != "visitor":
+        raise ValueError("Only --until visitor is currently implemented")
+    stop_after_stage = "first_visual" if profile == "first-visual" and until == "visitor" else None
     state = ProjectState(root)
     try:
         with state.lock():
-            result = run_workflow(root, config, state, resume=args.resume, force_hash=args.full_hash,
-                                  fail_at=getattr(args, "fail_at", None),
-                                  authorization_ids=getattr(args, "authorization_id", []),
-                                  package_only=getattr(args, "package_only", False))
+            authorization_ids = list(getattr(args, "authorization_id", []))
+            result = None
+            for _ in range(3):  # at most the separately authorized SfM and training stages
+                result = run_workflow(root, config, state, resume=args.resume, force_hash=args.full_hash,
+                                      fail_at=getattr(args, "fail_at", None),
+                                      authorization_ids=authorization_ids,
+                                      package_only=getattr(args, "package_only", False),
+                                      stop_after_stage=stop_after_stage)
+                if (result.get("status") != "AUTHORIZATION_REQUIRED" or
+                        not getattr(args, "interactive_authorization", False)):
+                    break
+                blocked = next((item for item in result.get("blocked", []) if item.get("execution_plan")), None)
+                if blocked is None or not sys.stdin.isatty():
+                    print("Interactive stage approval requires an interactive Terminal; no approval was created.", file=sys.stderr)
+                    break
+                execution_plan = blocked["execution_plan"]
+                stage_id = blocked["stage"]
+                expected = f"AUTHORIZE {stage_id} {execution_plan['plan_id']}"
+                print(f"\nExact authorization plan for {stage_id}:\n{json.dumps(execution_plan, indent=2)}")
+                print("The next operation launches this named backend stage once, with the plan and limits shown above.")
+                answer = input(f"To authorize, type exactly: {expected}\n> ").strip()
+                if answer != expected:
+                    result["authorization_declined"] = True
+                    break
+                reviewer = input("Reviewer identity: ").strip()
+                rationale = input("Rationale for this exact run: ").strip()
+                if not reviewer or not rationale:
+                    result["authorization_declined"] = True
+                    result["authorization_error"] = "Reviewer and rationale are required; no authorization was recorded."
+                    break
+                authorization_id = "ea_" + secrets.token_urlsafe(18)
+                created = datetime.now(timezone.utc).replace(microsecond=0)
+                expires = created + timedelta(minutes=15)
+                state.create_execution_authorization(authorization_id, config["project_id"], stage_id,
+                    execution_plan["plan_id"], execution_plan, reviewer, rationale,
+                    expires.isoformat().replace("+00:00", "Z"))
+                authorization_ids.append(authorization_id)
+            assert result is not None
+            status = result.get("status", "COMPLETED")
+            if status not in {"COMPLETED", "AWAITING_VISUAL_REVIEW"}:
+                result["resume_command"] = ("exhibition-archive resume " + shlex.quote(str(root)) +
+                                             " --profile first-visual --until visitor --interactive-authorization")
         print(json.dumps(result, indent=2))
         status = result.get("status", "COMPLETED")
         if status.startswith(("AUTHORIZATION_REQUIRED", "BLOCKED_PACKAGE")): return 3
         if status.startswith("BLOCKED_BACKEND"): return 1
+        if status in {"FAILED", "BLOCKED"}: return 1
         return 0
+    except Exception as exc:
+        command = ("exhibition-archive resume " + shlex.quote(str(root)) +
+                   " --profile first-visual --until visitor --interactive-authorization")
+        print(json.dumps({"status": "FAILED", "error": str(exc), "workspace": str(root),
+                          "resume_command": command}, indent=2), file=sys.stderr)
+        return 1
     finally:
         state.close()
 
@@ -184,6 +452,11 @@ def cmd_status(args) -> int:
         for sid in ("sfm", "training"):
             reconcile_running_stage(state, sid)
         stages = state.stages()
+        first_visual_details = {}
+        try:
+            first_visual_details = json.loads(stages.get("first_visual", {}).get("details_json") or "{}")
+        except (TypeError, ValueError):
+            pass
         runs = [dict(x) for x in state.db.execute("SELECT run_id,started_at,ended_at,mode,status,summary_json FROM workflow_runs ORDER BY run_id DESC LIMIT 5")]
         gates = [dict(x) for x in state.db.execute("SELECT * FROM review_gates ORDER BY gate_id")]
         failed = any(x["status"] == "FAILED" for x in stages.values())
@@ -215,6 +488,10 @@ def cmd_status(args) -> int:
                           "recent_runs": runs,
                           "resume_eligible": any(x["status"] in {"FAILED", "RUNNING", "INVALIDATED", "BLOCKED"} for x in stages.values()),
                           "selected_model": stages.get("training", {}).get("details_json"),
+                          "first_visual_preview": first_visual_details or None,
+                          "reviewer_html": first_visual_details.get("reviewer_html"),
+                          "visitor_html": first_visual_details.get("visitor_html"),
+                          "first_visual_summary": first_visual_details.get("summary_path"),
                           "website": str(out / "website"), "archive": str(out / "archive"),
                           "next_action": next((json.loads(v.get("details_json") or "{}").get("reason") for k, v in stages.items()
                                                if v.get("status") == "BLOCKED"), None)}, indent=2))
@@ -659,8 +936,19 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("project"); p.add_argument("--stage", choices=["sfm", "training"], required=True)
     p.add_argument("--plan-id", required=True); p.add_argument("--reviewer", required=True); p.add_argument("--rationale", required=True)
     p.set_defaults(func=cmd_authorize)
-    p = sub.add_parser("run", help="Run ready local stages and adopt configured existing artifacts")
-    p.add_argument("project"); p.add_argument("--full-hash", action="store_true", help="Re-hash all fingerprinted input files")
+    p = sub.add_parser("run", help="Run a project workflow or process one input folder through a first visual preview")
+    p.add_argument("project", nargs="?", help="Existing project workspace or project.json")
+    p.add_argument("--input", help="Photo folder with an optional raw point-cloud PLY")
+    p.add_argument("--output", help="Separate output directory for a folder-based run")
+    p.add_argument("--project-id", help="Operator-supplied stable project identifier; required with --input")
+    p.add_argument("--lidar", choices=["auto", "none"], default="auto", help="Inspect an unambiguous raw point cloud or explicitly disable it")
+    p.add_argument("--scene-type", choices=["auto", "indoor", "outdoor"], default="auto",
+                   help="Navigation geometry assumption; auto keeps enclosure type unclassified until evidence is reviewed")
+    p.add_argument("--profile", choices=["first-visual"], help="Initial SfM/3DGS and private Reviewer/Visitor preview workflow")
+    p.add_argument("--until", choices=["visitor"], help="Stop after the initial Visitor preview is generated")
+    p.add_argument("--dry-run", action="store_true", help="Validate inputs and dependencies without creating workspace files or launching backends")
+    p.add_argument("--interactive-authorization", action="store_true", help="Show and request one explicit approval for each exact fresh SfM/training plan")
+    p.add_argument("--full-hash", action="store_true", help="Re-hash all fingerprinted input files")
     p.add_argument("--authorization-id", action="append", default=[], help="One-time grant returned by authorize; repeat for separately approved stages")
     p.add_argument("--fail-at", choices=["viewer_package", "archive_package", "verification"], help=argparse.SUPPRESS)
     p.set_defaults(func=cmd_run, resume=False)
@@ -680,6 +968,9 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_diagnostic_smoke_validate)
     p = sub.add_parser("resume", help="Resume failed/invalidated stages while reusing valid upstream results")
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true")
+    p.add_argument("--profile", choices=["first-visual"], help="Continue through the initial private Reviewer/Visitor preview")
+    p.add_argument("--until", choices=["visitor"], help="Stop after the initial Visitor preview is generated")
+    p.add_argument("--interactive-authorization", action="store_true", help="Show and request one explicit approval for each exact fresh SfM/training plan")
     p.add_argument("--authorization-id", action="append", default=[], help="One-time grant returned by authorize; repeat for separately approved stages")
     p.set_defaults(func=cmd_run, resume=True)
     p = sub.add_parser("reconcile-interrupted", help="Reconcile one confirmed interrupted HEIC preparation without retrying it")

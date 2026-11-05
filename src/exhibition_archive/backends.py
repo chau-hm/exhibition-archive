@@ -1054,6 +1054,14 @@ def build_training_command(executable: Path, dataset_dir: Path, attempt_dir: Pat
     if "--train-resolution-divisor" not in supported or not isinstance(divisor, int) or divisor < 1:
         raise BackendError("training.resolution_divisor must be a positive integer supported by Spirula", failure_kind="INVALID_CONFIGURATION")
     command += ["--train-resolution-divisor", str(divisor)]
+    scene_center = cfg.get("scene_center")
+    if scene_center is not None:
+        if (not isinstance(scene_center, str) or scene_center not in
+                {"auto", "none", "point-median", "camera-median", "camera-focus", "point-mean", "camera-mean"} or
+                "--scene-center" not in supported):
+            raise BackendError("Configured training.scene_center must be a supported Spirula scene-center mode",
+                               failure_kind="INVALID_CONFIGURATION")
+        command += ["--scene-center", scene_center]
     device = cfg.get("device", "auto")
     if not isinstance(device, str) or not device.strip(): raise BackendError("training.device must be a non-empty string", failure_kind="INVALID_CONFIGURATION")
     if "--device" in supported: command += ["--device", device]
@@ -1111,13 +1119,65 @@ def build_training_command(executable: Path, dataset_dir: Path, attempt_dir: Pat
         command += ["--seed", str(seed)]
     extras = cfg.get("additional_args", [])
     if not isinstance(extras, list) or not all(isinstance(x, str) for x in extras): raise BackendError("training.additional_args must be a string array", failure_kind="INVALID_CONFIGURATION")
-    protected = {"--data", "--data-format", "--image-dir", "--colmap-recon-dir", "--output-dir-prefix", "--output-dir-name", "--num-iterations", "--device", "--train-resolution-divisor", "--resume", "--init-ply", "--save-full-checkpoint", "--save-only-latest-checkpoint", "--steps-per-save", "--quality", "--view-sampling", "--cache-images", "--load-masks", "--disable-viewer", "--keep-viewer-alive"}
+    protected = {"--data", "--data-format", "--image-dir", "--colmap-recon-dir", "--output-dir-prefix", "--output-dir-name", "--num-iterations", "--device", "--train-resolution-divisor", "--scene-center", "--resume", "--init-ply", "--save-full-checkpoint", "--save-only-latest-checkpoint", "--steps-per-save", "--quality", "--view-sampling", "--cache-images", "--load-masks", "--disable-viewer", "--keep-viewer-alive"}
     flags = [arg for arg in extras if arg.startswith("-")]
     unknown, blocked = sorted(set(flags)-supported), sorted(set(flags)&protected)
     if unknown: raise BackendError(f"Unsupported training extra flags: {unknown}", failure_kind="INVALID_CONFIGURATION")
     if blocked: raise BackendError(f"Training extra flags cannot override protected configuration: {blocked}", failure_kind="INVALID_CONFIGURATION")
     command.extend(extras)
     return command
+
+
+def training_preset_configuration(executable: Path, preset: str, quality: str | None,
+                                  command: list[str]) -> dict[str, Any]:
+    """Capture Spirula's quality-resolved defaults plus every explicit command override."""
+    help_command = [str(executable), "train", preset]
+    if quality:
+        help_command += ["--quality", quality]
+    help_command.append("--help-all")
+    help_result = _capture(help_command, timeout=60)
+    if help_result["exit_code"] != 0:
+        help_command = [str(executable), "train", preset]
+        if quality:
+            help_command += ["--quality", quality]
+        help_command.append("--help")
+        help_result = _capture(help_command, timeout=60)
+    help_text = help_result["stdout"] + ("\n" + help_result["stderr"] if help_result["stderr"] else "")
+    defaults = {}
+    default_pattern = re.compile(r"^\s*(--[A-Za-z0-9][A-Za-z0-9_-]*)\s{2,}\[([^\]]*)\](?:\s|$)")
+    for line in help_text.splitlines():
+        match = default_pattern.match(line)
+        if match:
+            defaults[match.group(1)] = match.group(2)
+    overrides = {}
+    index = 0
+    while index < len(command):
+        flag = command[index]
+        if flag.startswith("--"):
+            if index + 1 < len(command) and not command[index + 1].startswith("-"):
+                overrides[flag] = command[index + 1]
+                index += 2
+                continue
+            overrides[flag] = True
+        index += 1
+    effective = dict(defaults)
+    sources = {key: "SPIRULA_HELP_DEFAULT_FOR_SELECTED_PRESET_AND_QUALITY" for key in defaults}
+    for key, value in overrides.items():
+        effective[key] = value
+        sources[key] = "EXPLICIT_ENGINE_COMMAND"
+    return {"schema_version": "exhibition-archive.training-preset-configuration.v1",
+            "preset": preset, "quality": quality or "BACKEND_DEFAULT",
+            "status": "CAPTURED" if defaults else "HELP_DEFAULTS_UNAVAILABLE",
+            "help_command": help_command,
+            "help_exit_code": help_result["exit_code"],
+            "help_output_sha256": hashlib.sha256(help_text.encode("utf-8")).hexdigest(),
+            "parsed_default_parameter_count": len(defaults),
+            "backend_defaults": defaults,
+            "command_overrides": overrides,
+            "effective_parameters": effective,
+            "effective_parameter_count": len(effective),
+            "effective_parameter_sources": sources,
+            "note": "The effective parameter map combines the installed backend's help defaults resolved for this preset/quality with the exact Engine command overrides. It is a declaration of backend configuration, not a training convergence or visual-quality measurement."}
 
 
 def prepare_training_dataset(attempt_dir: Path, image_dir: Path, reconstruction_dir: Path, *, copy_inputs: bool = False,

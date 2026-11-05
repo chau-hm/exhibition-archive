@@ -13,6 +13,7 @@ from .navigation import generate_navigation, read_colmap_reconstruction, render_
 from .backends import (BackendError, CHECKPOINT_REPLACEMENT_OVERLAP_ASSUMPTION, IMAGE_SUFFIXES, build_sfm_command, build_training_command,
                        check_resources, create_attempt_dir, discover_checkpoints, discover_environment, discover_model_files,
                        execute_process, finalize_attempt_record, finalize_stage_attempt, image_inventory as backend_image_inventory, prepare_training_dataset,
+                       training_preset_configuration,
                        process_alive,
                        validate_colmap_directory, validate_gaussian_ply)
 from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_preparation_required,
@@ -21,17 +22,22 @@ from .dataset_prep import (DATASET_MANIFEST, DatasetPreparationRequired, auto_pr
                            image_gamut_mismatch, preparation_manifest_path,
                            prepare_spirula_dataset, preparation_settings_for,
                            validate_preparation_stage_outputs)
+from .lidar import (attempt_similarity_alignment, discover_input_files,
+                    inspect_optional_lidar)
 from .state import ProjectState, utc_now
 
 
 STAGES = [
     {"id": "photo_inventory", "deps": [], "inputs": ["original photographs", "Phase2EU inventory if supplied"], "outputs": ["source inventory and hashes"], "mode": "execute locally", "resource": "I/O bound"},
+    {"id": "lidar_inspection", "deps": ["photo_inventory"], "inputs": ["optional non-Gaussian PLY candidates"], "outputs": ["PLY inspection report, raw preview, and discovery manifest"], "mode": "optional; failures recover to photo-only", "resource": "bounded I/O"},
     {"id": "capture_preflight", "deps": ["photo_inventory"], "inputs": ["image inventory", "optional SfM and region evidence"], "outputs": ["quality and capture-risk report"], "mode": "adopt or image-only adapter", "resource": "low / I/O bound"},
     {"id": "sfm_dataset_prep", "deps": ["photo_inventory", "capture_preflight"], "inputs": ["registered source inventory", "HEIC files when fresh Spirula SfM requires JPEG"], "outputs": ["verified effective image dataset and source-to-derivative manifest"], "mode": "safe local preparation; no backend execution", "resource": "I/O and CPU bound when HEIC is present"},
     {"id": "artwork_association", "deps": ["photo_inventory", "capture_preflight"], "inputs": ["image inventory", "optional geometry and review state"], "outputs": ["inventory, observations, association graph"], "mode": "adopt or configured Phase2EV adapter", "resource": "low when adopted"},
     {"id": "sfm", "deps": ["photo_inventory"], "inputs": ["source images or existing COLMAP reconstruction"], "outputs": ["validated cameras, registered images, sparse points and provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "high when freshly executed"},
+    {"id": "lidar_registration", "deps": ["photo_inventory", "lidar_inspection", "sfm"], "inputs": ["independently inspected raw point cloud and validated sparse SfM geometry"], "outputs": ["scale-aware alignment report and optional aligned preview"], "mode": "optional FPFH/RANSAC global registration; rejection is recoverable", "resource": "bounded CPU geometry"},
     {"id": "navigation", "deps": ["sfm"], "inputs": ["trusted camera poses, geometry evidence, coordinate frame and review decisions"], "outputs": ["versioned navigation proposal or approved artifact"], "mode": "adopt_existing or generate_from_sfm", "resource": "low"},
     {"id": "training", "deps": ["photo_inventory", "sfm"], "inputs": ["images and validated SfM"], "outputs": ["validated candidate 3DGS PLY and training provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "GPU intensive"},
+    {"id": "first_visual", "deps": ["training"], "inputs": ["unreviewed candidate model, SfM, LiDAR and navigation diagnostics"], "outputs": ["private technical Reviewer and Visitor preview HTML"], "mode": "execute locally; no release approval", "resource": "model copy and local asset assembly"},
     {"id": "evaluation", "deps": ["training", "artwork_association"], "inputs": ["candidate model and fidelity evidence"], "outputs": ["model selection and limitations"], "mode": "adopt evidence / human gate" , "resource": "review dependent"},
     {"id": "viewer_package", "deps": ["training", "navigation", "evaluation", "artwork_association"], "inputs": ["selected model, navigation, confirmed catalogue, theme"], "outputs": ["independent static Review and Visitor websites"], "mode": "execute locally", "resource": "model copy and optional SOG conversion"},
     {"id": "archive_package", "deps": ["photo_inventory", "capture_preflight", "artwork_association", "sfm", "training", "evaluation", "navigation", "viewer_package"], "inputs": ["validated evidence and package"], "outputs": ["private archive metadata and manifest"], "mode": "execute locally", "resource": "low"},
@@ -221,6 +227,23 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
     if stage_id == "navigation":
         selected["navigation_inputs"] = integration.get("navigation", {})
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("navigation.py"), full_hash))
+    if stage_id == "lidar_inspection":
+        source_dir = project_path(root, config, config["source"]["photo_directory"])
+        discovery = discover_input_files(source_dir, hash_images=False, hash_ply=False)
+        selected["lidar_enabled"] = integration.get("lidar", {}).get("enabled", True)
+        selected["point_cloud_inputs"] = [
+            fingerprint_file(state, source_dir / row["relative_path"], full_hash)
+            for row in discovery.get("ply_files", [])
+        ]
+        selected["implementation_files"] = [
+            fingerprint_file(state, Path(__file__).with_name("lidar.py"), full_hash),
+        ]
+    if stage_id == "lidar_registration":
+        selected["files"].append(fingerprint_file(state, output_path(root, config) / "lidar" / "inspection.json", full_hash))
+        selected["files"].append(fingerprint_file(state, Path(__file__).with_name("lidar.py"), full_hash))
+        sfm_details = json.loads((state.stage("sfm") or {}).get("details_json") or "{}")
+        selected["sparse_reconstruction"] = {"path": sfm_details.get("reconstruction_directory"),
+                                             "validation_path": sfm_details.get("sfm_validation_path")}
     if stage_id == "viewer_package":
         viewer_source = Path(__file__).resolve().parents[2] / "templates" / "viewer"
         for name in ("app.js", "index.html", "style.css", "vendor/index.js", "vendor/index.css"):
@@ -251,6 +274,7 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
         source_dir = project_path(root, config, config["source"]["photo_directory"])
         suffixes = IMAGE_SUFFIXES
         selected["source_files"] = [fingerprint_file(state, file, full_hash) for file in sorted(source_dir.rglob("*") if source_dir.is_dir() else []) if file.is_file() and file.suffix.casefold() in suffixes]
+        selected["image_preparation"] = fingerprint_file(state, Path(__file__).with_name("input_prep.py"), full_hash)
     if stage_id == "sfm_dataset_prep":
         sfm_cfg = integration.get("sfm", {})
         image_dir = project_path(root, config, sfm_cfg.get("image_directory", config["source"]["photo_directory"]))
@@ -325,6 +349,20 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
             "default_geometry_view_id": config.get("viewer", {}).get("default_geometry_view_id"),
         }
         selected["public_policy"] = config.get("publication", {})
+    elif stage_id == "first_visual":
+        selected["training_candidate"] = ({k: state.stage("training").get(k) for k in ("status", "input_fingerprint", "output_digest")} if state.stage("training") else None)
+        selected["training_configuration"] = {k: v for k, v in integration.get("model", {}).items() if k != "environment_overrides"}
+        selected["diagnostic_stages"] = {sid: ({k: state.stage(sid).get(k) for k in ("status", "input_fingerprint", "output_digest")} if state.stage(sid) else None)
+                                          for sid in ("sfm", "lidar_inspection", "lidar_registration", "navigation")}
+        selected["navigation_configuration"] = integration.get("navigation", {})
+        selected["implementation_files"] = [
+            fingerprint_file(state, Path(__file__).with_name("preview.py"), full_hash),
+            fingerprint_file(state, Path(__file__).with_name("lidar.py"), full_hash),
+            fingerprint_file(state, Path(__file__).with_name("visitor.py"), full_hash),
+            fingerprint_file(state, Path(__file__).resolve().parents[2] / "templates" / "visitor" / "index.html", full_hash),
+            fingerprint_file(state, Path(__file__).resolve().parents[2] / "templates" / "visitor" / "app.js", full_hash),
+            fingerprint_file(state, Path(__file__).resolve().parents[2] / "templates" / "visitor" / "style.css", full_hash),
+        ]
     elif stage_id == "archive_package":
         selected["archive_policy"] = config.get("archive_policy", {})
         selected["publication"] = config.get("publication", {})
@@ -381,6 +419,8 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
         dataset = attempt / "<prepared-dataset>"
         command = build_training_command(executable, dataset, attempt, cfg, backend,
                                          f"{config['project_id']}-<next-execution-id>", resume_output_dir)
+        training_effective_configuration = training_preset_configuration(
+            executable, cfg["preset"], cfg.get("quality", "high"), command)
         limits = {**config.get("resource_policy", {}), "timeout_seconds": cfg.get("timeout_seconds", config.get("resource_policy", {}).get("training_timeout_seconds")),
                   "max_training_iterations": config.get("resource_policy", {}).get("max_training_iterations"),
                   "iterations": cfg.get("iterations"),
@@ -438,6 +478,7 @@ def expensive_execution_plan(root: Path, config: dict, state: ProjectState, stag
                     "capabilities": backend_capabilities},
         "normalized_command": command,
         "output_workspace": str(attempt), "configuration": selected_cfg,
+        "training_effective_configuration": (training_effective_configuration if stage_id == "training" else None),
         "environment_override_keys": sorted(env),
         "environment_overrides_sha256": json_digest(env),
         "resource_limits": limits, "quality_gates": quality_gates,
@@ -574,6 +615,65 @@ def _image_dimensions(path: Path) -> tuple[int | None, int | None]:
     return None, None
 
 
+def _training_resolution_request(image_directory: Path, divisor: int) -> dict[str, Any]:
+    images = []
+    try:
+        from PIL import Image
+    except ImportError:
+        Image = None
+    for path in sorted(item for item in image_directory.rglob("*") if item.is_file()):
+        size = None
+        if Image is not None:
+            try:
+                with Image.open(path) as image:
+                    size = image.size
+            except Exception:
+                size = None
+        if size is None:
+            size = _image_dimensions(path)
+        width, height = size
+        row = {"relative_path": path.relative_to(image_directory).as_posix(),
+               "width": width, "height": height}
+        if width and height and divisor == 1:
+            row["configured_effective_training_dimensions"] = [width, height]
+            row["configured_dimensions_basis"] = "Source image pixels; Spirula train-resolution-divisor=1; no max-image-size argument"
+        else:
+            row["configured_effective_training_dimensions"] = None
+        images.append(row)
+    known = [row for row in images if row["width"] and row["height"]]
+    return {"status": "REQUEST_RECORDED", "configured_resolution_divisor": divisor,
+            "configured_resolution_policy": "full source pixels" if divisor == 1 else "backend divisor configured",
+            "configured_effective_dimensions_basis": ("Per-image source dimensions are retained because the backend command uses divisor 1 and does not set max_image_size; backend log observation is recorded separately."
+                                                        if divisor == 1 else "Backend divisor is recorded; exact integer rounding is backend-specific."),
+            "registered_image_count": len(images), "image_dimensions_known_count": len(known),
+            "image_dimensions_unknown_count": len(images) - len(known),
+            "source_image_dimensions": images, "backend_reported_training_resolution": None,
+            "backend_report_status": "PENDING_TRAINING_LOG_INSPECTION"}
+
+
+def _training_resolution_from_log(request: dict[str, Any], log_path: Path) -> dict[str, Any]:
+    observed = dict(request)
+    try:
+        with log_path.open("r", encoding="utf-8", errors="replace") as stream:
+            text = stream.read()
+    except OSError:
+        observed["backend_report_status"] = "TRAINING_LOG_UNAVAILABLE"
+        return observed
+    patterns = (r"(?:training\s+|train(?:ing)?\s+|input\s+|image\s+)?(?:resolution|size)\s*[:=]\s*(\d+)\s*[x×]\s*(\d+)",
+                r"(?:training\s+|train(?:ing)?\s+)(\d+)\s*[x×]\s*(\d+)")
+    for line in text.splitlines():
+        for pattern in patterns:
+            match = re.search(pattern, line, re.IGNORECASE)
+            if match:
+                observed["backend_reported_training_resolution"] = [int(match.group(1)), int(match.group(2))]
+                observed["backend_report_status"] = "REPORTED_IN_SPIRULA_LOG"
+                observed["backend_report_evidence"] = line.strip()[:500]
+                return observed
+    observed["backend_report_status"] = "NOT_REPORTED_BY_BACKEND"
+    observed["note"] = "Source image dimensions and configured divisor are recorded; Spirula did not emit a recognizable effective tensor size in its log."
+    return observed
+
+
 def _navigation_mode(config: dict) -> str:
     mode = config.get("integrations", {}).get("navigation", {}).get("mode", "adopt_existing")
     if mode not in {"adopt_existing", "generate_from_sfm"}:
@@ -617,9 +717,14 @@ def _navigation_source(root: Path, config: dict) -> tuple[dict[str, Any], dict[s
                              "coordinate_frame": "viewer", "classification": "GEOMETRY_SUPPORTED",
                              "source": "supplied precomputed floor-plane evidence"}
     else:
-        if not sfm_cfg.get("directory"):
-            raise WorkflowError("generate_from_sfm requires integrations.sfm.directory or a configured camera_centers artifact")
-        reconstruction_dir = project_path(root, config, sfm_cfg["directory"])
+        if sfm_cfg.get("directory"):
+            reconstruction_dir = project_path(root, config, sfm_cfg["directory"])
+        else:
+            sfm_summary = output_path(root, config) / "work" / "sfm-summary.json"
+            reconstruction_value = read_json(sfm_summary).get("reconstruction_directory") if sfm_summary.is_file() else None
+            if not reconstruction_value:
+                raise WorkflowError("generate_from_sfm requires integrations.sfm.directory or the validated fresh-SfM summary")
+            reconstruction_dir = Path(reconstruction_value).expanduser().resolve()
         trust = None
         if nav_cfg.get("trusted_pose_classification"):
             trust, paths = _navigation_input_value(root, config, nav_cfg["trusted_pose_classification"])
@@ -661,8 +766,19 @@ def _navigation_source(root: Path, config: dict) -> tuple[dict[str, Any], dict[s
 
 
 def execute_navigation_generation(root: Path, config: dict, state: ProjectState, output_dir: Path, execution_id: int) -> dict:
-    source, generation_config = _navigation_source(root, config)
-    proposal = generate_navigation(source, generation_config)
+    try:
+        source, generation_config = _navigation_source(root, config)
+        proposal = generate_navigation(source, generation_config)
+    except Exception as exc:
+        proposal = {"schema_version": "exhibition-archive.navigation-fallback.v1",
+                    "status": "NAVIGATION_UNVERIFIED", "regions": [],
+                    "coordinate_frame": {"source_frame": "COLMAP_WORLD", "up_axis": "UNSPECIFIED"},
+                    "coverage_assumptions": {"scene_type": config.get("integrations", {}).get("navigation", {}).get("scene_type", "auto"),
+                                              "boundary": "NOT_GENERATED", "physical_walls_or_ceiling_inferred": False},
+                    "review": {"status": "REQUIRED", "approved": False},
+                    "validation": {"status": "UNVERIFIED", "errors": [], "warnings": [str(exc)]},
+                    "reason": f"Automatic navigation proposal could not be generated: {exc}",
+                    "provenance": {"generator": "exhibition_archive.navigation", "generation_execution_id": execution_id}}
     current_fingerprint = state.stage("navigation").get("input_fingerprint") if state.stage("navigation") else None
     proposal["provenance"]["navigation_input_fingerprint"] = current_fingerprint
     proposal["provenance"]["generation_execution_id"] = execution_id
@@ -671,7 +787,15 @@ def execute_navigation_generation(root: Path, config: dict, state: ProjectState,
     proposal_path = proposal_dir / f"navigation-proposal-v{execution_id:06d}.json"
     review_path = proposal_dir / f"navigation-review-v{execution_id:06d}.html"
     write_json(proposal_path, proposal)
-    review_path.write_text(render_navigation_review_html(proposal), encoding="utf-8")
+    if proposal.get("schema_version") == "exhibition-archive.navigation-fallback.v1":
+        import html
+        review_path.write_text("<!doctype html><meta charset='utf-8'><title>Navigation unverified</title>"
+                               "<main style='font:16px system-ui;max-width:48rem;margin:3rem auto'>"
+                               "<h1>Navigation proposal unavailable</h1><p>Visitor navigation remains unverified. "
+                               "No scene boundary was inferred or published.</p><pre>" + html.escape(proposal["reason"]) +
+                               "</pre></main>", encoding="utf-8")
+    else:
+        review_path.write_text(render_navigation_review_html(proposal), encoding="utf-8")
     from .navigation_review import invalidate_navigation_approval
     invalidated = invalidate_navigation_approval(state, "A new generated navigation proposal replaced the previously approved artifact",
                                                  current_fingerprint)
@@ -685,15 +809,96 @@ def execute_navigation_generation(root: Path, config: dict, state: ProjectState,
                      ("navigation-approval", "PENDING", 1, utc_now(), json.dumps(gate_decision, sort_keys=True)))
     state.db.commit()
     summary_path = output_dir / "navigation-summary.json"
-    summary = {"status": proposal["status"], "proposal_id": proposal["id"], "envelope_id": proposal["id"], "proposal_path": str(proposal_path),
-               "review_path": str(review_path), "region_count": len(proposal["regions"]),
-               "trusted_camera_count": proposal["pose_evidence"]["used_camera_station_count"],
-               "excluded_pose_count": proposal["pose_evidence"]["excluded_pose_count"],
-               "validation": proposal["validation"], "publishing_ready": False,
+    pose_evidence = proposal.get("pose_evidence", {})
+    summary = {"status": proposal["status"], "proposal_id": proposal.get("id", f"unverified-{execution_id:06d}"),
+               "envelope_id": proposal.get("id"), "proposal_path": str(proposal_path),
+               "review_path": str(review_path), "region_count": len(proposal.get("regions", [])),
+               "trusted_camera_count": pose_evidence.get("used_camera_station_count", 0),
+               "excluded_pose_count": pose_evidence.get("excluded_pose_count", 0),
+               "validation": proposal.get("validation", {"status": "UNVERIFIED"}), "publishing_ready": False,
                "training_dependency": False, "sfm_dependency": True}
     write_json(summary_path, summary)
     return {"status": "NEEDS_REVIEW", "artifacts": [proposal_path, review_path, summary_path],
             "details": summary}
+
+
+def execute_lidar_inspection(root: Path, config: dict, output_dir: Path) -> dict:
+    """Inspect optional point clouds in their own cacheable stage."""
+    source = project_path(root, config, config["source"]["photo_directory"])
+    discovery = discover_input_files(source, hash_images=False)
+    discovery_path = output_path(root, config) / "inputs" / "discovery.json"
+    write_json(discovery_path, discovery)
+    lidar_dir = output_path(root, config) / "lidar"
+    # These are engine-owned previews. A changed or missing scan must never
+    # leave a prior preview visible as though it belonged to the new inputs.
+    for name in ("lidar-preview.ply", "aligned-cloud-preview.ply"):
+        (lidar_dir / name).unlink(missing_ok=True)
+    lidar_enabled = config.get("integrations", {}).get("lidar", {}).get("enabled", True)
+    if lidar_enabled:
+        report = inspect_optional_lidar(discovery, source, lidar_dir)
+    else:
+        report = inspect_optional_lidar({**discovery, "ply_files": [],
+                                         "raw_lidar_status": "DISABLED_BY_CONFIGURATION"},
+                                        source, lidar_dir)
+        report["inspection_status"] = "DISABLED_BY_CONFIGURATION"
+        write_json(lidar_dir / "inspection.json", report)
+    artifacts = [discovery_path, lidar_dir / "inspection.json"]
+    preview_path = lidar_dir / "lidar-preview.ply"
+    if preview_path.is_file():
+        artifacts.append(preview_path)
+    return {"status": "COMPLETED", "artifacts": artifacts,
+            "details": {"inspection_status": report.get("inspection_status"),
+                        "raw_lidar_status": report.get("selection_status"),
+                        "detected": report.get("detected", False),
+                        "inspection_report_path": str((lidar_dir / "inspection.json").resolve()),
+                        "discovery_report_path": str(discovery_path.resolve()),
+                        "photo_only_fallback_available": True}}
+
+
+def execute_lidar_registration(root: Path, config: dict, state: ProjectState, output_dir: Path) -> dict:
+    """Attempt bounded global registration; all optional alignment failures remain recoverable."""
+    target = output_path(root, config) / "lidar" / "alignment-report.json"
+    inspection_path = output_path(root, config) / "lidar" / "inspection.json"
+    (target.parent / "aligned-cloud-preview.ply").unlink(missing_ok=True)
+    inspection = read_json(inspection_path) if inspection_path.is_file() else {
+        "inspection_status": "NOT_DETECTED", "detected": False,
+        "alignment_attempted": False, "warnings": ["No LiDAR inspection report is available."]}
+    sfm_details = json.loads((state.stage("sfm") or {}).get("details_json") or "{}")
+    reconstruction_value = sfm_details.get("reconstruction_directory")
+    if not reconstruction_value:
+        sfm_cfg = config.get("integrations", {}).get("sfm", {})
+        if sfm_cfg.get("directory"):
+            reconstruction_value = str(project_path(root, config, sfm_cfg["directory"]))
+    reconstruction = Path(reconstruction_value).expanduser() if reconstruction_value else None
+    if reconstruction is None or not reconstruction.is_dir():
+        report = {"schema_version": "exhibition-archive.lidar-alignment.v1",
+                  "alignment_attempted": False, "status": "REJECTED", "accepted": False,
+                  "reason": "Validated SfM sparse geometry is unavailable; LiDAR is not consumed.",
+                  "training_consumed": False, "navigation_consumed": False}
+        write_json(target, report)
+    else:
+        try:
+            from .lidar import sample_colmap_sparse_points
+            points = sample_colmap_sparse_points(reconstruction, maximum=100_000)
+            report = attempt_similarity_alignment(inspection, points, target.parent)
+        except Exception as exc:
+            report = {"schema_version": "exhibition-archive.lidar-alignment.v1",
+                      "alignment_attempted": False, "status": "REJECTED", "accepted": False,
+                      "reason": f"Optional LiDAR registration could not prepare valid sparse geometry: {exc}",
+                      "training_consumed": False, "navigation_consumed": False}
+            write_json(target, report)
+    artifacts = [target]
+    aligned_preview = target.parent / "aligned-cloud-preview.ply"
+    if aligned_preview.is_file():
+        artifacts.append(aligned_preview)
+    return {"status": "COMPLETED", "artifacts": artifacts,
+            "details": {"alignment_status": report.get("status"),
+                        "alignment_attempted": report.get("alignment_attempted", False),
+                        "accepted": report.get("accepted", False),
+                        "training_consumed": report.get("training_consumed", False),
+                        "navigation_consumed": report.get("navigation_consumed", False),
+                        "alignment_report_path": str(target.resolve()),
+                        "reason": report.get("reason")}}
 
 
 def adopt_stage(root: Path, config: dict, state: ProjectState, stage_id: str, output_dir: Path) -> dict:
@@ -701,9 +906,19 @@ def adopt_stage(root: Path, config: dict, state: ProjectState, stage_id: str, ou
     output_dir.mkdir(parents=True, exist_ok=True)
     if stage_id == "photo_inventory":
         inventory = image_inventory(root, config, state)
+        from .input_prep import materialize_image_only_dataset
+        normalized_images = materialize_image_only_dataset(root, config, inventory)
+        if normalized_images:
+            inventory["normalized_image_dataset"] = normalized_images
         target = output_dir / "source-index.json"
         write_json(target, inventory)
-        return {"status": "COMPLETED", "artifacts": [target], "details": {"image_count": inventory["image_count"], "source_is_read_only": True, "adopted_inventory_rows": bool(i.get("preflight", {}).get("image_inventory"))}}
+        artifacts = [target]
+        if normalized_images:
+            artifacts.append(Path(normalized_images["manifest_path"]))
+        return {"status": "COMPLETED", "artifacts": artifacts,
+                "details": {"image_count": inventory["image_count"], "source_is_read_only": True,
+                            "adopted_inventory_rows": bool(i.get("preflight", {}).get("image_inventory")),
+                            "normalized_image_dataset": normalized_images}}
     if stage_id == "capture_preflight":
         cfg = i.get("preflight", {})
         if not cfg:
@@ -1059,12 +1274,15 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
         raise BackendError("Prepared training dataset does not exactly match the selected COLMAP registered-image membership",
                            failure_kind="INVALID_INPUT", details={"expected_count": len(registered_names),
                                                                     "actual_count": len(materialized_names)})
+    resolution_request = _training_resolution_request(training_dataset / "images", int(cfg.get("resolution_divisor", 1)))
     selected_formats = materialized_images["formats"]
     source_names = set(source_by_name)
     excluded_names = sorted(source_names - set(registered_names))
     run_name = resume_output_dir.name if resume_output_dir else f"{config['project_id']}-attempt-{execution_id:04d}"
     command = build_training_command(Path(capabilities["tool"]["executable"]), training_dataset, attempt, cfg, capabilities, run_name,
                                      resume_output_dir)
+    effective_training_configuration = training_preset_configuration(
+        Path(capabilities["tool"]["executable"]), cfg["preset"], cfg.get("quality", "high"), command)
     backend_output_dir = resume_output_dir or (attempt / "outputs" / run_name)
     checkpoint_root = resume_output_dir or (attempt / "outputs")
     checkpoint_policy = {"steps_per_save": cfg.get("steps_per_save", 100),
@@ -1097,6 +1315,8 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
         "excluded_source_image_count": len(excluded_names),
         "excluded_source_images": [{"relative_path": name, "sha256": source_by_name[name]["sha256"]} for name in excluded_names],
         "formats": selected_formats,
+        "training_resolution": resolution_request,
+        "effective_training_configuration": effective_training_configuration,
         "images": selected_source_rows,
         "image_derivative_provenance": derivative_provenance,
         "reconstruction_directory": str(reconstruction.resolve()),
@@ -1114,7 +1334,7 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     write_json(manifest_path, training_manifest)
     input_validation_path = attempt / "training-input-validation.json"
     write_json(input_validation_path, input_validation)
-    command_record = {"stage": "training", "attempt_id": attempt.name, "engine_execution_id": execution_id, "backend_version": capabilities["tool"]["version"], "run_name": run_name, "run_type": cfg["run_type"], "configuration": {k:v for k,v in cfg.items() if k not in {"environment_overrides"}}, "command": command, "cwd": str(attempt.resolve()), "environment_override_keys": sorted(env_overrides), "resource_check": resources, "resource_limits": training_limits, "checkpoint_policy": checkpoint_policy, "resume_checkpoint_identity": resume_identity, "expected_output_prefix": str(backend_output_dir.resolve()), "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "started_at_utc": utc_now(), "artifact_discovery_status": "NOT_STARTED", "validation_result": {"status": "NOT_RUN"}}
+    command_record = {"stage": "training", "attempt_id": attempt.name, "engine_execution_id": execution_id, "backend_version": capabilities["tool"]["version"], "run_name": run_name, "run_type": cfg["run_type"], "configuration": {k:v for k,v in cfg.items() if k not in {"environment_overrides"}}, "effective_training_configuration": effective_training_configuration, "training_resolution": resolution_request, "command": command, "cwd": str(attempt.resolve()), "environment_override_keys": sorted(env_overrides), "resource_check": resources, "resource_limits": training_limits, "checkpoint_policy": checkpoint_policy, "resume_checkpoint_identity": resume_identity, "expected_output_prefix": str(backend_output_dir.resolve()), "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "started_at_utc": utc_now(), "artifact_discovery_status": "NOT_STARTED", "validation_result": {"status": "NOT_RUN"}}
     write_json(attempt / "command.json", command_record)
     if not authorization_plan_id:
         raise AuthorizationRequired("training", "Fresh training execution requires an explicit one-time authorization. Run plan --full-hash, then authorize the displayed plan_id.")
@@ -1124,6 +1344,8 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
                                checkpoint_root=checkpoint_root,
                                minimum_free_disk_bytes=training_limits["minimum_free_disk_bytes_training"])
     command_record = read_json(attempt / "command.json")
+    training_resolution = _training_resolution_from_log(resolution_request, Path(execution["log_path"]))
+    command_record["training_resolution"] = training_resolution
     from .backends import discover_checkpoints
     checkpoints = discover_checkpoints(checkpoint_root)
     candidates = discover_model_files(backend_output_dir, cfg.get("artifact_selector"))
@@ -1150,12 +1372,14 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
                   "status": "MODEL_VALIDATED", "model_status": model_validation["smoke_test_marker"] or "UNREVIEWED_CANDIDATE",
                   "public_selection_allowed": False, "backend": "spirula", "backend_version": capabilities["tool"]["version"],
                   "elapsed_seconds": execution["elapsed_seconds"], "exit_code": execution["exit_code"], "log_path": execution["log_path"],
-                  "command": command, "configuration": command_record["configuration"], "resource_check": resources,
+                  "command": command, "configuration": command_record["configuration"],
+                  "effective_training_configuration": effective_training_configuration, "resource_check": resources,
                   "resource_limits": training_limits, "checkpoint_policy": checkpoint_policy,
                   "resume_checkpoint_identity": resume_identity,
                   "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "checkpoint_resume_execution_status": "NOT_TESTED",
                   "discovered_checkpoints": checkpoints,
                   "model": model_validation, "input_manifest": str(manifest_path.resolve()), "input_validation_report": str(input_validation_path.resolve()),
+                  "training_resolution": training_resolution,
                   "sfm_input_quality_gate": input_validation["quality_gate"],
                   "sfm_input_warnings": input_validation["warnings"],
                   "sfm_current_revalidation_quality_gate": input_validation["current_revalidation_quality_gate"],
@@ -1172,7 +1396,7 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     artifacts = [model_path, validation_path, run_path, manifest_path, input_validation_path, attempt / "command.json", attempt / "spirula.log"]
     return {"status": "COMPLETED", "artifacts": artifacts,
             "artifact_types": {str(path): ("3dgs-ply" if path.suffix.casefold() == ".ply" else ("text" if path.suffix == ".log" else "json")) for path in artifacts},
-            "details": {"model_status": run_report["model_status"], "run_type": cfg["run_type"], "public_selection_allowed": False, "model_path": str(model_path.resolve()), "model_sha256": model_validation["sha256"], "gaussian_count": model_validation["gaussian_count"], "file_bytes": model_validation["file_bytes"], "validation_path": str(validation_path.resolve()), "training_run_path": str(run_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "backend_version": capabilities["tool"]["version"], "training_iterations_requested": cfg["iterations"], "training_progress": "FINAL_EXIT_ONLY; intermediate progress is available only in the log", "checkpoint_resume_execution_status": "NOT_TESTED", "discovered_checkpoints": checkpoints, "sfm_component_id": sfm_scope["component_id"], "sfm_component_acceptance_audit_identity": (sfm_scope["acceptance"] or {}).get("audit_identity"), "training_registered_image_count": len(selected_source_rows), "training_source_directory_image_count": dataset_images["image_count"]}}
+            "details": {"model_status": run_report["model_status"], "run_type": cfg["run_type"], "public_selection_allowed": False, "model_path": str(model_path.resolve()), "model_sha256": model_validation["sha256"], "gaussian_count": model_validation["gaussian_count"], "file_bytes": model_validation["file_bytes"], "validation_path": str(validation_path.resolve()), "training_run_path": str(run_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "backend_version": capabilities["tool"]["version"], "training_iterations_requested": cfg["iterations"], "training_effective_configuration_status": effective_training_configuration["status"], "training_effective_configuration_sha256": json_digest(effective_training_configuration), "training_resolution": training_resolution, "training_progress": "FINAL_EXIT_ONLY; intermediate progress is available only in the log", "checkpoint_resume_execution_status": "NOT_TESTED", "discovered_checkpoints": checkpoints, "sfm_component_id": sfm_scope["component_id"], "sfm_component_acceptance_audit_identity": (sfm_scope["acceptance"] or {}).get("audit_identity"), "training_registered_image_count": len(selected_source_rows), "training_source_directory_image_count": dataset_images["image_count"]}}
 
 
 def fresh_evaluation_stage(root: Path, config: dict, state: ProjectState, output_dir: Path) -> dict:
@@ -1470,8 +1694,11 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
                 except (BackendError, KeyError, TypeError, ValueError) as exc:
                     readiness = f"BLOCKED_BACKEND_CONFIGURATION:{exc}"
             if sid == "navigation" and has_cfg and configured_mode == "generate_from_sfm":
-                if not group_cfg.get("camera_centers") and not integration.get("sfm", {}).get("directory"):
+                fresh_sfm = integration.get("sfm", {}).get("mode") == "spirula_fresh"
+                if not group_cfg.get("camera_centers") and not integration.get("sfm", {}).get("directory") and not fresh_sfm:
                     readiness = "BLOCKED_NO_CAMERA_POSE_SOURCE"
+                elif group_cfg.get("scene_type") == "outdoor":
+                    readiness = "READY_OPEN_AIR_CAMERA_COVERAGE_REQUIRES_REVIEW"
                 elif not group_cfg.get("floor_plane") and not group_cfg.get("camera_centers"):
                     readiness = "REVIEW_REQUIRED_FLOOR_PLANE_NOT_CONFIGURED"
                 else:
@@ -1521,6 +1748,8 @@ def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str,
         result = prepare_spirula_dataset(root, config, inventory)
         manifest = Path(result["manifest_path"])
         return {"status": "COMPLETED", "artifacts": [manifest], "details": result["details"]}
+    if stage_id == "lidar_inspection":
+        return execute_lidar_inspection(root, config, output_dir)
     if stage_id in {"photo_inventory", "capture_preflight", "artwork_association", "sfm", "training", "evaluation", "navigation"}:
         if stage_id == "sfm": return execute_fresh_sfm(root, config, state, output_dir, execution_id, authorization_plan_id)
         if stage_id == "training": return execute_fresh_training(root, config, state, output_dir, execution_id, authorization_plan_id)
@@ -1529,6 +1758,11 @@ def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str,
         if stage_id == "navigation" and _navigation_mode(config) == "generate_from_sfm":
             return execute_navigation_generation(root, config, state, output_dir, execution_id)
         return adopt_stage(root, config, state, stage_id, output_dir)
+    if stage_id == "lidar_registration":
+        return execute_lidar_registration(root, config, state, output_dir)
+    if stage_id == "first_visual":
+        from .preview import build_first_visual_preview
+        return build_first_visual_preview(root, config, state, output_dir, execution_id)
     if stage_id == "viewer_package":
         from .publisher import build_website
         details = build_website(root, config, state, output_dir)
@@ -1553,7 +1787,7 @@ def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str,
 
 def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = False, force_hash: bool = False,
                  fail_at: str | None = None, authorization_ids: list[str] | None = None,
-                 package_only: bool = False) -> dict:
+                 package_only: bool = False, stop_after_stage: str | None = None) -> dict:
     if config.get("diagnostic_policy", {}).get("mode") == "SMOKE_TEST_ONLY":
         raise WorkflowError("This isolated diagnostic project cannot run the production workflow DAG; use the explicit diagnostic smoke-training command.")
     from .backends import reconcile_running_stage
@@ -1587,6 +1821,14 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
     try:
         for stage in STAGES:
             sid = stage["id"]
+            if sid == "first_visual" and stop_after_stage != "first_visual":
+                summary["skipped"].append(sid)
+                summary["stages"][sid] = "SKIPPED_NOT_REQUESTED"
+                continue
+            if package_only and sid in {"lidar_inspection", "lidar_registration", "first_visual"}:
+                summary["skipped"].append(sid)
+                summary["stages"][sid] = "SKIPPED_PACKAGE_ONLY"
+                continue
             if package_only and sid not in {"viewer_package", "archive_package", "verification"}:
                 if sid == "sfm_dataset_prep" and not auto_preparation_required(root, config):
                     summary["skipped"].append(sid)
@@ -1609,6 +1851,10 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 if scoped_sfm_training and scoped_sfm_training["conditional_scope"]:
                     blocked.remove("sfm")
             if blocked:
+                if sid == "lidar_registration" and "sfm" in blocked and scoped_sfm_training:
+                    summary["skipped"].append(sid)
+                    summary["stages"][sid] = "SKIPPED_SFM_COMPONENT_REVIEW_SCOPE"
+                    continue
                 if sid == "navigation" and "sfm" in blocked and scoped_sfm_training:
                     summary["skipped"].append(sid)
                     summary["stages"][sid] = "SKIPPED_OUTSIDE_SFM_ACCEPTANCE_SCOPE"
@@ -1671,7 +1917,14 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 )
             if prior and prior.get("input_fingerprint") == fp and prior.get("status") in {"COMPLETED", "ADOPTED"} and _stage_artifacts_valid(state, sid, stage_root):
                 summary["skipped"].append(sid); summary["stages"][sid] = "SKIPPED_VALID_CACHE"
+                if sid == stop_after_stage:
+                    summary["status"] = "AWAITING_VISUAL_REVIEW"
+                    summary["stop_reason"] = "The requested first-visual Visitor output is ready for human review."
+                    state.end_run(run_id, summary["status"], summary)
+                    return summary
                 if sid == "training" and scoped_sfm_training:
+                    if stop_after_stage == "first_visual":
+                        continue
                     message = "The accepted SfM scope permits experimental training only; downstream model evaluation, navigation, archive packaging, and publication remain outside this run."
                     summary["status"] = "NEEDS_REVIEW"
                     summary["stop_reason"] = message
@@ -1762,6 +2015,11 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 if status == "ADOPTED": summary["adopted"].append(sid)
                 elif status == "NEEDS_REVIEW": summary["needs_review"].append(sid)
                 else: summary["completed"].append(sid)
+                if sid == stop_after_stage:
+                    summary["status"] = "AWAITING_VISUAL_REVIEW"
+                    summary["stop_reason"] = "The requested first-visual Reviewer and Visitor outputs are ready for human review."
+                    state.end_run(run_id, summary["status"], summary)
+                    return summary
                 if status == "NEEDS_REVIEW":
                     # Navigation is independent of Gaussian training. Preserve the
                     # review gate for publication while allowing configured model
@@ -1772,6 +2030,8 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                     state.end_run(run_id, "NEEDS_REVIEW", summary)
                     return summary
                 if sid == "training" and scoped_sfm_training:
+                    if stop_after_stage == "first_visual":
+                        continue
                     message = "The accepted SfM scope permits experimental training only; downstream model evaluation, navigation, archive packaging, and publication remain outside this run."
                     summary["status"] = "NEEDS_REVIEW"
                     summary["stop_reason"] = message

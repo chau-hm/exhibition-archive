@@ -279,7 +279,7 @@ async function openModel(format, settings) {
     contentUrl: model.url,
     contentFilename: model.filename,
     collisionUrl: (__EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__ && new URLSearchParams(location.search).get('collision') === 'off')
-      ? undefined : metadata.collision.url,
+      ? undefined : metadata.collision?.url,
     contents: Promise.resolve(response),
     renderer: 'webgpu',
     ui: false,

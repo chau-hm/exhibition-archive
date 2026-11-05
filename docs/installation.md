@@ -59,3 +59,7 @@ Do not put venue datasets, runtime SQLite databases, or generated packages in th
 ~~~
 
 Run the command's --help for exact options. Only the Engine can determine current stage readiness and whether existing artifacts remain valid.
+
+## One-command first-visual workflow
+
+For a new photo folder with an optional raw point-cloud PLY, use `run --input ... --output ... --project-id ... --profile first-visual --until visitor`. Start with `--dry-run`; the folder-based path validates the installed Spirula commands and bundled viewer before creating a workspace. Fresh SfM and training remain separately gated by the existing exact-plan authorization policy. The complete local runbook, checkpoint locations, resume conditions, and expected Reviewer/Visitor paths are in [the playground Engine readiness report](experiments/playground-engine-readiness.md).

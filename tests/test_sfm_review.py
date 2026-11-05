@@ -253,7 +253,9 @@ class SfmReviewTests(unittest.TestCase):
         self.accept("0")
         training = next(row for row in plan(self.root, self.config, self.state) if row["id"] == "training")
         self.assertEqual(training["readiness"], "READY_EXPERIMENTAL_TRAINING_WITH_SCOPED_ACCEPTANCE")
-        execution_plan = expensive_execution_plan(self.root, self.config, self.state, "training", backend_info=BACKEND)
+        with patch("exhibition_archive.workflow.training_preset_configuration",
+                   return_value={"status": "CAPTURED", "effective_parameters": {"--quality": "high"}}):
+            execution_plan = expensive_execution_plan(self.root, self.config, self.state, "training", backend_info=BACKEND)
         self.assertEqual(execution_plan["source_image_count"], 8)
         self.assertEqual(execution_plan["source_directory_image_count"], 12)
         self.assertEqual(execution_plan["sfm_component_scope"]["component_id"], "0")
@@ -265,7 +267,9 @@ class SfmReviewTests(unittest.TestCase):
         self.make_sfm()
         self.accept("0")
         with patch("exhibition_archive.workflow.STAGES", [SFM_STAGE, NAVIGATION_STAGE, TRAINING_STAGE]), \
-             patch("exhibition_archive.backends.discover_environment", return_value=BACKEND):
+             patch("exhibition_archive.backends.discover_environment", return_value=BACKEND), \
+             patch("exhibition_archive.workflow.training_preset_configuration",
+                   return_value={"status": "CAPTURED", "effective_parameters": {"--quality": "high"}}):
             result = run_workflow(self.root, self.config, self.state)
         self.assertEqual(result["status"], "AUTHORIZATION_REQUIRED")
         self.assertEqual(result["stages"]["sfm"], "RETAINED_NEEDS_REVIEW_WITH_TRAINING_SCOPE")
