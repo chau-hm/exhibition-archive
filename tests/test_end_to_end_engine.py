@@ -490,6 +490,54 @@ def test_workflow_resumes_after_stage_failure_and_stops_at_first_visual(tmp_path
         state.close()
 
 
+def test_resume_after_export_failure_reuses_completed_sfm_cache(tmp_path):
+    import exhibition_archive.workflow as workflow
+
+    source = tmp_path / "source"
+    source.mkdir()
+    (source / "photo.jpg").write_bytes(b"photo bytes")
+    root = tmp_path / "project"
+    config = {"project_id": "export-resume-fixture", "source": {"photo_directory": str(source)},
+              "output_directory": "output",
+              "integrations": {"sfm": {"mode": "adopt_existing"},
+                               "model": {"mode": "adopt_existing"}},
+              "resource_policy": {}, "retry_policy": {"max_failed_attempts": 2}}
+    stage_defs = [{"id": "photo_inventory", "deps": []},
+                  {"id": "sfm", "deps": ["photo_inventory"]},
+                  {"id": "sfm_studio_export", "deps": ["photo_inventory", "sfm"]},
+                  {"id": "training", "deps": ["sfm"]},
+                  {"id": "first_visual", "deps": ["training"]}]
+    state = ProjectState(root)
+    calls = {stage_id: 0 for stage_id in ("photo_inventory", "sfm", "sfm_studio_export", "training", "first_visual")}
+
+    def fake_execute(_root, _config, _state, stage_id, output_dir, _execution_id, *_args):
+        calls[stage_id] += 1
+        output_dir.mkdir(parents=True, exist_ok=True)
+        if stage_id == "sfm_studio_export" and calls[stage_id] == 1:
+            # Simulates the prior report serialization failure after the SfM cache is durable.
+            raise TypeError("Object of type PosixPath is not JSON serializable")
+        target = output_dir / f"{stage_id}.json"
+        target.write_text(json.dumps({"stage": stage_id}))
+        return {"status": "COMPLETED", "artifacts": [target], "details": {"stage": stage_id}}
+
+    try:
+        with patch.object(workflow, "STAGES", stage_defs), patch.object(workflow, "_execute_stage", side_effect=fake_execute):
+            with pytest.raises(TypeError, match="PosixPath is not JSON serializable"):
+                run_workflow(root, config, state, stop_after_stage="first_visual")
+            assert state.stage("sfm")["status"] == "COMPLETED"
+            assert state.stage("sfm_studio_export")["status"] == "FAILED"
+
+            resumed = run_workflow(root, config, state, resume=True, stop_after_stage="first_visual")
+
+        assert resumed["status"] == "AWAITING_VISUAL_REVIEW"
+        assert calls["sfm"] == 1
+        assert calls["sfm_studio_export"] == 2
+        assert resumed["stages"]["sfm"] == "SKIPPED_VALID_CACHE"
+        assert resumed["stages"]["sfm_studio_export"] == "COMPLETED"
+    finally:
+        state.close()
+
+
 def test_end_to_end_stage_dependencies_keep_photos_primary_and_preview_last():
     stages = {stage["id"]: stage for stage in STAGES}
     assert stages["sfm"]["deps"] == ["photo_inventory"]

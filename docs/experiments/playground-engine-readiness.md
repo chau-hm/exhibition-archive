@@ -58,6 +58,8 @@ The earlier SfM output split the registered JPEG dataset and the `workspace/spar
 
 Automated checks validate all registered image names, content hashes, image dimensions against camera records, camera references, sparse artifacts, and package relocation. The test suite marks GUI status `NOT_GUI_VERIFIED`; no GUI round-trip is claimed. On the next local run, the user must open the exported package in Spirula Studio and verify that registered photos and sparse geometry load without starting a new reconstruction.
 
+The Engine stage report uses an explicit JSON-safe schema with artifact paths relative to the configured output root; it does not stringify arbitrary objects. A content-addressed hidden staging directory retains and revalidates completed copies after interruption, while a fully published package is reused on retry without copying its JPEGs again.
+
 ## LiDAR behavior and current limits
 
 The Engine records point count, coordinate bounds, PLY encoding and properties, RGB/normals, invalid values, sampled outlier diagnostics, and header-declared units when present. Units otherwise remain unknown. It streams point records and writes a bounded preview rather than retaining the input cloud in memory.
@@ -84,7 +86,7 @@ The private first-visual Visitor uses the bundled SuperSplat runtime and the act
 
 ## Safe validation results
 
-The lightweight regression suite passed: 156 tests and 3 subtests, with one warning from the installed Dash pytest plugin about its deprecated hook configuration. `compileall`, `uv lock --check`, and the real input-directory `--dry-run --json` check also passed. The dry run found 77 HEIC images and one unambiguous ASCII RGB PLY; Open3D is installed but fails to import because `libusb-1.0.0.dylib` is missing. It confirmed that photo-only processing remains available, reported optional LiDAR registration as unavailable, and did not create the requested output directory. No real SfM, DepthEye registration, 3DGS training, model-backed viewer generation, or GUI import was performed in Codex; synthetic HTML construction remains covered by tests.
+The lightweight regression suite passed: 161 tests and 3 subtests, with one warning from the installed Dash pytest plugin about its deprecated hook configuration. `compileall`, `uv lock --check`, and the real input-directory `--dry-run --json` check also passed. The dry run found 77 HEIC images and one unambiguous ASCII RGB PLY; Open3D is installed but fails to import because `libusb-1.0.0.dylib` is missing. It confirmed that photo-only processing remains available, reported optional LiDAR registration as unavailable, and did not create the requested output directory. No real SfM, DepthEye registration, 3DGS training, model-backed viewer generation, or GUI import was performed in Codex; synthetic HTML construction remains covered by tests.
 
 The structural export and synthetic tests do **not** establish Spirula GUI reopening, real LiDAR registration quality, training success, model fidelity, or browser/WebGPU compatibility. No actual playground model has been generated in this phase.
 

@@ -1032,7 +1032,8 @@ def execute_sfm_studio_export(root: Path, config: dict, state: ProjectState,
     output_dir.mkdir(parents=True, exist_ok=True)
     report_path = output_dir / "export-report.json"
     try:
-        from .studio_export import export_spirula_colmap_dataset
+        from .studio_export import (build_studio_export_stage_report,
+                                    export_spirula_colmap_dataset)
         sfm_details = json.loads((state.stage("sfm") or {}).get("details_json") or "{}")
         reconstruction_value = (sfm_details.get("reconstruction_directory") or
                                 config.get("integrations", {}).get("sfm", {}).get("directory"))
@@ -1052,8 +1053,8 @@ def execute_sfm_studio_export(root: Path, config: dict, state: ProjectState,
         result = export_spirula_colmap_dataset(
             image_directory, reconstruction, output_path(root, config) / "sfm" / "spirula-studio-export",
             project_id=config["project_id"], source_provenance=provenance)
-        write_json(report_path, {"schema_version": "exhibition-archive.spirula-export-stage.v1", **result,
-                                 "gui_reopen_status": "NOT_GUI_VERIFIED"})
+        report = build_studio_export_stage_report(result, output_path(root, config))
+        write_json(report_path, report)
         return {"status": "COMPLETED", "artifacts": [*result["artifacts"], report_path],
                 "details": {"export_status": result["status"],
                             "package_directory": result["package_directory"],
