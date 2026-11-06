@@ -9,6 +9,7 @@ import shutil
 import signal
 import struct
 import subprocess
+import sys
 import time
 from datetime import datetime, timezone
 from pathlib import Path, PurePosixPath
@@ -426,7 +427,9 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
             camera_centers.append({"image_name": name, "xyz_sfm_units": center})
             images[image_id] = {"name": name, "camera_id": camera_id, "points2d": n_points2d,
                                 "pose": pose, "rotation": _rotation_from_colmap_pose(pose),
-                                "quaternion_norm": qnorm}
+                                "quaternion_norm": qnorm,
+                                "camera_width": cameras[camera_id]["width"],
+                                "camera_height": cameras[camera_id]["height"]}
             image_observations[image_id] = observations
             names.add(name)
         if stream.read(1): raise BackendError("Unexpected trailing bytes in images.bin", failure_kind="SFM_INVALID")
@@ -574,6 +577,9 @@ def _parse_colmap(directory: Path, image_inventory_rows: list[dict] | None = Non
         "format": "COLMAP_BINARY", "directory": str(directory.resolve()), "camera_count": len(cameras),
         "registered_image_count": len(images), "sparse_point_count": len(points),
         "camera_model_ids": sorted({x["model_id"] for x in cameras.values()}),
+        "registered_images": [{"name": row["name"], "camera_id": row["camera_id"],
+                               "width": row["camera_width"], "height": row["camera_height"]}
+                              for row in images.values()],
         "all_camera_parameters_finite": True, "all_camera_references_resolve": True,
         "all_image_poses_finite": True, "all_3d_points_finite": True,
         "registered_image_names": [x["name"] for x in images.values()], "camera_centers": camera_centers,
@@ -966,6 +972,9 @@ def execute_process(
     poll_interval: float = 1.0,
     checkpoint_root: Path | None = None,
     minimum_free_disk_bytes: int | None = None,
+    progress_format: str = "text",
+    verbose: bool = False,
+    progress_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not command or not all(isinstance(x, str) for x in command):
         raise BackendError("Subprocess command must be a non-empty string argument array", failure_kind="INVALID_COMMAND")
@@ -973,6 +982,8 @@ def execute_process(
         raise BackendError("poll_interval_seconds must be between 0.1 and 5", failure_kind="INVALID_CONFIGURATION")
     if minimum_free_disk_bytes is not None and (minimum_free_disk_bytes < 1 or checkpoint_root is None):
         raise BackendError("Runtime disk monitoring requires a positive floor and checkpoint/output path", failure_kind="INVALID_CONFIGURATION")
+    if progress_format not in {"text", "jsonl", "off"}:
+        raise BackendError("progress_format must be text, jsonl, or off", failure_kind="INVALID_CONFIGURATION")
     if not cwd.is_dir(): raise BackendError(f"Subprocess working directory is missing: {cwd}", failure_kind="UNSAFE_OUTPUT")
     if log_path.exists(): raise BackendError(f"Refusing to overwrite an existing process log: {log_path}", failure_kind="UNSAFE_OUTPUT")
     env = os.environ.copy()
@@ -983,6 +994,44 @@ def execute_process(
     started = time.monotonic()
     process = None
     returncode = None
+    from .progress import (IncrementalLogReader, SpirulaProgressParser, append_event,
+                          format_event, make_event)
+    reader = IncrementalLogReader()
+    parser = SpirulaProgressParser(stage_id, progress_context)
+    progress_path = log_path.parent / "progress.jsonl"
+    if progress_path.exists():
+        raise BackendError(f"Refusing to overwrite an existing progress event log: {progress_path}", failure_kind="UNSAFE_OUTPUT")
+    current_progress: dict[str, Any] | None = None
+    last_checkpoints: list[dict[str, Any]] | None = None
+    last_printed: dict[str, float] = {}
+    last_heartbeat = started
+
+    def emit_progress(event: dict[str, Any], *, force: bool = False) -> None:
+        name = event.get("event", "unknown")
+        now = time.monotonic()
+        interval = 15.0 if name in {"sfm_bundle_adjustment", "sfm_mapping", "sfm_image_extraction",
+                                    "stage_process_heartbeat"} else (5.0 if name == "training_iteration" else 0.0)
+        if not force and interval and now - last_printed.get(name, 0.0) < interval:
+            return
+        last_printed[name] = now
+        append_event(progress_path, event)
+        if progress_format == "jsonl":
+            print(json.dumps(event, sort_keys=True, ensure_ascii=False), file=sys.stderr, flush=True)
+        elif progress_format == "text" and name != "sfm_bundle_adjustment":
+            print(format_event(event), file=sys.stderr, flush=True)
+
+    def consume_log_lines(lines: list[str]) -> None:
+        nonlocal current_progress
+        for line in lines:
+            if verbose and progress_format != "off":
+                print(f"[{stage_id}:backend] {line}", file=sys.stderr, flush=True)
+            parsed = parser.parse(line)
+            if parsed:
+                current_progress = parsed
+                parsed_event = parsed["event"]
+                emit_progress(make_event(stage_id, parsed_event,
+                                         **{key: value for key, value in parsed.items() if key != "event"}))
+
     try:
         with log_path.open("xb") as log:
             process = subprocess.Popen(command, cwd=cwd, env=env, stdin=subprocess.DEVNULL, stdout=log, stderr=subprocess.STDOUT,
@@ -1000,10 +1049,24 @@ def execute_process(
                                          log_path=str(log_path.resolve()), details={"process_state": "RUNNING", "launched_at_utc": launched_at, "environment_override_keys": sorted(overrides), "runtime_free_disk_floor_bytes": minimum_free_disk_bytes})
             current = state.stage(stage_id) or {}
             state.set_stage(stage_id, "RUNNING", current.get("input_fingerprint"), None, execution_id, {"process_state": "RUNNING", "pid": process.pid, "command": command, "workdir": str(cwd.resolve()), "log_path": str(log_path.resolve()), "started_monotonic": started})
+            position = {"photo_inventory": 1, "lidar_inspection": 2, "capture_preflight": 3,
+                        "sfm_dataset_prep": 4, "artwork_association": 5, "sfm": 6,
+                        "sfm_studio_export": 7, "lidar_registration": 8,
+                        "navigation": 9, "training": 10, "first_visual": 11}.get(stage_id)
+            emit_progress(make_event(stage_id, "stage_process_started", pipeline_stage_number=position,
+                                     pipeline_stage_total=11, command=command, workdir=str(cwd.resolve()),
+                                     output_log=str(log_path.resolve())), force=True)
             last_update = started
             runtime_free_bytes = None
             while process.poll() is None:
                 now = time.monotonic()
+                consume_log_lines(reader.read(log_path))
+                if now - last_heartbeat >= 15.0:
+                    emit_progress(make_event(stage_id, "stage_process_heartbeat",
+                                             elapsed_seconds=round(now - started, 2),
+                                             progress=current_progress,
+                                             checkpoint_count=len(last_checkpoints or [])))
+                    last_heartbeat = now
                 if minimum_free_disk_bytes is not None:
                     disk_probe_path = checkpoint_root
                     while not disk_probe_path.exists() and disk_probe_path != disk_probe_path.parent:
@@ -1033,19 +1096,27 @@ def execute_process(
                 if now - last_update >= max(1.0, poll_interval):
                     elapsed = round(now-started, 2)
                     checkpoints = discover_checkpoints(checkpoint_root) if checkpoint_root else []
-                    recent_lines = []
-                    try:
-                        from collections import deque
-                        with log_path.open("r", encoding="utf-8", errors="replace") as log_reader:
-                            recent_lines = [line.rstrip("\r\n") for line in deque(log_reader, maxlen=8)]
-                    except OSError:
-                        pass
+                    recent_lines = list(reader.recent_lines)
+                    if current_progress is not None:
+                        current_progress = {**current_progress, "elapsed_seconds": elapsed}
+                    if checkpoint_root:
+                        current_checkpoints = discover_checkpoints(checkpoint_root)
+                        if current_checkpoints != last_checkpoints:
+                            emit_progress(make_event(stage_id, "checkpoint_state", candidates=current_checkpoints,
+                                                     elapsed_seconds=elapsed), force=True)
+                            last_checkpoints = current_checkpoints
+                    else:
+                        current_checkpoints = []
                     current = state.stage(stage_id) or {}
-                    state.set_stage(stage_id, "RUNNING", current.get("input_fingerprint"), None, execution_id, {"process_state": "RUNNING", "pid": process.pid, "command": command, "workdir": str(cwd.resolve()), "log_path": str(log_path.resolve()), "elapsed_seconds": elapsed, "progress": "UNKNOWN_NOT_REPORTED_BY_BACKEND", "recent_log_lines": recent_lines, "checkpoint_candidates": checkpoints, "runtime_free_disk_bytes": runtime_free_bytes, "runtime_free_disk_floor_bytes": minimum_free_disk_bytes})
-                    state.update_stage_execution(execution_id, details={"elapsed_seconds": elapsed, "checkpoint_candidates": checkpoints, "recent_log_lines": recent_lines, "runtime_free_disk_bytes": runtime_free_bytes, "runtime_free_disk_floor_bytes": minimum_free_disk_bytes})
+                    state.set_stage(stage_id, "RUNNING", current.get("input_fingerprint"), None, execution_id, {"process_state": "RUNNING", "pid": process.pid, "command": command, "workdir": str(cwd.resolve()), "log_path": str(log_path.resolve()), "progress_event_log": str(progress_path.resolve()), "elapsed_seconds": elapsed, "progress": current_progress or {"status": "UNKNOWN_NOT_REPORTED_BY_BACKEND", "eta": "unavailable"}, "recent_log_lines": recent_lines, "checkpoint_candidates": current_checkpoints, "runtime_free_disk_bytes": runtime_free_bytes, "runtime_free_disk_floor_bytes": minimum_free_disk_bytes})
+                    state.update_stage_execution(execution_id, details={"elapsed_seconds": elapsed, "checkpoint_candidates": current_checkpoints, "recent_log_lines": recent_lines, "current_progress": current_progress, "progress_event_log": str(progress_path.resolve()), "runtime_free_disk_bytes": runtime_free_bytes, "runtime_free_disk_floor_bytes": minimum_free_disk_bytes})
                     last_update = now
                 time.sleep(poll_interval)
             returncode = process.wait()
+            consume_log_lines(reader.read(log_path))
+            if reader.partial:
+                consume_log_lines([reader.partial.decode("utf-8", errors="replace")])
+                reader.partial = b""
             log.flush()
             os.fsync(log.fileno())
     except KeyboardInterrupt as exc:
@@ -1153,7 +1224,14 @@ def execute_process(
         elapsed_seconds=elapsed, artifact_discovery_status="PENDING", validation_result={"status": validation_status},
         details={"checkpoint_candidates": checkpoints, "backend_partial_output": partial_sfm_output})
     state.update_stage_execution(execution_id, details={"process_state": terminal_state, "ended_at_utc": datetime.now(timezone.utc).isoformat().replace("+00:00", "Z"), "exit_code": returncode, "elapsed_seconds": elapsed, "checkpoint_candidates": checkpoints, "backend_partial_output": partial_sfm_output})
-    return {"pid": process.pid, "exit_code": returncode, "elapsed_seconds": elapsed, "log_path": str(log_path.resolve()), "command": command, "workdir": str(cwd.resolve()), "progress": "UNKNOWN_NOT_REPORTED_BY_BACKEND", "partial_output": partial_sfm_output}
+    emit_progress(make_event(stage_id, "stage_process_completed", exit_code=returncode,
+                             elapsed_seconds=elapsed, current_progress=current_progress,
+                             checkpoint_candidates=checkpoints), force=True)
+    return {"pid": process.pid, "exit_code": returncode, "elapsed_seconds": elapsed,
+            "log_path": str(log_path.resolve()), "progress_event_log": str(progress_path.resolve()),
+            "command": command, "workdir": str(cwd.resolve()),
+            "progress": current_progress or {"status": "UNKNOWN_NOT_REPORTED_BY_BACKEND", "eta": "unavailable"},
+            "partial_output": partial_sfm_output}
 
 
 def cancel_execution(execution: dict[str, Any], grace_seconds: float = 8.0) -> dict[str, Any]:

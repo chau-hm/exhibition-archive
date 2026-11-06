@@ -5,6 +5,7 @@
 - uv for Python version and dependency management.
 - Python 3.11 or newer; use Python 3.12 for development and validation.
 - Pillow is installed from the project's declared runtime dependencies.
+- uv is the only supported Python environment and dependency manager; do not use pip, Conda, or global package installs.
 - pytest is included in the default development dependency group.
 - Spirula is optional and only needed for fresh SfM or training. Existing validated COLMAP and PLY inputs can be adopted without starting those backends.
 
@@ -23,6 +24,15 @@ export EXHIBITION_ARCHIVE_ENGINE="$PWD/.venv/bin/exhibition-archive"
 ~~~
 
 `uv.lock` pins the Engine and default development dependencies. Use the project-local `.venv` for CLI, test, and future workspace commands; do not use a Conda interpreter. If the lockfile is intentionally changed, regenerate it with `uv lock`, review the diff, and then use `uv sync --locked`.
+
+The CLI checks the interpreter and package importability during preflight. An explicitly operator-initiated local run can repair declared dependencies using `uv sync --locked`; if an unambiguous raw LiDAR PLY is selected, it requests the locked `lidar-registration` extra. Repair requires both `--interactive-authorization` and an interactive Terminal; a TTY alone never triggers installation. `--dry-run` only reports the planned sync and never installs packages. Use `--no-auto-install` to prevent repair during a non-dry run. Python dependency repair does not install native macOS tools or libraries. If Open3D still fails to import because a native library is missing, the Engine records that failure and continues photo-only; install the host dependency separately, then rerun preflight.
+
+For an explicitly requested LiDAR registration environment, the equivalent uv command is:
+
+~~~bash
+uv sync --locked --python .venv/bin/python --no-default-groups --extra lidar-registration
+.venv/bin/python -c 'import numpy, open3d; print(numpy.__version__, open3d.__version__)'
+~~~
 
 The installed console script can be run from any working directory. The repository also includes bin/exhibition-archive, a source-checkout launcher that resolves its package relative to the script location; for operator work, prefer `.venv/bin/exhibition-archive` so the CLI uses the uv-managed environment.
 
@@ -62,4 +72,4 @@ Run the command's --help for exact options. Only the Engine can determine curren
 
 ## One-command first-visual workflow
 
-For a new photo folder with an optional raw point-cloud PLY, use `run --input ... --output ... --project-id ... --profile first-visual --until visitor`. Start with `--dry-run`; the folder-based path validates the installed Spirula commands and bundled viewer before creating a workspace. Fresh SfM and training remain separately gated by the existing exact-plan authorization policy. The complete local runbook, checkpoint locations, resume conditions, and expected Reviewer/Visitor paths are in [the playground Engine readiness report](experiments/playground-engine-readiness.md).
+For a new photo folder with an optional raw point-cloud PLY, use `run --input ... --output ... --project-id ... --profile first-visual --until visitor`. Start with `--dry-run`; it validates the local environment, images, installed Spirula commands, and bundled viewer without creating a workspace. Fresh SfM and training retain separate exact-plan authorizations. SfM component acceptance, geometry review, navigation approval, and publication approval remain separate decisions. Live progress is written to stderr and persisted at `logs/pipeline-progress.jsonl`. The local runbook, checkpoints, resume conditions, and Reviewer/Visitor paths are in [the playground Engine readiness report](experiments/playground-engine-readiness.md).

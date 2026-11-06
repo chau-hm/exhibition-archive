@@ -116,6 +116,10 @@ def test_photo_only_and_invalid_lidar_fallback(tmp_path):
 
 
 def test_valid_lidar_without_open3d_reports_actionable_optional_fallback(tmp_path):
+    # patch.dict restores sys.modules after the context. Import NumPy first so
+    # restoring the module table does not remove a native extension that has
+    # already been initialized and break subsequent numerical tests.
+    pytest.importorskip("numpy")
     source = tmp_path / "input"
     output = tmp_path / "output"
     source.mkdir()
@@ -359,13 +363,14 @@ def test_dry_run_validates_and_does_not_create_output(tmp_path, capsys):
          patch("exhibition_archive.backends.image_inventory", return_value={"image_count": 2, "formats": {".jpg": 2}, "duplicates": {}}), \
          patch("exhibition_archive.backends.build_sfm_command", return_value=["spirula", "sfm", "--quality", "high"]), \
          patch("exhibition_archive.backends.build_training_command", return_value=["spirula", "train", "3dgs", "--train-resolution-divisor", "1"]), \
-         patch("exhibition_archive.backends.training_preset_configuration", return_value={"status": "CAPTURED", "effective_parameters": {"--train-resolution-divisor": "1"}}):
+         patch("exhibition_archive.backends.training_preset_configuration", return_value={"status": "CAPTURED", "effective_parameters": {"--train-resolution-divisor": "1"}}), \
+         patch("exhibition_archive.environment.repair_python_environment", side_effect=AssertionError("dry-run must not install")):
         args = build_parser().parse_args(["run", "--input", str(source), "--output", str(output),
-                                          "--project-id", "playground-fixture", "--dry-run"])
+                                          "--project-id", "playground-fixture", "--dry-run", "--json"])
         code = cmd_run(args)
     result = json.loads(capsys.readouterr().out)
     assert code == 0
-    assert result["status"] == "READY"
+    assert result["status"].startswith("READY")
     assert result["backend"]["training_process_launched"] is False
     assert result["backend"]["training_effective_configuration"]["status"] == "CAPTURED"
     assert not output.exists()
@@ -382,7 +387,7 @@ def test_dry_run_reports_photo_blocker_with_nonzero_exit_code(tmp_path, capsys):
          patch("exhibition_archive.backends.build_training_command", return_value=["spirula", "train"]), \
          patch("exhibition_archive.backends.training_preset_configuration", return_value={"status": "CAPTURED", "effective_parameters": {}}):
         args = build_parser().parse_args(["run", "--input", str(source), "--output", str(output),
-                                          "--project-id", "empty-fixture", "--dry-run"])
+                                          "--project-id", "empty-fixture", "--dry-run", "--json"])
         code = cmd_run(args)
     report = json.loads(capsys.readouterr().out)
     assert code == 2
@@ -398,6 +403,38 @@ def test_cli_returns_nonzero_for_invalid_input_directory(tmp_path, capsys):
     assert code == 1
     assert "Input directory does not exist" in capsys.readouterr().err
     assert not output.exists()
+
+
+def test_guided_sfm_review_records_only_the_explicit_component_decision(tmp_path, monkeypatch, capsys):
+    import exhibition_archive.sfm_review as sfm_review
+
+    validation = tmp_path / "sfm-validation.json"
+    validation.write_text(json.dumps({"components": [{"component_id": "0", "registered_image_count": 77}]}))
+
+    class State:
+        def stage(self, stage_id):
+            assert stage_id == "sfm"
+            return {"details_json": json.dumps({"registered_image_count": 77,
+                                                "source_image_count": 77,
+                                                "sparse_point_count": 63824,
+                                                "quality_gate": "SFM_VALID_WITH_WARNINGS",
+                                                "sfm_validation_path": str(validation)})}
+
+    calls = []
+    monkeypatch.setattr(sfm_review, "review_sfm_component",
+                        lambda *args, **kwargs: calls.append(kwargs) or {"status": "ACCEPTED"})
+    answers = iter(["d", "a", "Reviewer", "Reviewed component coverage", "Visual fidelity still needs review"])
+    monkeypatch.setattr("builtins.input", lambda _prompt="": next(answers))
+
+    from exhibition_archive.cli import _guided_sfm_component_review
+    accepted = _guided_sfm_component_review(tmp_path, {"project_id": "guided-fixture"}, State(),
+                                            {"status": "NEEDS_REVIEW", "needs_review": ["sfm"]})
+
+    assert accepted is True
+    assert calls[0]["component_id"] == "0"
+    assert calls[0]["decision"] == "accept-experimental-training"
+    assert calls[0]["limitations"] == ["Visual fidelity still needs review"]
+    assert "63824" in capsys.readouterr().err
 
 
 def test_outdoor_navigation_emits_camera_coverage_proposal_without_fake_ceiling():

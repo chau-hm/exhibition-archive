@@ -6,7 +6,7 @@ import os
 import re
 import shutil
 from pathlib import Path, PurePosixPath
-from typing import Any
+from typing import Any, Callable
 
 from .adapters import colmap_binary_counts, ply_identity, read_json, sha256_file, validate_navigation, write_json
 from .navigation import generate_navigation, read_colmap_reconstruction, render_navigation_review_html
@@ -35,6 +35,7 @@ STAGES = [
     {"id": "sfm_dataset_prep", "deps": ["photo_inventory", "capture_preflight"], "inputs": ["registered source inventory", "HEIC files when fresh Spirula SfM requires JPEG"], "outputs": ["verified effective image dataset and source-to-derivative manifest"], "mode": "safe local preparation; no backend execution", "resource": "I/O and CPU bound when HEIC is present"},
     {"id": "artwork_association", "deps": ["photo_inventory", "capture_preflight"], "inputs": ["image inventory", "optional geometry and review state"], "outputs": ["inventory, observations, association graph"], "mode": "adopt or configured Phase2EV adapter", "resource": "low when adopted"},
     {"id": "sfm", "deps": ["photo_inventory"], "inputs": ["source images or existing COLMAP reconstruction"], "outputs": ["validated cameras, registered images, sparse points and provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "high when freshly executed"},
+    {"id": "sfm_studio_export", "deps": ["photo_inventory", "sfm"], "inputs": ["effective SfM image dataset", "validated COLMAP sparse model"], "outputs": ["portable images/ + sparse/0/ COLMAP dataset and manifest"], "mode": "local copy; export failure is recoverable", "resource": "I/O bound"},
     {"id": "lidar_registration", "deps": ["photo_inventory", "lidar_inspection", "sfm"], "inputs": ["independently inspected raw point cloud and validated sparse SfM geometry"], "outputs": ["scale-aware alignment report and optional aligned preview"], "mode": "optional FPFH/RANSAC global registration; rejection is recoverable", "resource": "bounded CPU geometry"},
     {"id": "navigation", "deps": ["sfm", "lidar_registration"], "inputs": ["trusted camera poses, optional validated aligned LiDAR geometry, coordinate frame and review decisions"], "outputs": ["versioned navigation proposal or approved artifact"], "mode": "adopt_existing or generate_from_sfm", "resource": "low"},
     {"id": "training", "deps": ["photo_inventory", "sfm"], "inputs": ["images and validated SfM"], "outputs": ["validated candidate 3DGS PLY and training provenance"], "mode": "adopt_existing or spirula_fresh", "resource": "GPU intensive"},
@@ -44,6 +45,10 @@ STAGES = [
     {"id": "archive_package", "deps": ["photo_inventory", "capture_preflight", "artwork_association", "sfm", "training", "evaluation", "navigation", "viewer_package"], "inputs": ["validated evidence and package"], "outputs": ["private archive metadata and manifest"], "mode": "execute locally", "resource": "low"},
     {"id": "verification", "deps": ["archive_package"], "inputs": ["website, manifest, checksums, policies"], "outputs": ["verification report"], "mode": "execute locally", "resource": "I/O bound"},
 ]
+FIRST_VISUAL_STAGE_ORDER = ("photo_inventory", "lidar_inspection", "capture_preflight",
+                           "sfm_dataset_prep", "artwork_association", "sfm",
+                           "sfm_studio_export", "lidar_registration", "navigation",
+                           "training", "first_visual")
 
 
 class WorkflowError(RuntimeError):
@@ -239,6 +244,29 @@ def stage_fingerprint(root: Path, config: dict, state: ProjectState, stage_id: s
         selected["implementation_files"] = [
             fingerprint_file(state, Path(__file__).with_name("lidar.py"), full_hash),
         ]
+    if stage_id == "sfm_studio_export":
+        sfm_details = json.loads((state.stage("sfm") or {}).get("details_json") or "{}")
+        reconstruction = sfm_details.get("reconstruction_directory") or integration.get("sfm", {}).get("directory")
+        if reconstruction:
+            reconstruction_path = Path(reconstruction).expanduser()
+            if not reconstruction_path.is_absolute():
+                reconstruction_path = root / reconstruction_path
+            selected["reconstruction"] = str(reconstruction_path.resolve())
+            selected["files"].extend(fingerprint_file(state, reconstruction_path / name, full_hash)
+                                     for name in ("cameras.bin", "images.bin", "points3D.bin"))
+        image_directory = sfm_details.get("effective_image_directory")
+        if not image_directory:
+            try:
+                image_directory, prep_manifest = effective_sfm_dataset(root, config, validate_files=full_hash)
+            except DatasetPreparationRequired:
+                image_directory, prep_manifest = raw_sfm_image_directory(root, config), None
+        else:
+            image_directory = Path(image_directory).expanduser()
+            prep_manifest = None
+        selected["image_directory"] = str(Path(image_directory).resolve())
+        if prep_manifest:
+            selected["preparation_manifest"] = prep_manifest
+        selected["implementation_files"] = [fingerprint_file(state, Path(__file__).with_name("studio_export.py"), full_hash)]
     if stage_id == "lidar_registration":
         selected["files"].append(fingerprint_file(state, output_path(root, config) / "lidar" / "inspection.json", full_hash))
         selected["files"].append(fingerprint_file(state, Path(__file__).with_name("lidar.py"), full_hash))
@@ -998,6 +1026,52 @@ def execute_lidar_registration(root: Path, config: dict, state: ProjectState, ou
                         "reason": report.get("reason")}}
 
 
+def execute_sfm_studio_export(root: Path, config: dict, state: ProjectState,
+                              output_dir: Path) -> dict:
+    """Prepare a self-contained COLMAP folder for local Studio review."""
+    output_dir.mkdir(parents=True, exist_ok=True)
+    report_path = output_dir / "export-report.json"
+    try:
+        from .studio_export import export_spirula_colmap_dataset
+        sfm_details = json.loads((state.stage("sfm") or {}).get("details_json") or "{}")
+        reconstruction_value = (sfm_details.get("reconstruction_directory") or
+                                config.get("integrations", {}).get("sfm", {}).get("directory"))
+        if not reconstruction_value:
+            raise BackendError("SfM stage has no recorded/configured sparse reconstruction directory",
+                               failure_kind="SFM_INVALID")
+        reconstruction = Path(reconstruction_value).expanduser()
+        if not reconstruction.is_absolute():
+            reconstruction = root / reconstruction
+        image_directory, preparation = effective_sfm_dataset(root, config, validate_files=True)
+        derivative = sfm_details.get("image_derivative_provenance") or {}
+        provenance = {"source_photographs_modified": False,
+                      "effective_dataset_kind": "validated_SfM_input_dataset",
+                      "preparation_manifest_sha256": preparation.get("manifest_sha256") if preparation else None,
+                      "prepared_image_count": preparation.get("mapped_image_count") if preparation else None,
+                      "derivative_provenance_recorded": bool(derivative)}
+        result = export_spirula_colmap_dataset(
+            image_directory, reconstruction, output_path(root, config) / "sfm" / "spirula-studio-export",
+            project_id=config["project_id"], source_provenance=provenance)
+        write_json(report_path, {"schema_version": "exhibition-archive.spirula-export-stage.v1", **result,
+                                 "gui_reopen_status": "NOT_GUI_VERIFIED"})
+        return {"status": "COMPLETED", "artifacts": [*result["artifacts"], report_path],
+                "details": {"export_status": result["status"],
+                            "package_directory": result["package_directory"],
+                            "manifest_path": result["manifest_path"],
+                            "report_path": str(report_path.resolve()),
+                            "validation": result["validation"],
+                            "gui_reopen_status": "NOT_GUI_VERIFIED"}}
+    except (BackendError, OSError, ValueError, ImportError) as exc:
+        report = {"schema_version": "exhibition-archive.spirula-export-stage.v1",
+                  "status": "WARNING", "gui_reopen_status": "NOT_GUI_VERIFIED",
+                  "error": f"{type(exc).__name__}: {exc}",
+                  "photo_reconstruction_affected": False,
+                  "action": "Inspect the SfM image mapping and COLMAP camera dimensions; the validated reconstruction remains available.",
+                  "details": getattr(exc, "details", {})}
+        write_json(report_path, report)
+        return {"status": "WARNING", "artifacts": [report_path], "details": report}
+
+
 def adopt_stage(root: Path, config: dict, state: ProjectState, stage_id: str, output_dir: Path) -> dict:
     i = config.get("integrations", {})
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -1205,7 +1279,8 @@ def _validate_image_derivative_manifest(root: Path, config: dict, image_dir: Pat
 
 
 def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir: Path, execution_id: int,
-                      authorization_plan_id: str | None = None) -> dict:
+                      authorization_plan_id: str | None = None, *, progress_format: str = "text",
+                      verbose: bool = False) -> dict:
     cfg = config.get("integrations", {}).get("sfm", {})
     if _integration_mode(config, "sfm") != "spirula_fresh":
         return adopt_stage(root, config, state, "sfm", output_dir)
@@ -1241,7 +1316,9 @@ def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir:
         raise AuthorizationRequired("sfm", "Fresh SfM execution requires an explicit one-time authorization. Run plan --full-hash, then authorize the displayed plan_id.")
     assert_authorization_plan_current(root, config, state, "sfm", authorization_plan_id, backend_info=capabilities)
     execution = execute_process(state, execution_id, "sfm", command, attempt, attempt / "spirula.log", env_overrides,
-                               cfg.get("timeout_seconds", policy.get("sfm_timeout_seconds")), float(policy.get("poll_interval_seconds", 1.0)))
+                               cfg.get("timeout_seconds", policy.get("sfm_timeout_seconds")), float(policy.get("poll_interval_seconds", 1.0)),
+                               progress_format=progress_format, verbose=verbose,
+                               progress_context={"target_images": dataset["image_count"]})
     command_record = read_json(attempt / "command.json")
     sparse_root = output / "sparse"
     backend_reprojection_summary = parse_spirula_sfm_reprojection_summary(execution.get("log_path"))
@@ -1288,7 +1365,8 @@ def execute_fresh_sfm(root: Path, config: dict, state: ProjectState, output_dir:
 
 
 def execute_fresh_training(root: Path, config: dict, state: ProjectState, output_dir: Path, execution_id: int,
-                           authorization_plan_id: str | None = None) -> dict:
+                           authorization_plan_id: str | None = None, *, progress_format: str = "text",
+                           verbose: bool = False) -> dict:
     cfg = config.get("integrations", {}).get("model", {})
     if _integration_mode(config, "training") != "spirula_fresh":
         return adopt_stage(root, config, state, "training", output_dir)
@@ -1442,7 +1520,9 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     execution = execute_process(state, execution_id, "training", command, attempt, attempt / "spirula.log", env_overrides,
                                training_limits["training_timeout_seconds"], float(policy.get("poll_interval_seconds", 1.0)),
                                checkpoint_root=checkpoint_root,
-                               minimum_free_disk_bytes=training_limits["minimum_free_disk_bytes_training"])
+                               minimum_free_disk_bytes=training_limits["minimum_free_disk_bytes_training"],
+                               progress_format=progress_format, verbose=verbose,
+                               progress_context={"target_iterations": cfg["iterations"]})
     command_record = read_json(attempt / "command.json")
     training_resolution = _training_resolution_from_log(resolution_request, Path(execution["log_path"]))
     command_record["training_resolution"] = training_resolution
@@ -1842,7 +1922,8 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
 
 
 def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str, output_dir: Path, execution_id: int, fail_at: str | None = None, force_hash: bool = False,
-                   authorization_plan_id: str | None = None) -> dict:
+                   authorization_plan_id: str | None = None, progress_format: str = "text",
+                   verbose: bool = False) -> dict:
     if stage_id == "sfm_dataset_prep":
         inventory = read_json(output_dir / "source-index.json")
         result = prepare_spirula_dataset(root, config, inventory)
@@ -1850,9 +1931,13 @@ def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str,
         return {"status": "COMPLETED", "artifacts": [manifest], "details": result["details"]}
     if stage_id == "lidar_inspection":
         return execute_lidar_inspection(root, config, output_dir)
+    if stage_id == "sfm_studio_export":
+        return execute_sfm_studio_export(root, config, state, output_dir)
     if stage_id in {"photo_inventory", "capture_preflight", "artwork_association", "sfm", "training", "evaluation", "navigation"}:
-        if stage_id == "sfm": return execute_fresh_sfm(root, config, state, output_dir, execution_id, authorization_plan_id)
-        if stage_id == "training": return execute_fresh_training(root, config, state, output_dir, execution_id, authorization_plan_id)
+        if stage_id == "sfm": return execute_fresh_sfm(root, config, state, output_dir, execution_id, authorization_plan_id,
+                                                        progress_format=progress_format, verbose=verbose)
+        if stage_id == "training": return execute_fresh_training(root, config, state, output_dir, execution_id, authorization_plan_id,
+                                                                  progress_format=progress_format, verbose=verbose)
         if stage_id == "evaluation" and _integration_mode(config, "training") == "spirula_fresh":
             return fresh_evaluation_stage(root, config, state, output_dir)
         if stage_id == "navigation" and _navigation_mode(config) == "generate_from_sfm":
@@ -1887,7 +1972,9 @@ def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str,
 
 def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = False, force_hash: bool = False,
                  fail_at: str | None = None, authorization_ids: list[str] | None = None,
-                 package_only: bool = False, stop_after_stage: str | None = None) -> dict:
+                 package_only: bool = False, stop_after_stage: str | None = None,
+                 progress_format: str = "text", verbose: bool = False,
+                 progress_callback: Callable[[dict[str, Any]], None] | None = None) -> dict:
     if config.get("diagnostic_policy", {}).get("mode") == "SMOKE_TEST_ONLY":
         raise WorkflowError("This isolated diagnostic project cannot run the production workflow DAG; use the explicit diagnostic smoke-training command.")
     from .backends import reconcile_running_stage
@@ -1927,13 +2014,19 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
         if current_training_scope and current_training_scope["conditional_scope"]:
             scoped_sfm_training = current_training_scope
     try:
-        for stage in STAGES:
+        for stage_index, stage in enumerate(STAGES, 1):
             sid = stage["id"]
+            if progress_callback and sid in FIRST_VISUAL_STAGE_ORDER:
+                current_row = state.stage(sid) or {}
+                progress_callback({"event": "pipeline_stage_checked", "stage": sid,
+                                   "stage_number": FIRST_VISUAL_STAGE_ORDER.index(sid) + 1,
+                                   "stage_total": len(FIRST_VISUAL_STAGE_ORDER),
+                                   "status": current_row.get("status", "PENDING")})
             if sid == "first_visual" and stop_after_stage != "first_visual":
                 summary["skipped"].append(sid)
                 summary["stages"][sid] = "SKIPPED_NOT_REQUESTED"
                 continue
-            if package_only and sid in {"lidar_inspection", "lidar_registration", "first_visual"}:
+            if package_only and sid in {"lidar_inspection", "lidar_registration", "sfm_studio_export", "first_visual"}:
                 summary["skipped"].append(sid)
                 summary["stages"][sid] = "SKIPPED_PACKAGE_ONLY"
                 continue
@@ -1953,6 +2046,10 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 state.end_run(run_id, summary["status"], summary)
                 return summary
             blocked = [dep for dep in stage["deps"] if state.stage(dep) is None or state.stage(dep)["status"] not in {"COMPLETED", "ADOPTED"}]
+            if sid == "sfm_studio_export" and "sfm" in blocked and (state.stage("sfm") or {}).get("status") == "NEEDS_REVIEW":
+                # A technically valid reconstruction may be exported for inspection
+                # while its separate component-use decision remains pending.
+                blocked.remove("sfm")
             if sid in {"lidar_registration", "navigation"} and "sfm" in blocked and scoped_sfm_geometry:
                 blocked.remove("sfm")
             if sid == "training" and "sfm" in blocked and _integration_mode(config, "training") == "spirula_fresh":
@@ -2014,19 +2111,34 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                     summary["stages"][sid] = "RETAINED_NEEDS_REVIEW_WITH_TRAINING_SCOPE"
                     summary["needs_review"].append(sid)
                     continue
-                message = "The current SfM result remains NEEDS_REVIEW. Record a component decision with sfm-review or explicitly replan a corrected SfM execution."
-                summary["status"] = "NEEDS_REVIEW"
+                export_stage = state.stage("sfm_studio_export") or {}
+                export_fp = stage_fingerprint(root, config, state, "sfm_studio_export", full_hash=force_hash)
+                if (export_stage.get("input_fingerprint") == export_fp and
+                        export_stage.get("status") in {"COMPLETED", "ADOPTED"} and
+                        _stage_artifacts_valid(state, "sfm_studio_export", stage_root)):
+                    message = "The current SfM result remains NEEDS_REVIEW. Inspect the validation report and make an explicit component decision before downstream training."
+                    summary["status"] = "NEEDS_REVIEW"
+                    summary["stages"][sid] = "NEEDS_REVIEW"
+                    summary["needs_review"].append(sid)
+                    summary["blocked"].append({"stage": sid, "reason": message, "authorization_required": False})
+                    summary["stop_reason"] = message
+                    state.end_run(run_id, summary["status"], summary)
+                    return summary
+                # Reuse the accepted SfM bytes and allow only the independent,
+                # local dataset export stage to run before returning to review.
                 summary["stages"][sid] = "NEEDS_REVIEW"
                 summary["needs_review"].append(sid)
-                summary["blocked"].append({"stage": sid, "reason": message, "authorization_required": False})
-                summary["stop_reason"] = message
-                state.end_run(run_id, summary["status"], summary)
-                return summary
+                continue
             if (sid == "sfm_dataset_prep" and auto_preparation_required(root, config) and prior and
                     prior.get("status") in {"COMPLETED", "ADOPTED"}):
                 if _stage_artifacts_valid(state, sid, stage_root):
                     summary["skipped"].append(sid)
                     summary["stages"][sid] = "SKIPPED_VALID_CACHE"
+                    if progress_callback and sid in FIRST_VISUAL_STAGE_ORDER:
+                        progress_callback({"event": "pipeline_stage_cached", "stage": sid,
+                                           "stage_number": FIRST_VISUAL_STAGE_ORDER.index(sid) + 1,
+                                           "stage_total": len(FIRST_VISUAL_STAGE_ORDER),
+                                           "status": "SKIPPED_VALID_CACHE"})
                     continue
                 raise BackendError(
                     "Previously completed HEIC preparation no longer passes source, derivative, or artifact-hash validation. "
@@ -2035,9 +2147,23 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 )
             if prior and prior.get("input_fingerprint") == fp and prior.get("status") in {"COMPLETED", "ADOPTED"} and _stage_artifacts_valid(state, sid, stage_root):
                 summary["skipped"].append(sid); summary["stages"][sid] = "SKIPPED_VALID_CACHE"
+                if progress_callback and sid in FIRST_VISUAL_STAGE_ORDER:
+                    progress_callback({"event": "pipeline_stage_cached", "stage": sid,
+                                       "stage_number": FIRST_VISUAL_STAGE_ORDER.index(sid) + 1,
+                                       "stage_total": len(FIRST_VISUAL_STAGE_ORDER),
+                                       "status": "SKIPPED_VALID_CACHE"})
                 if sid == stop_after_stage:
                     summary["status"] = "AWAITING_VISUAL_REVIEW"
                     summary["stop_reason"] = "The requested first-visual Visitor output is ready for human review."
+                    state.end_run(run_id, summary["status"], summary)
+                    return summary
+                if sid == "sfm_studio_export" and (state.stage("sfm") or {}).get("status") == "NEEDS_REVIEW":
+                    message = "SfM passed technical output validation but needs a human component decision before training. The portable Studio dataset is ready for inspection."
+                    summary["status"] = "NEEDS_REVIEW"
+                    summary["stages"]["sfm"] = "NEEDS_REVIEW"
+                    summary["needs_review"].append("sfm")
+                    summary["blocked"].append({"stage": "sfm", "reason": message, "authorization_required": False})
+                    summary["stop_reason"] = message
                     state.end_run(run_id, summary["status"], summary)
                     return summary
                 if sid == "training" and scoped_sfm_training:
@@ -2118,9 +2244,14 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
             state.set_stage(sid, "RUNNING", fp, None, execution_id,
                             {"resume": resume, "authorization_id": authorization_id,
                              "authorization_plan_id": authorization_plan.get("plan_id") if authorization_plan else None})
+            if progress_callback and sid in FIRST_VISUAL_STAGE_ORDER:
+                progress_callback({"event": "pipeline_stage_started", "stage": sid,
+                                   "stage_number": FIRST_VISUAL_STAGE_ORDER.index(sid) + 1,
+                                   "stage_total": len(FIRST_VISUAL_STAGE_ORDER), "status": "RUNNING"})
             try:
                 result = _execute_stage(root, config, state, sid, stage_root, execution_id, fail_at, force_hash,
-                                        authorization_plan.get("plan_id") if authorization_plan else None)
+                                        authorization_plan.get("plan_id") if authorization_plan else None,
+                                        progress_format, verbose)
                 status = result["status"]
                 artifact_paths = [Path(x).resolve() for x in result.get("artifacts", [])]
                 if not artifact_paths or not all(p.is_file() for p in artifact_paths):
@@ -2131,6 +2262,11 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 digest = json_digest([{"path": str(p.relative_to(root) if root in p.parents else p), "sha256": state.cached_hash(p)} for p in artifact_paths])
                 state.finish_stage(execution_id, status, digest, {**result, "artifacts": [str(x) for x in artifact_paths]})
                 state.set_stage(sid, status, fp, digest, execution_id, result.get("details", {}))
+                if progress_callback and sid in FIRST_VISUAL_STAGE_ORDER:
+                    progress_callback({"event": "pipeline_stage_completed", "stage": sid,
+                                       "stage_number": FIRST_VISUAL_STAGE_ORDER.index(sid) + 1,
+                                       "stage_total": len(FIRST_VISUAL_STAGE_ORDER), "status": status,
+                                       "warning": result.get("details", {}).get("error") if status == "WARNING" else None})
                 summary["stages"][sid] = status
                 if status == "ADOPTED": summary["adopted"].append(sid)
                 elif status == "NEEDS_REVIEW": summary["needs_review"].append(sid)
@@ -2141,10 +2277,19 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                     state.end_run(run_id, summary["status"], summary)
                     return summary
                 if status == "NEEDS_REVIEW":
+                    if progress_callback and sid in FIRST_VISUAL_STAGE_ORDER:
+                        progress_callback({"event": "pipeline_stage_needs_review", "stage": sid,
+                                           "stage_number": FIRST_VISUAL_STAGE_ORDER.index(sid) + 1,
+                                           "stage_total": len(FIRST_VISUAL_STAGE_ORDER),
+                                           "status": status})
                     # Navigation is independent of Gaussian training. Preserve the
                     # review gate for publication while allowing configured model
                     # work and evaluation to finish from the already validated SfM.
                     if sid == "navigation" and config.get("integrations", {}).get("model"):
+                        continue
+                    if sid == "sfm":
+                        # Allow the non-training portable export to complete, then
+                        # stop for the existing component review gate.
                         continue
                     summary["stop_reason"] = f"Stopped before dependent work because {sid} requires human review."
                     state.end_run(run_id, "NEEDS_REVIEW", summary)
@@ -2173,6 +2318,10 @@ def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = F
                 state.end_run(run_id, summary["status"], summary)
                 return summary
             except Exception as exc:
+                try:
+                    setattr(exc, "stage_id", sid)
+                except (AttributeError, TypeError):
+                    pass
                 execution_row = state.execution(execution_id) or {}
                 execution_details = json.loads(execution_row.get("details_json") or "{}")
                 failure_kind = getattr(exc, "failure_kind", "EXECUTION_FAILED")

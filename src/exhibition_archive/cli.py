@@ -129,6 +129,13 @@ def _first_visual_preflight(input_directory: str | Path, output_directory: str |
               "side_effects": "NONE; dry-run does not create a workspace, project manifest, SQLite database, cache, or derived image copy",
               "dry_run_scope": "PLY headers are classified; full vertex scanning, preview generation, SfM, training, and registration are deferred to the authorized local run.",
               "blockers": [], "warnings": []}
+    from .environment import inspect_python_environment
+    plausible_lidar = (lidar_mode == "auto" and discovery.get("raw_lidar_status") == "SELECTED_UNAMBIGUOUS" and
+                       bool(discovery.get("selected_raw_lidar_relative_path")))
+    python_environment = inspect_python_environment(PRODUCT_ROOT, lidar_registration=plausible_lidar)
+    report["python_environment"] = python_environment
+    report["blockers"].extend(python_environment.get("blockers", []))
+    report["warnings"].extend(python_environment.get("warnings", []))
     try:
         image_index = image_inventory(source)
         report["photo_validation"] = {"status": "PASS", "image_count": image_index["image_count"],
@@ -190,14 +197,270 @@ def _first_visual_preflight(input_directory: str | Path, output_directory: str |
         report["blockers"].append("At least two supported photographs are required.")
     if lidar_mode == "auto" and not discovery["ply_files"]:
         report["warnings"].append("No LiDAR PLY was detected; the photo-only pathway remains available.")
-    if lidar_mode == "auto":
-        try:
-            import open3d
-            report["optional_lidar_registration"] = {"status": "AVAILABLE", "version": open3d.__version__}
-        except ImportError:
-            report["optional_lidar_registration"] = {"status": "UNAVAILABLE_OPTIONAL", "effect": "LiDAR inspection continues; registration will be recoverably rejected and photos remain primary."}
-    report["status"] = "BLOCKED" if report["blockers"] else "READY"
+    if plausible_lidar:
+        missing_registration = python_environment.get("optional_registration_missing", [])
+        report["optional_lidar_registration"] = ({"status": "AVAILABLE",
+            "versions": {row["distribution"]: row.get("version") for row in python_environment["packages"]
+                         if row["distribution"] in {"numpy", "open3d"}}}
+            if not missing_registration else
+            {"status": "READY_AFTER_BOOTSTRAP" if python_environment.get("optional_registration_repair_available") else "UNAVAILABLE_OPTIONAL",
+             "missing": missing_registration,
+             "effect": ("The local run may install the locked registration extra; otherwise LiDAR registration is skipped and photos remain primary."
+                        if python_environment.get("optional_registration_repair_available") else
+                        "The package import error needs separate repair; LiDAR registration is skipped and photos remain primary.")})
+    else:
+        report["optional_lidar_registration"] = {"status": "NOT_REQUIRED"}
+    if report["blockers"]:
+        report["status"] = "BLOCKED"
+    elif python_environment["status"] == "READY_AFTER_BOOTSTRAP":
+        report["status"] = "READY_AFTER_BOOTSTRAP"
+    elif python_environment.get("warnings") or report["warnings"]:
+        report["status"] = "READY_WITH_OPTIONAL_WARNINGS"
+    else:
+        report["status"] = "READY"
     return report
+
+
+def _report_preflight(report: dict, *, as_json: bool = False, file=None) -> None:
+    stream = file or sys.stdout
+    if as_json:
+        print(json.dumps(report, indent=2, ensure_ascii=False), file=stream)
+        return
+    print(f"Exhibition Archive Engine · preflight {report.get('status', 'UNKNOWN')}", file=stream)
+    print(f"Project: {report.get('project_id', 'existing project')}", file=stream)
+    if "photo_count" in report:
+        print(f"Photos: {report['photo_count']} · input: {report.get('input_directory')}", file=stream)
+        print(f"Output: {report.get('output_directory')}", file=stream)
+        print("Planned: " + " → ".join(report.get("planned_stages", [])), file=stream)
+    environment = report.get("python_environment", {})
+    if environment:
+        python = environment.get("python", {})
+        uv = environment.get("uv", {})
+        print(f"Python: {python.get('version', 'unknown')} · {python.get('executable', 'unknown')} · {python.get('project_local_venv') and 'project .venv' or 'not project .venv'}", file=stream)
+        print(f"uv: {uv.get('status', 'unknown')}", file=stream)
+        for package in environment.get("packages", []):
+            version = package.get("version") or "missing"
+            print(f"{package.get('distribution')}: {package.get('status')} ({version})", file=stream)
+        command = environment.get("bootstrap", {}).get("command")
+        if environment.get("status") == "READY_AFTER_BOOTSTRAP" and command:
+            print("Planned environment repair: " + shlex.join(command), file=stream)
+    backend = report.get("backend", {})
+    if backend:
+        print(f"Spirula: {backend.get('status', 'unknown')} · {backend.get('version', backend.get('reason', ''))}", file=stream)
+        training = backend.get("training_effective_configuration", {})
+        if training:
+            print(f"Training preset: {training.get('preset')} / {training.get('quality')} · effective settings: {training.get('effective_parameter_count', 'unknown')}", file=stream)
+    if report.get("optional_lidar_registration"):
+        print(f"LiDAR registration dependency: {report['optional_lidar_registration'].get('status')}", file=stream)
+    for warning in report.get("warnings", []):
+        print(f"Warning: {warning}", file=stream)
+    for blocker in report.get("blockers", []):
+        print(f"Blocker: {blocker}", file=stream)
+
+
+def _project_environment(root: Path, config: dict) -> dict:
+    from .environment import inspect_python_environment
+    from .lidar import discover_input_files
+    source = project_path(root, config, config["source"]["photo_directory"])
+    enabled = config.get("integrations", {}).get("lidar", {}).get("enabled", True)
+    discovery = discover_input_files(source, hash_images=False, hash_ply=False) if source.is_dir() else {}
+    lidar_registration = (enabled and discovery.get("raw_lidar_status") == "SELECTED_UNAMBIGUOUS" and
+                          bool(discovery.get("selected_raw_lidar_relative_path")))
+    return inspect_python_environment(PRODUCT_ROOT, lidar_registration=lidar_registration)
+
+
+def _progress_callback(root: Path, config: dict, output_format: str):
+    from .progress import append_event, format_event, make_event
+    event_path = output_path(root, config) / "logs" / "pipeline-progress.jsonl"
+
+    def emit(payload: dict) -> None:
+        event = make_event(str(payload.get("stage", "pipeline")),
+                           str(payload.get("event", "pipeline_status")),
+                           **{key: value for key, value in payload.items() if key not in {"stage", "event"}})
+        append_event(event_path, event)
+        if output_format == "jsonl":
+            print(json.dumps(event, sort_keys=True, ensure_ascii=False), file=sys.stderr, flush=True)
+        elif output_format == "text":
+            print(format_event(event), file=sys.stderr, flush=True)
+
+    return emit
+
+
+def _write_run_result(result: dict, root: Path, config: dict, state: ProjectState,
+                       *, as_json: bool = False) -> None:
+    if as_json:
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+    status = str(result.get("status", "UNKNOWN"))
+    print(f"Exhibition Archive Engine · {status}")
+    print(f"Project: {config.get('project_id')} · workspace: {root}")
+    for stage, stage_status in result.get("stages", {}).items():
+        print(f"  {stage}: {stage_status}")
+    if status == "AUTHORIZATION_REQUIRED":
+        blocked = next((item for item in result.get("blocked", []) if item.get("execution_plan")), None)
+        if blocked:
+            execution_plan = blocked["execution_plan"]
+            plan_directory = root / "authorization-plans"
+            plan_directory.mkdir(parents=True, exist_ok=True)
+            plan_path = plan_directory / f"{blocked['stage']}-{execution_plan['plan_id']}.json"
+            if not plan_path.exists():
+                write_json(plan_path, execution_plan)
+            print(f"\n[APPROVAL REQUIRED] {blocked['stage']} · one attempt")
+            print(f"Plan SHA-256: {execution_plan['plan_id']}")
+            print(f"Backend: {execution_plan.get('backend', {}).get('executable')} · {execution_plan.get('backend', {}).get('version')}")
+            print(f"Input: {execution_plan.get('source_image_directory')} · {execution_plan.get('source_image_count')} images")
+            print(f"Output: {execution_plan.get('output_workspace')}")
+            print(f"Command: {shlex.join(execution_plan.get('normalized_command', []))}")
+            print(f"Full plan: {plan_path}")
+            print("Authorize this stage only, then resume with the one-time authorization ID returned by the command:")
+            print("  exhibition-archive authorize " + shlex.quote(str(root)) +
+                  f" --stage {blocked['stage']} --plan-id {execution_plan['plan_id']} --reviewer <name> --rationale <text>")
+            print("  exhibition-archive resume " + shlex.quote(str(root)) +
+                  " --authorization-id <returned-id> --profile first-visual --until visitor")
+    if status == "NEEDS_REVIEW":
+        review_stage = next(iter(result.get("needs_review", [])), None)
+        if not review_stage:
+            review_stage = next((row.get("stage") for row in result.get("blocked", []) if row.get("stage")), "workflow")
+        print(f"\n[REVIEW REQUIRED] {review_stage}")
+        print(result.get("stop_reason") or next((row.get("reason") for row in result.get("blocked", []) if row.get("reason")), "A human decision is required before dependent work."))
+        if review_stage == "sfm":
+            sfm = state.stage("sfm") or {}
+            try:
+                sfm_details = json.loads(sfm.get("details_json") or "{}")
+            except (TypeError, ValueError):
+                sfm_details = {}
+            metrics = sfm_details.get("reprojection_metrics") or {}
+            error = sfm_details.get("mean_point_reprojection_error_px")
+            error_text = f"{error:.3f} px" if isinstance(error, (int, float)) else "unavailable"
+            print("Result:")
+            print(f"  Registered: {sfm_details.get('registered_image_count', 'unknown')}/"
+                  f"{sfm_details.get('source_image_count', 'unknown')}")
+            print(f"  Sparse points: {sfm_details.get('sparse_point_count', 'unknown'):,}"
+                  if isinstance(sfm_details.get("sparse_point_count"), int) else
+                  f"  Sparse points: {sfm_details.get('sparse_point_count', 'unknown')}")
+            print(f"  Mean per-point reprojection error: {error_text}")
+            print(f"  Metric source: {metrics.get('quality_gate_source') or 'unavailable'}")
+            print(f"  Quality: {sfm_details.get('quality_gate', 'unknown')}")
+            if sfm_details.get("sfm_validation_path"):
+                print(f"  Validation report: {sfm_details['sfm_validation_path']}")
+            print("Decision required: accept a component for experimental training, reject it, or defer review.")
+            print("Inspect metrics: exhibition-archive sfm-revalidate " + shlex.quote(str(root)))
+            print("Record component decision: exhibition-archive sfm-review " + shlex.quote(str(root)) +
+                  " --component <id> --decision accept-experimental-training --reviewer <name> --rationale <text> --limitation <known-limit>")
+        elif review_stage == "navigation":
+            print("Inspect the proposal: exhibition-archive navigation status " + shlex.quote(str(root)))
+            print("Record an explicit decision: exhibition-archive navigation review " + shlex.quote(str(root)) +
+                  " --decision <approve|reject> --reviewer <name> --rationale <text>")
+        print("Continue: exhibition-archive resume " + shlex.quote(str(root)) +
+              " --profile first-visual --until visitor --interactive-authorization")
+    if status == "AWAITING_VISUAL_REVIEW":
+        first_visual = state.stage("first_visual") or {}
+        try:
+            details = json.loads(first_visual.get("details_json") or "{}")
+        except (TypeError, ValueError):
+            details = {}
+        print("\nFirst visual outputs:")
+        for key in ("reviewer_html", "visitor_html", "summary_path"):
+            if details.get(key):
+                print(f"  {key.replace('_', ' ')}: {details[key]}")
+        print("Open these files through a local HTTP server for asset-safe review.")
+    if status in {"FAILED", "BLOCKED", "BLOCKED_BACKEND_PLAN_UNAVAILABLE", "BLOCKED_PACKAGE_PREREQUISITE"}:
+        failed = result.get("failed") or {}
+        if failed:
+            print(f"\nFailure: {failed.get('stage', 'unknown stage')} — {failed.get('error', 'see diagnostics')}")
+            failed_stage = state.stage(str(failed.get("stage", ""))) if failed.get("stage") else None
+            try:
+                failed_details = json.loads((failed_stage or {}).get("details_json") or "{}")
+            except (TypeError, ValueError):
+                failed_details = {}
+            diagnostic = next((failed_details.get(key) for key in
+                               ("log_path", "sfm_validation_path", "report_path", "inspection_report_path")
+                               if failed_details.get(key)), None)
+            if diagnostic is None and failed_stage and failed_stage.get("last_execution_id"):
+                execution = state.execution(int(failed_stage["last_execution_id"])) or {}
+                diagnostic = execution.get("log_path") or execution.get("checkpoint_path")
+            if diagnostic:
+                print(f"Diagnostics: {diagnostic}")
+        for item in result.get("blocked", []):
+            print(f"Blocker: {item.get('stage', 'workflow')} — {item.get('reason', 'unknown cause')}")
+        print("Successful cached stages are retained. Resume command:")
+        print("  exhibition-archive resume " + shlex.quote(str(root)) +
+              " --profile first-visual --until visitor --interactive-authorization")
+        print("A failed fresh SfM/training attempt needs a new separate one-use approval for the current plan.")
+
+
+def _guided_sfm_component_review(root: Path, config: dict, state: ProjectState,
+                                 result: dict) -> bool:
+    """Offer an explicit, auditable component decision in an opted-in local TTY."""
+    if result.get("status") != "NEEDS_REVIEW" or "sfm" not in result.get("needs_review", []):
+        return False
+    sfm = state.stage("sfm") or {}
+    try:
+        details = json.loads(sfm.get("details_json") or "{}")
+    except (TypeError, ValueError):
+        details = {}
+    components = []
+    validation_path = details.get("sfm_validation_path")
+    if validation_path:
+        try:
+            report = read_json(validation_path)
+            components = report.get("components", [])
+        except (OSError, ValueError, TypeError):
+            components = []
+    component_id = str(components[0].get("component_id", components[0].get("id") or
+                                         Path(components[0].get("directory", "0")).name)) if components else "0"
+    print("\n[REVIEW REQUIRED] SfM component acceptance", file=sys.stderr)
+    print("Choose an explicit decision: [a] accept for experimental training, [r] reject, "
+          "[d] show detailed metrics, [q] leave unchanged.", file=sys.stderr)
+    while True:
+        try:
+            answer = input("SfM review [a/r/d/q]: ").strip().casefold()
+        except EOFError:
+            return False
+        if answer == "d":
+            print(json.dumps({"summary": details, "components": components}, indent=2,
+                             ensure_ascii=False), file=sys.stderr)
+            continue
+        if answer in {"q", ""}:
+            return False
+        if answer not in {"a", "r"}:
+            print("Choose a, r, d, or q.", file=sys.stderr)
+            continue
+        reviewer = input("Reviewer identity: ").strip()
+        rationale = input("Review rationale: ").strip()
+        limitations = []
+        if answer == "a":
+            limitation = input("Unresolved limitation (enter an explicit statement, e.g. 'visual fidelity still requires review'): ").strip()
+            if limitation:
+                limitations.append(limitation)
+        if not reviewer or not rationale or (answer == "a" and not limitations):
+            print("No decision was recorded: reviewer, rationale, and an explicit limitation for acceptance are required.",
+                  file=sys.stderr)
+            return False
+        from .sfm_review import review_sfm_component
+        decision = "accept-experimental-training" if answer == "a" else "reject"
+        review_sfm_component(root, config, state, component_id=component_id,
+                             decision=decision, reviewer=reviewer,
+                             rationale=rationale, limitations=limitations)
+        print(f"Recorded SfM component {component_id}: {decision}.", file=sys.stderr)
+        return answer == "a"
+
+
+def _print_authorization_summary(stage_id: str, execution_plan: dict, plan_path: Path,
+                                 *, verbose: bool = False) -> None:
+    backend = execution_plan.get("backend", {})
+    limits = execution_plan.get("resource_limits", {})
+    print(f"\n[APPROVAL REQUIRED] {stage_id} · one attempt", file=sys.stderr)
+    print(f"Plan SHA-256: {execution_plan.get('plan_id')}", file=sys.stderr)
+    print(f"Backend: {backend.get('executable', 'unknown')} · {backend.get('version', 'version unknown')}", file=sys.stderr)
+    print(f"Input: {execution_plan.get('source_image_directory')} · {execution_plan.get('source_image_count')} images", file=sys.stderr)
+    print(f"Output: {execution_plan.get('output_workspace')}", file=sys.stderr)
+    print(f"Command: {shlex.join(execution_plan.get('normalized_command', []))}", file=sys.stderr)
+    print("Limits: " + json.dumps(limits, sort_keys=True), file=sys.stderr)
+    print("Cache: no valid completed result for this exact plan. Effect: launch only this named stage once.", file=sys.stderr)
+    print(f"Full canonical plan: {plan_path}", file=sys.stderr)
+    if verbose:
+        print(json.dumps(execution_plan, indent=2, ensure_ascii=False), file=sys.stderr)
 
 
 def _root_for_init(args) -> tuple[Path, dict]:
@@ -306,6 +569,11 @@ def cmd_run(args) -> int:
     output_directory = getattr(args, "output", None)
     profile = getattr(args, "profile", None)
     until = getattr(args, "until", None)
+    as_json = getattr(args, "json", False)
+    environment_report = None
+    state = None
+    root = None
+    config = None
     if until == "visitor" and profile is None:
         profile = "first-visual"
     if input_directory:
@@ -320,12 +588,12 @@ def cmd_run(args) -> int:
         if getattr(args, "dry_run", False):
             preflight = _first_visual_preflight(input_directory, output_directory, args.project_id,
                                                 getattr(args, "lidar", "auto"), getattr(args, "scene_type", "auto"))
-            print(json.dumps(preflight, indent=2))
-            return 0 if preflight["status"] == "READY" else 2
+            _report_preflight(preflight, as_json=as_json)
+            return 0 if preflight["status"].startswith("READY") else 2
         preflight = _first_visual_preflight(input_directory, output_directory, args.project_id,
                                             getattr(args, "lidar", "auto"), getattr(args, "scene_type", "auto"))
+        _report_preflight(preflight, as_json=as_json, file=sys.stderr)
         if preflight["blockers"]:
-            print(json.dumps(preflight, indent=2))
             return 2
         root = Path(preflight["workspace"])
         config = preflight["configuration"]
@@ -334,54 +602,97 @@ def cmd_run(args) -> int:
             output = Path(output_directory).expanduser().resolve()
             if output.exists() and any(output.iterdir()):
                 raise FileExistsError(f"Output directory is non-empty and has no existing Engine project; refusing to overwrite it: {output}")
-            root.mkdir(parents=True, exist_ok=True)
-            write_json(project_file, config)
-            initial_state = ProjectState(root)
-            initial_state.close()
+        environment_report = preflight["python_environment"]
     else:
         if getattr(args, "dry_run", False):
             raise ValueError("--dry-run requires --input, --output, and --project-id")
         if not getattr(args, "project", None):
             raise ValueError("run/resume requires a project workspace or --input/--output/--project-id")
         root, config = load_project(args.project)
+        environment_report = _project_environment(root, config)
+        _report_preflight({"status": environment_report.get("status"), "project_id": config["project_id"],
+                           "python_environment": environment_report,
+                           "blockers": environment_report.get("blockers", []),
+                           "warnings": environment_report.get("warnings", [])},
+                          as_json=as_json, file=sys.stderr)
+    if environment_report.get("bootstrap", {}).get("command") and environment_report.get("status") != "READY":
+        print("\nEnvironment preparation is being checked before reconstruction. No SfM or training is authorized by this step.", file=sys.stderr)
     if profile and profile != "first-visual":
         raise ValueError("Only the first-visual profile is currently implemented")
     if until and until != "visitor":
         raise ValueError("Only --until visitor is currently implemented")
+    from .environment import persist_environment_report, repair_python_environment
+    environment_report = repair_python_environment(
+        environment_report, project_root=PRODUCT_ROOT,
+        operator_initiated=(getattr(args, "interactive_authorization", False) and
+                            sys.stdin.isatty() and sys.stdout.isatty()),
+        auto_install=not getattr(args, "no_auto_install", False),
+        log_directory=(output_path(root, config) / ".engine" / "logs" / "environment"
+                       if root is not None else None),
+    )
+    if environment_report.get("status") == "BLOCKED":
+        preflight_doc = {"status": "BLOCKED", "project_id": config["project_id"],
+                         "workspace": str(root), "python_environment": environment_report,
+                         "blockers": environment_report.get("blockers", []),
+                         "warnings": environment_report.get("warnings", [])}
+        _report_preflight(preflight_doc, as_json=as_json)
+        return 2
+    if input_directory and not (root / "project.json").is_file():
+        root.mkdir(parents=True, exist_ok=True)
+        write_json(root / "project.json", config)
+    environment_report_path = root / "environment-preflight.json"
+    persist_environment_report(environment_report, environment_report_path)
     stop_after_stage = "first_visual" if profile == "first-visual" and until == "visitor" else None
     state = ProjectState(root)
     try:
         with state.lock():
             authorization_ids = list(getattr(args, "authorization_id", []))
             result = None
-            for _ in range(3):  # at most the separately authorized SfM and training stages
-                result = run_workflow(root, config, state, resume=args.resume, force_hash=args.full_hash,
+            reviewer = None
+            rationale = None
+            progress_format = getattr(args, "progress_format", "text")
+            progress_callback = _progress_callback(root, config, progress_format)
+            print(f"Exhibition Archive Engine · project {config['project_id']} · output {output_path(root, config)}", file=sys.stderr)
+            for attempt_number in range(5):  # bounded across SfM approval/review, training approval, and output validation
+                result = run_workflow(root, config, state, resume=args.resume or attempt_number > 0, force_hash=args.full_hash,
                                       fail_at=getattr(args, "fail_at", None),
                                       authorization_ids=authorization_ids,
                                       package_only=getattr(args, "package_only", False),
-                                      stop_after_stage=stop_after_stage)
+                                      stop_after_stage=stop_after_stage,
+                                      progress_format=progress_format,
+                                      verbose=getattr(args, "verbose", False),
+                                      progress_callback=progress_callback)
                 if (result.get("status") != "AUTHORIZATION_REQUIRED" or
                         not getattr(args, "interactive_authorization", False)):
+                    if (result.get("status") == "NEEDS_REVIEW" and
+                            getattr(args, "interactive_authorization", False) and
+                            sys.stdin.isatty() and sys.stdout.isatty() and
+                            _guided_sfm_component_review(root, config, state, result)):
+                        continue
                     break
                 blocked = next((item for item in result.get("blocked", []) if item.get("execution_plan")), None)
-                if blocked is None or not sys.stdin.isatty():
+                if blocked is None or not (sys.stdin.isatty() and sys.stdout.isatty()):
                     print("Interactive stage approval requires an interactive Terminal; no approval was created.", file=sys.stderr)
                     break
                 execution_plan = blocked["execution_plan"]
                 stage_id = blocked["stage"]
-                expected = f"AUTHORIZE {stage_id} {execution_plan['plan_id']}"
-                print(f"\nExact authorization plan for {stage_id}:\n{json.dumps(execution_plan, indent=2)}")
-                print("The next operation launches this named backend stage once, with the plan and limits shown above.")
-                answer = input(f"To authorize, type exactly: {expected}\n> ").strip()
-                if answer != expected:
+                plan_directory = root / "authorization-plans"
+                plan_directory.mkdir(parents=True, exist_ok=True)
+                plan_path = plan_directory / f"{stage_id}-{execution_plan['plan_id']}.json"
+                write_json(plan_path, execution_plan)
+                _print_authorization_summary(stage_id, execution_plan, plan_path,
+                                             verbose=getattr(args, "verbose", False))
+                answer = input(f"Approve only this {stage_id} attempt? [yes/no] ").strip().casefold()
+                if answer != "yes":
                     result["authorization_declined"] = True
                     break
-                reviewer = input("Reviewer identity: ").strip()
-                rationale = input("Rationale for this exact run: ").strip()
-                if not reviewer or not rationale:
-                    result["authorization_declined"] = True
-                    result["authorization_error"] = "Reviewer and rationale are required; no authorization was recorded."
-                    break
+                if reviewer is None:
+                    reviewer = input("Reviewer identity: ").strip()
+                    rationale = input("Why is this named stage approved for this run? ").strip()
+                    if not reviewer or not rationale:
+                        result["authorization_declined"] = True
+                        result["authorization_error"] = "Reviewer and rationale are required; no authorization was recorded."
+                        break
                 authorization_id = "ea_" + secrets.token_urlsafe(18)
                 created = datetime.now(timezone.utc).replace(microsecond=0)
                 expires = created + timedelta(minutes=15)
@@ -390,11 +701,13 @@ def cmd_run(args) -> int:
                     expires.isoformat().replace("+00:00", "Z"))
                 authorization_ids.append(authorization_id)
             assert result is not None
+            result["environment"] = environment_report
+            result["environment_report_path"] = str(environment_report_path.resolve())
             status = result.get("status", "COMPLETED")
             if status not in {"COMPLETED", "AWAITING_VISUAL_REVIEW"}:
                 result["resume_command"] = ("exhibition-archive resume " + shlex.quote(str(root)) +
                                              " --profile first-visual --until visitor --interactive-authorization")
-        print(json.dumps(result, indent=2))
+        _write_run_result(result, root, config, state, as_json=as_json)
         status = result.get("status", "COMPLETED")
         if status.startswith(("AUTHORIZATION_REQUIRED", "BLOCKED_PACKAGE")): return 3
         if status.startswith("BLOCKED_BACKEND"): return 1
@@ -403,11 +716,27 @@ def cmd_run(args) -> int:
     except Exception as exc:
         command = ("exhibition-archive resume " + shlex.quote(str(root)) +
                    " --profile first-visual --until visitor --interactive-authorization")
-        print(json.dumps({"status": "FAILED", "error": str(exc), "workspace": str(root),
-                          "resume_command": command}, indent=2), file=sys.stderr)
+        failure = {"status": "FAILED", "stage": getattr(exc, "stage_id", None),
+                   "error": str(exc), "workspace": str(root),
+                   "resume_command": command, "failure_kind": getattr(exc, "failure_kind", "EXECUTION_FAILED"),
+                   "details": getattr(exc, "details", {})}
+        if as_json:
+            print(json.dumps(failure, indent=2, ensure_ascii=False), file=sys.stderr)
+        else:
+            failed_prefix = f"{failure['stage']} — " if failure.get("stage") else ""
+            print(f"\n[FAILED] {failed_prefix}{failure['failure_kind']} · {exc}", file=sys.stderr)
+            details = failure["details"]
+            if details:
+                print("Diagnostics: " + json.dumps(details, ensure_ascii=False, sort_keys=True), file=sys.stderr)
+            print("Successful cached stages are preserved. Resume with:", file=sys.stderr)
+            print("  " + command, file=sys.stderr)
+            print("The failed stage is preserved for inspection; the Engine will not retry it automatically.", file=sys.stderr)
+            if failure["failure_kind"] in {"NONZERO_EXIT", "TIMEOUT", "CANCELLED", "PROCESS_LAUNCH_FAILED"}:
+                print("A fresh expensive retry requires a new approval for the current stage plan.", file=sys.stderr)
         return 1
     finally:
-        state.close()
+        if state is not None:
+            state.close()
 
 
 def cmd_diagnostic_smoke_train(args) -> int:
@@ -988,7 +1317,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--profile", choices=["first-visual"], help="Initial SfM/3DGS and private Reviewer/Visitor preview workflow")
     p.add_argument("--until", choices=["visitor"], help="Stop after the initial Visitor preview is generated")
     p.add_argument("--dry-run", action="store_true", help="Validate inputs and dependencies without creating workspace files or launching backends")
-    p.add_argument("--interactive-authorization", action="store_true", help="Show and request one explicit approval for each exact fresh SfM/training plan")
+    p.add_argument("--interactive-authorization", action="store_true", help="Explicitly opt into local TTY prompts for fresh SfM/training authorization and SfM component review")
+    p.add_argument("--no-auto-install", action="store_true", help="Do not repair declared Python dependencies with uv during this run")
+    p.add_argument("--progress-format", choices=["text", "jsonl", "off"], default="text",
+                   help="Write live progress to stderr as readable text, JSON Lines, or no console output (events are still persisted)")
+    p.add_argument("--verbose", action="store_true", help="Also stream raw backend log lines to stderr and show full approval plans")
+    p.add_argument("--json", action="store_true", help="Write structured preflight/final result JSON to stdout")
     p.add_argument("--full-hash", action="store_true", help="Re-hash all fingerprinted input files")
     p.add_argument("--authorization-id", action="append", default=[], help="One-time grant returned by authorize; repeat for separately approved stages")
     p.add_argument("--fail-at", choices=["viewer_package", "archive_package", "verification"], help=argparse.SUPPRESS)
@@ -1011,7 +1345,12 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true")
     p.add_argument("--profile", choices=["first-visual"], help="Continue through the initial private Reviewer/Visitor preview")
     p.add_argument("--until", choices=["visitor"], help="Stop after the initial Visitor preview is generated")
-    p.add_argument("--interactive-authorization", action="store_true", help="Show and request one explicit approval for each exact fresh SfM/training plan")
+    p.add_argument("--interactive-authorization", action="store_true", help="Explicitly opt into local TTY prompts for fresh SfM/training authorization and SfM component review")
+    p.add_argument("--no-auto-install", action="store_true", help="Do not repair declared Python dependencies with uv during this run")
+    p.add_argument("--progress-format", choices=["text", "jsonl", "off"], default="text",
+                   help="Write live progress to stderr as readable text, JSON Lines, or no console output (events are still persisted)")
+    p.add_argument("--verbose", action="store_true", help="Also stream raw backend log lines to stderr and show full approval plans")
+    p.add_argument("--json", action="store_true", help="Write structured final result JSON to stdout")
     p.add_argument("--authorization-id", action="append", default=[], help="One-time grant returned by authorize; repeat for separately approved stages")
     p.set_defaults(func=cmd_run, resume=True)
     p = sub.add_parser("reconcile-interrupted", help="Reconcile one confirmed interrupted HEIC preparation without retrying it")
