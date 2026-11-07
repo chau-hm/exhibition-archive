@@ -166,17 +166,21 @@ def read_colmap_reconstruction(directory: str | Path, trust: dict[str, Any] | No
                            "qvec_wxyz": qvec, "tvec": tvec,
                            "camera_center": colmap_camera_center(qvec, tvec), "registered": True})
     sparse_points: list[list[float]] = []
+    sparse_point_tracks: list[int] = []
+    sparse_point_errors: list[float] = []
     with points_path.open("rb") as stream:
         count = struct.unpack("<Q", stream.read(8))[0]
         for _ in range(count):
             stream.read(8)  # point3D id
             xyz = list(struct.unpack("<3d", stream.read(24)))
             stream.read(3)  # RGB
-            stream.read(8)  # reprojection error
+            error = struct.unpack("<d", stream.read(8))[0]
             track_len = struct.unpack("<Q", stream.read(8))[0]
             stream.seek(track_len * 8, 1)
             if all(math.isfinite(x) for x in xyz):
                 sparse_points.append(xyz)
+                sparse_point_tracks.append(track_len)
+                sparse_point_errors.append(error)
     trust = trust or {}
     trusted_ids = set(map(str, trust.get("trusted_image_ids", [])))
     trusted_names = set(map(str, trust.get("trusted_image_names", [])))
@@ -196,7 +200,8 @@ def read_colmap_reconstruction(directory: str | Path, trust: dict[str, Any] | No
     return {"source_reconstruction": {"identity": {"directory_name": root.name},
                                       "coordinate_frame": {"convention": "COLMAP_WORLD", "up_axis": "UNSPECIFIED", "metric_scale": "UNKNOWN"}},
             "camera_models": list(camera_models.values()), "cameras": images,
-            "sparse_points": sparse_points, "sparse_point_count": len(sparse_points)}
+            "sparse_points": sparse_points, "sparse_point_tracks": sparse_point_tracks,
+            "sparse_point_errors": sparse_point_errors, "sparse_point_count": len(sparse_points)}
 
 
 def _mat_vec(rotation: list[list[float]], point: list[float]) -> list[float]:
@@ -261,6 +266,154 @@ def _plane_basis(plane: dict[str, Any], frame: dict[str, Any]) -> dict[str, list
     u = _normalize(projected)
     v = _normalize(_cross(normal, u))
     return {"origin": origin, "normal": normal, "u": u, "v": v}
+
+
+def _up_axis_basis(frame: dict[str, Any]) -> dict[str, list[float]] | None:
+    """Build a right-handed view-up projection basis without claiming a floor."""
+    raw_up = frame.get("navigation_up_viewer")
+    if raw_up is None and frame.get("coordinates_are_viewer"):
+        raw_up = [0.0, 1.0, 0.0]
+    if raw_up is None:
+        return None
+    normal = _normalize(_finite_vector(raw_up, 3, "navigation_up_viewer"))
+    preferred = _finite_vector(frame.get("navigation_reference_axis_viewer", [1.0, 0.0, 0.0]), 3,
+                               "navigation_reference_axis_viewer")
+    projected = [preferred[i] - _dot(preferred, normal) * normal[i] for i in range(3)]
+    if math.sqrt(_dot(projected, projected)) < 1e-6:
+        preferred = [0.0, 0.0, 1.0]
+        projected = [preferred[i] - _dot(preferred, normal) * normal[i] for i in range(3)]
+    u = _normalize(projected)
+    v = _normalize(_cross(normal, u))
+    return {"origin": [0.0, 0.0, 0.0], "normal": normal, "u": u, "v": v}
+
+
+def _quantile(values: list[float], fraction: float) -> float:
+    ordered = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not ordered:
+        raise ValueError("Cannot compute a quantile from an empty value set")
+    position = max(0.0, min(1.0, float(fraction))) * (len(ordered) - 1)
+    lower, upper = math.floor(position), math.ceil(position)
+    blend = position - lower
+    return ordered[lower] * (1.0 - blend) + ordered[upper] * blend
+
+
+def _fit_height_plane(rows: list[dict[str, Any]]) -> tuple[float, float, float] | None:
+    """Fit local height = a*u + b*v + c using stable centered normal equations."""
+    if len(rows) < 3:
+        return None
+    mean_u = sum(row["uvh"][0] for row in rows) / len(rows)
+    mean_v = sum(row["uvh"][1] for row in rows) / len(rows)
+    mean_h = sum(row["uvh"][2] for row in rows) / len(rows)
+    suu = sum((row["uvh"][0] - mean_u) ** 2 for row in rows)
+    svv = sum((row["uvh"][1] - mean_v) ** 2 for row in rows)
+    suv = sum((row["uvh"][0] - mean_u) * (row["uvh"][1] - mean_v) for row in rows)
+    suh = sum((row["uvh"][0] - mean_u) * (row["uvh"][2] - mean_h) for row in rows)
+    svh = sum((row["uvh"][1] - mean_v) * (row["uvh"][2] - mean_h) for row in rows)
+    determinant = suu * svv - suv * suv
+    # Test collinearity relative to the sample spread so the fit remains valid
+    # for arbitrary-scale SfM coordinates.
+    if suu <= 0 or svv <= 0 or determinant <= suu * svv * 1e-10:
+        return None
+    a = (suh * svv - svh * suv) / determinant
+    b = (svh * suu - suh * suv) / determinant
+    return a, b, mean_h - a * mean_u - b * mean_v
+
+
+def _geometry_ground_candidate(component: list[dict[str, Any]], polygon: list[list[float]],
+                               geometry: list[dict[str, Any]], basis: dict[str, list[float]],
+                               spacing: float, config: dict[str, Any]) -> dict[str, Any]:
+    """Propose a lower exploration limit only from distributed, tracked photo-SfM geometry."""
+    min_tracks = int(config.get("minimum_ground_track_length", 3))
+    minimum_inliers = int(config.get("minimum_ground_support_points", 30))
+    minimum_coverage = float(config.get("minimum_ground_coverage_fraction", 0.2))
+    inlier_factor = float(config.get("ground_inlier_spacing_factor", 0.2))
+    camera_clearance_factor = float(config.get("ground_camera_clearance_spacing_factor", 0.5))
+    maximum_tilt = float(config.get("ground_maximum_tilt_degrees", 20.0))
+    if (minimum_inliers < 3 or not 0.0 < minimum_coverage <= 1.0 or
+            inlier_factor <= 0.0 or camera_clearance_factor < 0.0 or not 0.0 < maximum_tilt < 90.0):
+        raise ValueError("ground candidate thresholds are invalid")
+    if not geometry or spacing <= EPS:
+        return {"status": "INSUFFICIENT", "reason": "sparse point track metadata or camera spacing is unavailable",
+                "inlier_count": 0, "coverage_fraction": 0.0}
+    candidate = [row for row in geometry if row["track_length"] >= min_tracks and
+                 _point_in_polygon(row["uvh"][:2], polygon)]
+    camera_heights = [row["uvh"][2] for row in component]
+    camera_floor = _quantile(camera_heights, 0.1) - camera_clearance_factor * spacing
+    lower = [row for row in candidate if row["uvh"][2] < camera_floor]
+    if len(lower) < minimum_inliers:
+        return {"status": "INSUFFICIENT", "reason": "too few multi-view points lie below the camera path",
+                "candidate_point_count": len(candidate), "lower_point_count": len(lower),
+                "minimum_required_inliers": minimum_inliers}
+    tolerance = spacing * inlier_factor
+    heights = sorted(row["uvh"][2] for row in lower)
+    best_low, best_high = 0, 0
+    left = 0
+    for right, height in enumerate(heights):
+        while height - heights[left] > 2.0 * tolerance:
+            left += 1
+        if right - left > best_high - best_low:
+            best_low, best_high = left, right
+    mode_rows = [row for row in lower if heights[best_low] - EPS <= row["uvh"][2] <= heights[best_high] + EPS]
+    initial_fit = _fit_height_plane(mode_rows)
+    if initial_fit is None:
+        return {"status": "INSUFFICIENT", "reason": "candidate ground points are spatially degenerate",
+                "candidate_point_count": len(candidate), "lower_point_count": len(lower),
+                "minimum_required_inliers": minimum_inliers}
+    a, b, c = initial_fit
+    plane_height = lambda row: a * row["uvh"][0] + b * row["uvh"][1] + c
+    inliers = [row for row in candidate if abs(row["uvh"][2] - plane_height(row)) <= tolerance]
+    fitted = _fit_height_plane(inliers)
+    if fitted is not None:
+        a, b, c = fitted
+        plane_height = lambda row: a * row["uvh"][0] + b * row["uvh"][1] + c
+        inliers = [row for row in candidate if abs(row["uvh"][2] - plane_height(row)) <= tolerance]
+    residuals = [abs(row["uvh"][2] - plane_height(row)) for row in inliers]
+    residual_p90 = _quantile(residuals, 0.9) if residuals else math.inf
+    slope_length = math.sqrt(1.0 + a * a + b * b)
+    tilt = math.degrees(math.acos(max(-1.0, min(1.0, 1.0 / slope_length))))
+    grid_size = 8
+    min_u, max_u = min(point[0] for point in polygon), max(point[0] for point in polygon)
+    min_v, max_v = min(point[1] for point in polygon), max(point[1] for point in polygon)
+    valid_cells = set()
+    occupied_cells = set()
+    for row in range(grid_size):
+        for column in range(grid_size):
+            center = [min_u + (column + 0.5) * (max_u - min_u) / grid_size,
+                      min_v + (row + 0.5) * (max_v - min_v) / grid_size]
+            if _point_in_polygon(center, polygon):
+                valid_cells.add((column, row))
+    for item in inliers:
+        column = min(grid_size - 1, max(0, int((item["uvh"][0] - min_u) / (max_u - min_u or 1.0) * grid_size)))
+        row = min(grid_size - 1, max(0, int((item["uvh"][1] - min_v) / (max_v - min_v or 1.0) * grid_size)))
+        occupied_cells.add((column, row))
+    coverage = len(occupied_cells & valid_cells) / max(1, len(valid_cells))
+    camera_clearances = [row["uvh"][2] - plane_height(row) for row in component]
+    above_fraction = sum(value > tolerance for value in camera_clearances) / len(camera_clearances)
+    normal_viewer = _normalize([basis["normal"][i] - a * basis["u"][i] - b * basis["v"][i] for i in range(3)])
+    origin = basis["origin"]
+    representative_uv = [sum(row["uvh"][axis] for row in component) / len(component) for axis in (0, 1)]
+    representative_height = a * representative_uv[0] + b * representative_uv[1] + c
+    point_on_plane = _unproject([representative_uv[0], representative_uv[1], representative_height], basis)
+    offset = -_dot(normal_viewer, point_on_plane)
+    passed = (len(inliers) >= minimum_inliers and coverage >= minimum_coverage and
+              residual_p90 <= tolerance and tilt <= maximum_tilt and above_fraction >= 0.8)
+    evidence = {"method": "multi-view sparse points below camera path; robust local plane fit",
+                "track_length_minimum": min_tracks, "candidate_point_count": len(candidate),
+                "lower_point_count": len(lower), "inlier_count": len(inliers),
+                "inlier_fraction_of_lower_points": len(inliers) / max(1, len(lower)),
+                "footprint_grid_occupied_fraction": coverage,
+                "footprint_grid_occupied_cells": len(occupied_cells & valid_cells),
+                "footprint_grid_candidate_cells": len(valid_cells),
+                "residual_tolerance_units": tolerance, "residual_p90_units": residual_p90,
+                "normal_viewer": normal_viewer, "tilt_from_view_up_degrees": tilt,
+                "camera_clearance_quantiles_units": [_quantile(camera_clearances, value) for value in (0.1, 0.5, 0.9)],
+                "candidate_not_auto_accepted": True}
+    return {"status": "PROPOSED" if passed else "INSUFFICIENT",
+            "reason": None if passed else "photo-SfM lower-plane support did not meet count, spread, residual, or orientation thresholds",
+            "normal": normal_viewer, "offset": offset, "representative_height": representative_height,
+            "tolerance_units": tolerance, "evidence": evidence,
+            "minimum_required_inliers": minimum_inliers,
+            "minimum_required_footprint_coverage_fraction": minimum_coverage}
 
 
 def _project(point: list[float], basis: dict[str, list[float]]) -> list[float]:
@@ -677,10 +830,16 @@ def navigation_segment_allowed(artifact: dict[str, Any], start_local: list[float
     def within_heights(region: dict[str, Any], low_t: float, high_t: float) -> bool:
         vertical = region.get("vertical_bounds", {})
         floor, ceiling = vertical.get("floor") or {}, vertical.get("ceiling") or {}
-        if floor.get("value") is None or ceiling.get("value") is None:
+        exploration = region.get("exploration_limits") or {}
+        minimum, maximum = exploration.get("minimum_height") or {}, exploration.get("maximum_height") or {}
+        if minimum.get("value") is not None and maximum.get("value") is not None:
+            low = float(minimum["value"]) + float(minimum.get("clearance", 0.0))
+            high = float(maximum["value"]) - float(maximum.get("clearance", 0.0))
+        elif floor.get("value") is not None and ceiling.get("value") is not None:
+            low = float(floor["value"]) + float(floor.get("clearance", 0.0))
+            high = float(ceiling["value"]) - float(ceiling.get("clearance", 0.0))
+        else:
             return False
-        low = float(floor["value"]) + float(floor.get("clearance", 0.0))
-        high = float(ceiling["value"]) - float(ceiling.get("clearance", 0.0))
         if not math.isfinite(low) or not math.isfinite(high) or high < low:
             return False
         for t in (low_t, high_t):
@@ -794,6 +953,13 @@ def _validate_artifact(artifact: dict[str, Any]) -> dict[str, Any]:
                 errors.append(f"non_finite_{label}:{rid}")
         if floor.get("value") is not None and ceiling.get("value") is not None and float(ceiling["value"]) <= float(floor["value"]):
             errors.append(f"vertical_bounds_inverted:{rid}")
+        exploration = region.get("exploration_limits") or {}
+        minimum, maximum = exploration.get("minimum_height") or {}, exploration.get("maximum_height") or {}
+        for label, bound in (("minimum_height", minimum), ("maximum_height", maximum)):
+            if bound.get("value") is not None and not math.isfinite(float(bound["value"])):
+                errors.append(f"non_finite_exploration_{label}:{rid}")
+        if minimum.get("value") is not None and maximum.get("value") is not None and float(maximum["value"]) <= float(minimum["value"]):
+            errors.append(f"exploration_limits_inverted:{rid}")
     for transition in artifact.get("transitions", []):
         if transition.get("from_region") not in ids or transition.get("to_region") not in ids:
             errors.append("transition_references_unknown_region")
@@ -865,11 +1031,17 @@ def _validate_initial_camera(artifact: dict[str, Any]) -> dict[str, Any]:
         return {"status": "INVALID", "station_id": default_id, "error": "default_camera_outside_navigation_region"}
     vertical = region.get("vertical_bounds", {})
     floor, ceiling = vertical.get("floor") or {}, vertical.get("ceiling") or {}
-    if floor.get("value") is None or ceiling.get("value") is None:
+    exploration = region.get("exploration_limits") or {}
+    minimum, maximum = exploration.get("minimum_height") or {}, exploration.get("maximum_height") or {}
+    if minimum.get("value") is not None and maximum.get("value") is not None:
+        low = float(minimum["value"]) + float(minimum.get("clearance", 0.0))
+        high = float(maximum["value"]) - float(maximum.get("clearance", 0.0))
+    elif floor.get("value") is not None and ceiling.get("value") is not None:
+        low = float(floor["value"]) + float(floor.get("clearance", 0.0))
+        high = float(ceiling["value"]) - float(ceiling.get("clearance", 0.0))
+    else:
         return {"status": "INSUFFICIENT_GEOMETRY", "station_id": default_id, "region_id": region["id"],
                 "error": "default_camera_vertical_bounds_unavailable"}
-    low = float(floor["value"]) + float(floor.get("clearance", 0.0))
-    high = float(ceiling["value"]) - float(ceiling.get("clearance", 0.0))
     if float(local[2]) < low - 1e-8 or float(local[2]) > high + 1e-8:
         return {"status": "INVALID", "station_id": default_id, "region_id": region["id"],
                 "height_units": local[2], "allowed_height_units": [low, high], "error": "default_camera_outside_vertical_bounds"}
@@ -903,8 +1075,13 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                              "message": "A dominant aligned LiDAR plane is only a geometric candidate; a reviewer must confirm it is ground before approving navigation."})
     else:
         plane_viewer = None
-        basis = None
-        warnings.append({"code": "FLOOR_UNOBSERVED", "severity": "BLOCKING", "message": "No ground/floor plane was supplied; camera height is not sufficient evidence to manufacture one."})
+        basis = _up_axis_basis(frame)
+        if basis:
+            warnings.append({"code": "GROUND_PLANE_UNVERIFIED", "severity": "REVIEW",
+                             "message": "No physical floor was supplied. Viewer-up is used only to project camera and geometry evidence; photo-SfM can propose a lower exploration limit for review."})
+        else:
+            warnings.append({"code": "FLOOR_UNOBSERVED", "severity": "BLOCKING",
+                             "message": "No ground/floor plane or viewer-up axis was supplied; a horizontal exploration frame cannot be established."})
     cameras = source.get("stations", source.get("cameras", []))
     projected: list[dict[str, Any]] = []
     pose_exclusions: list[dict[str, Any]] = []
@@ -995,13 +1172,38 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     margin_units = float(config.get("margin_units", 0.0))
     if margin_units < 0 or not math.isfinite(margin_units):
         raise ValueError("margin_units must be finite and non-negative")
+    margin_spacing_factor = float(config.get("camera_boundary_margin_spacing_factor", 0.0))
+    if margin_spacing_factor < 0 or not math.isfinite(margin_spacing_factor):
+        raise ValueError("camera_boundary_margin_spacing_factor must be finite and non-negative")
     ceiling_cfg = source.get("ceiling") or source.get("geometry", {}).get("ceiling") or config.get("ceiling")
     default_floor_clearance = float(config.get("floor_clearance_units", 0.0))
     default_ceiling_clearance = float(config.get("ceiling_clearance_units", 0.0))
+    sparse_input = source.get("sparse_points") or []
+    sparse_tracks = source.get("sparse_point_tracks") or []
+    sparse_uvh: list[list[float]] = []
+    sparse_geometry: list[dict[str, Any]] = []
+    if basis:
+        for point_index, point in enumerate(sparse_input):
+            try:
+                point_viewer = _finite_vector(point, 3, "sparse point")
+                if not frame.get("coordinates_are_viewer"):
+                    point_viewer = _transform_point(point_viewer, scale, rotation, translation)
+                local = _project(point_viewer, basis)
+                sparse_uvh.append(local)
+                if point_index < len(sparse_tracks):
+                    sparse_geometry.append({"viewer": point_viewer, "uvh": local,
+                                            "track_length": int(sparse_tracks[point_index])})
+            except (TypeError, ValueError, OverflowError):
+                continue
     regions = []
     region_station_assignments: dict[str, list[dict[str, Any]]] = {}
     unresolved_components: list[dict[str, Any]] = []
+    excluded_components: list[dict[str, Any]] = []
+    component_for_station = {row["station_id"]: f"camera-component-{component_index:02d}"
+                             for component_index, component in enumerate(components, 1)
+                             for row in component}
     for index, component in enumerate(components, 1):
+        component_id = f"camera-component-{index:02d}"
         component_points = [row["uvh"] for row in component]
         if len({(round(p[0], 10), round(p[1], 10)) for p in component_points}) < 3:
             unresolved_components.append({"camera_ids": [row.get("camera_id") for row in component],
@@ -1021,17 +1223,91 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                           "station_ids": [row.get("station_id") for row in component],
                                           "reason": "no_finite_simple_footprint"})
             continue
-        if margin_units > 0:
+        margin_units_used = margin_units + component_spacing * margin_spacing_factor
+        if margin_units_used > 0:
             try:
-                polygon = _offset_polygon(polygon, margin_units)
+                polygon = _offset_polygon(polygon, margin_units_used)
             except ValueError as exc:
                 warnings.append({"code": "MARGIN_REJECTED", "severity": "REVIEW", "message": str(exc)})
                 margin_units_used = 0.0
-            else:
-                margin_units_used = margin_units
-        else:
-            margin_units_used = 0.0
-        rid = f"region-{index:02d}"
+        rid = f"region-{len(regions) + 1:02d}"
+        ground_candidate = None
+        if not plane_viewer and basis:
+            ground_candidate = _geometry_ground_candidate(component, polygon, sparse_geometry, basis,
+                                                          component_spacing, config)
+        local_limits = source.get("exploration_vertical_limits") or config.get("exploration_vertical_limits")
+        exploration_limits = None
+        if isinstance(local_limits, dict):
+            minimum = local_limits.get("minimum_height", local_limits.get("minimum"))
+            maximum = local_limits.get("maximum_height", local_limits.get("maximum"))
+            if minimum is not None and maximum is not None:
+                exploration_limits = {"minimum_height": {"value": float(minimum),
+                                                            "classification": "CONFIGURED_EXPLORATION_LIMIT_PROPOSAL",
+                                                            "physical_surface": False},
+                                      "maximum_height": {"value": float(maximum),
+                                                            "classification": "CONFIGURED_EXPLORATION_LIMIT_PROPOSAL",
+                                                            "physical_surface": False},
+                                      "source": "operator-configured local navigation heights",
+                                      "physical_ceiling_inferred": False}
+        local_supported = [row["uvh"][2] for row in sparse_geometry
+                           if row["track_length"] >= int(config.get("minimum_ground_track_length", 3)) and
+                           _point_in_polygon(row["uvh"][:2], polygon)]
+        lower_limit = (0.0 if plane_viewer else
+                       ground_candidate.get("representative_height") if ground_candidate and
+                       ground_candidate.get("status") == "PROPOSED" else None)
+        if (exploration_limits is None and lower_limit is not None and
+                scene_type in {"auto", "outdoor"} and len(local_supported) >= 3):
+            upper_percentile = float(config.get("exploration_height_percentile", 0.995))
+            upper_margin_factor = float(config.get("exploration_height_margin_spacing_factor", 0.5))
+            if not 0.9 <= upper_percentile < 1.0 or upper_margin_factor < 0 or not math.isfinite(upper_margin_factor):
+                raise ValueError("exploration height percentile or spacing margin is invalid")
+            upper_limit = _quantile(local_supported, upper_percentile) + component_spacing * upper_margin_factor
+            if upper_limit > lower_limit and all(row["uvh"][2] >= lower_limit - component_spacing for row in component):
+                lower_class = (plane_viewer["classification"] if plane_viewer else
+                               "PHOTO_SFM_GROUND_LEVEL_PROPOSAL")
+                upper_class = "PHOTO_SFM_MODEL_SUPPORT_EXPLORATION_LIMIT_PROPOSAL"
+                exploration_limits = {
+                    "minimum_height": {"value": lower_limit, "classification": lower_class,
+                                       "physical_surface": bool(plane_viewer),
+                                       "evidence": plane_viewer.get("evidence", []) if plane_viewer else ground_candidate.get("evidence", {})},
+                    "maximum_height": {"value": upper_limit, "classification": upper_class,
+                                       "physical_surface": False,
+                                       "evidence": {"track_length_minimum": int(config.get("minimum_ground_track_length", 3)),
+                                                    "support_point_count": len(local_supported),
+                                                    "support_height_percentile": upper_percentile,
+                                                    "spacing_margin_factor": upper_margin_factor,
+                                                    "median_station_spacing_units": component_spacing}},
+                    "source": "local multi-view photo-SfM support; upper value is an exploration limit, not a ceiling",
+                    "physical_ceiling_inferred": False}
+        bounds_ready = bool(
+            plane_viewer and ceiling_cfg and
+            ceiling_cfg.get("height_along_floor_normal_units", ceiling_cfg.get("value")) is not None
+        ) or bool(exploration_limits and
+                 exploration_limits["minimum_height"].get("value") is not None and
+                 exploration_limits["maximum_height"].get("value") is not None and
+                 float(exploration_limits["maximum_height"]["value"]) > float(exploration_limits["minimum_height"]["value"]))
+        if not bounds_ready:
+            reason = (ground_candidate or {}).get("reason") or "vertical exploration bounds are unavailable"
+            excluded_components.append({"component_id": component_id,
+                                        "camera_ids": [row.get("camera_id") for row in component],
+                                        "station_ids": [row.get("station_id") for row in component],
+                                        "polygon_uv": polygon, "reason": reason,
+                                        "ground_plane_candidate": ground_candidate,
+                                        "candidate_station_count": len(component)})
+            for row in component:
+                pose_exclusions.append({"camera_id": row.get("camera_id"), "image_id": row.get("image_id"),
+                                        "image_name": row.get("image_name"), "station_id": row.get("station_id"),
+                                        "navigation_local_uvh": row["uvh"],
+                                        "reason": "camera_component_excluded_insufficient_vertical_or_ground_geometry"})
+            warnings.append({"code": "CAMERA_COMPONENT_EXCLUDED_INSUFFICIENT_GEOMETRY", "severity": "REVIEW",
+                             "message": f"{len(component)} camera position(s) in {component_id} are excluded because the available geometry does not support a bounded free-XYZ exploration volume."})
+            if scene_type == "outdoor":
+                warnings.append({"code": "OPEN_AIR_VERTICAL_LIMIT_UNVERIFIED", "severity": "REVIEW",
+                                 "message": f"No reviewed lower and upper exploration limits are available for {component_id}; no physical ceiling was inferred."})
+            elif not ceiling_cfg:
+                warnings.append({"code": "CEILING_UNOBSERVED", "severity": "BLOCKING",
+                                 "message": f"No ceiling bound is available for {rid}; public movement cannot be enabled until reviewed."})
+            continue
         if plane_viewer:
             floor_value = 0.0
             floor_class = plane_viewer["classification"]
@@ -1044,42 +1320,40 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
             ceiling_evidence = ceiling_cfg.get("evidence", [])
         else:
             ceiling_value, ceiling_class, ceiling_evidence = None, "CEILING_UNOBSERVED", []
-            code = "OPEN_AIR_VERTICAL_LIMIT_UNVERIFIED" if scene_type == "outdoor" else "CEILING_UNOBSERVED"
-            message = (f"No artificial ceiling was inferred for open-air region {rid}; the vertical navigation limit remains unverified."
-                       if scene_type == "outdoor" else
-                       f"No ceiling bound is available for {rid}; public movement cannot be enabled until reviewed.")
-            warnings.append({"code": code, "severity": "REVIEW" if scene_type == "outdoor" else "BLOCKING", "message": message})
+            if exploration_limits:
+                warnings.append({"code": "EXPLORATION_LIMITS_REQUIRE_REVIEW", "severity": "REVIEW",
+                                 "message": f"Region {rid} has proposed lower and upper exploration limits; its upper limit is not a physical ceiling."})
+            else:
+                code = "OPEN_AIR_VERTICAL_LIMIT_UNVERIFIED" if scene_type == "outdoor" else "CEILING_UNOBSERVED"
+                message = (f"No artificial ceiling was inferred for open-air region {rid}; the vertical navigation limit remains unverified."
+                           if scene_type == "outdoor" else
+                           f"No ceiling bound is available for {rid}; public movement cannot be enabled until reviewed.")
+                warnings.append({"code": code, "severity": "REVIEW" if scene_type == "outdoor" else "BLOCKING", "message": message})
         station_ids = [row.get("station_id") or row.get("camera_id") or row.get("image_id") or row.get("image_name") for row in component]
         region_station_assignments[rid] = component
         region = {"id": rid, "polygon_uv": polygon, "coordinate_frame": "navigation_local_uv",
                   "algorithm": algorithm, "classification": "CAMERA_DERIVED_PROPOSAL",
-                  "status": "PROPOSED", "confidence": "UNASSESSED",
+                  "status": "PROPOSED", "confidence": "REVIEW_REQUIRED",
                   "evidence": {"trusted_station_count": sum(1 for row in component if row["trust_explicit"]),
                                "candidate_station_count": len(component),
                                "provisional_station_count": sum(1 for row in component if not row["trust_explicit"]),
                                "station_ids": station_ids,
                                "median_nearest_neighbor_spacing_units": component_spacing,
                                "alpha_radius_units": component_spacing * alpha_scale,
+                               "boundary_margin_units": margin_units_used,
+                               "ground_plane_candidate": ground_candidate,
                                "camera_occupied_footprint": "Camera locations are spatial evidence only; the footprint interior is not presumed traversable without review."},
                   "boundary_segments": [{"classification": "CAMERA_DERIVED", "inferred_margin_units": margin_units_used,
                                          "geometry_supported": False} for _ in polygon],
                   "vertical_bounds": {"floor": {"value": floor_value, "classification": floor_class, "clearance": default_floor_clearance, "evidence": floor_evidence},
                                        "ceiling": None if ceiling_value is None else {"value": ceiling_value, "classification": ceiling_class, "clearance": default_ceiling_clearance, "evidence": ceiling_evidence}},
+                  "exploration_limits": exploration_limits,
+                  "geometry_candidates": {"ground_plane": ground_candidate} if ground_candidate else {},
                   "uncertainty": ["Camera trajectories do not prove the entire footprint is traversable.",
                                   "The proposed boundary is a conservative camera-coverage limit, not a physical wall.",
-                                  "Ground and vertical limits remain unverified unless independently supported."]}
+                                  "Ground and vertical limits remain proposals until explicitly reviewed.",
+                                  "The upper exploration limit is not a reconstructed ceiling."]}
         regions.append(region)
-    sparse_uvh = []
-    sparse_input = source.get("sparse_points") or []
-    if basis:
-        for point in sparse_input:
-            try:
-                point_viewer = _finite_vector(point, 3, "sparse point")
-                if not frame.get("coordinates_are_viewer"):
-                    point_viewer = _transform_point(point_viewer, scale, rotation, translation)
-                sparse_uvh.append(_project(point_viewer, basis))
-            except (TypeError, ValueError):
-                continue
     for region in regions:
         support_band = float(region["evidence"]["median_nearest_neighbor_spacing_units"])
         polygon = region["polygon_uv"]
@@ -1098,6 +1372,11 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
             "input_point_count": len(sparse_input), "finite_points_in_navigation_frame": len(sparse_uvh),
             "points_inside_candidate": inside_count, "points_within_station_spacing_of_candidate_boundary": near_boundary_count,
             "near_boundary_points_inside_candidate": near_boundary_inside_count,
+            "points_with_track_length_minimum_inside_candidate": sum(
+                1 for point_index, local in enumerate(sparse_uvh)
+                if point_index < len(sparse_tracks) and
+                int(sparse_tracks[point_index]) >= int(config.get("minimum_ground_track_length", 3)) and
+                _point_in_polygon(local[:2], polygon)),
             "boundary_band_units": support_band,
             "architectural_classification": "NOT_PERFORMED",
             "interpretation": "Sparse-point proximity is diagnostic only; it does not classify walls, floors, furniture, or traversability, and low density is not evidence of empty space."}
@@ -1106,31 +1385,57 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
         transitions.append({"from_region": item.get("from_region"), "to_region": item.get("to_region"),
                             "portal": {"segment_uv": item.get("segment_uv")}, "classification": item.get("classification", "REVIEW_PROPOSED"),
                             "approved": bool(item.get("approved", False)), "evidence": item.get("evidence", [])})
+    candidate_rows = [row for members in region_station_assignments.values() for row in members]
+    candidate_station_ids = {row["station_id"] for row in candidate_rows}
+    insufficient_station_ids = {station_id for item in excluded_components
+                                for station_id in item.get("station_ids", [])}
+    unresolved_station_ids = {station_id for item in unresolved_components
+                              for station_id in item.get("station_ids", [])}
+    if excluded_components:
+        warnings.append({"code": "CAMERA_COMPONENTS_EXCLUDED", "severity": "REVIEW",
+                         "message": f"{len(excluded_components)} disconnected camera component(s) were excluded because their local geometry does not support a bounded exploration volume."})
     if len(regions) > 1:
-        warnings.append({"code": "MULTIPLE_REGIONS", "severity": "REVIEW", "message": f"{len(regions)} separate camera-supported regions are represented. No doorway or transition is inferred from proximity."})
-    if len(regions) == 1 and len(components) == 1:
-        convex = _convex_hull([row["uvh"] for row in retained])
+        warnings.append({"code": "MULTIPLE_REGIONS", "severity": "REVIEW", "message": f"{len(regions)} separate camera-supported regions are represented. No connection is inferred from proximity."})
+    if len(regions) == 1 and len(candidate_rows) == len(region_station_assignments.get(regions[0]["id"], [])):
+        convex = _convex_hull([row["uvh"] for row in candidate_rows])
         if len(regions[0]["polygon_uv"]) <= len(convex) and abs(abs(_signed_area(convex)) - abs(_signed_area(regions[0]["polygon_uv"]))) < max(1e-5, abs(_signed_area(convex)) * 0.01):
             regions[0]["topology"] = "CONVEX_OR_UNRESOLVED"
             warnings.append({"code": "CONVEXITY_NOT_ARCHITECTURALLY_CONFIRMED", "severity": "REVIEW", "message": "Camera coverage does not establish that the convex footprint perimeter is a wall or safe boundary."})
         else:
             regions[0]["topology"] = "CONCAVE_ALPHA_SHAPE"
     stations = []
-    for row in retained:
+    for row in candidate_rows:
         stations.append({"stationId": row["station_id"] or f"camera-{row['image_id'] or len(stations) + 1}",
                          "centerCommonViewer": row["center_viewer"], "representativeForwardCommonViewer": row["forward_viewer"],
                          "normalVisitorPositionCandidate": True, "planeCoordinates": row["uvh"][:2],
                          "regionId": next((rid for rid, members in region_station_assignments.items() if row in members), None),
                          "imageKeys": row["image_keys"]})
+    camera_trajectory = []
+    for row in projected:
+        if row["station_id"] in candidate_station_ids:
+            coverage_status = "INCLUDED_PROPOSAL"
+        elif row["station_id"] in insufficient_station_ids:
+            coverage_status = "EXCLUDED_INSUFFICIENT_GEOMETRY"
+        elif row["station_id"] in unresolved_station_ids:
+            coverage_status = "UNRESOLVED_FOOTPRINT"
+        else:
+            coverage_status = "EXCLUDED_POSE"
+        camera_trajectory.append({"station_id": row["station_id"], "image_id": row["image_id"],
+                                  "image_name": row["image_name"], "viewer_center": row["center_viewer"],
+                                  "viewer_forward": row["forward_viewer"], "navigation_local_uvh": row["uvh"],
+                                  "component_id": component_for_station.get(row["station_id"]),
+                                  "coverage_status": coverage_status,
+                                  "pose_trust": "TRUSTED" if row["trust_explicit"] else "PROVISIONAL"})
     if not transform_verified:
         warnings.append({"code": "VIEWER_ALIGNMENT_UNVERIFIED", "severity": "BLOCKING", "message": "The SfM-to-viewer transform is mathematically valid but not marked verified against the selected model's transform."})
-    if not plane_viewer:
-        warnings.append({"code": "NAVIGATION_INSUFFICIENT_GEOMETRY", "severity": "BLOCKING", "message": "A floor-aligned frame cannot be established without a floor plane."})
-    if spacing > EPS and margin_units > 2.0 * spacing:
+    if not basis:
+        warnings.append({"code": "NAVIGATION_INSUFFICIENT_GEOMETRY", "severity": "BLOCKING", "message": "A horizontal viewer/navigation basis cannot be established from the supplied evidence."})
+    if spacing > EPS and margin_units + margin_spacing_factor * spacing > 2.0 * spacing:
         warnings.append({"code": "EXTRAPOLATION_EXCEEDS_SUPPORTED_SCALE", "severity": "BLOCKING", "message": "Configured margin exceeds twice the observed median station spacing."})
-    if margin_units > 0:
-        warnings.append({"code": "INFERRED_NAVIGATION_MARGIN", "severity": "REVIEW", "message": f"The configured {margin_units:g} scene-unit extension is inferred; it has no metric interpretation."})
-    provisional = [row for row in retained if not row["trust_explicit"]]
+    if margin_units > 0 or margin_spacing_factor > 0:
+        warnings.append({"code": "INFERRED_NAVIGATION_MARGIN", "severity": "REVIEW",
+                         "message": f"Boundary expansion uses {margin_units:g} scene units plus {margin_spacing_factor:g} times local camera spacing; its scale is non-metric."})
+    provisional = [row for row in candidate_rows if not row["trust_explicit"]]
     if provisional:
         warnings.append({"code": "POSE_TRUST_UNASSESSED", "severity": "REVIEW", "message": f"{len(provisional)} camera poses lack an explicit trust classification and are only candidate evidence."})
     source_rec = dict(source.get("source_reconstruction", {}))
@@ -1139,8 +1444,10 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     source_rec["sparse_point_count"] = source.get("sparse_point_count", len(source.get("sparse_points", [])))
     transform_matrix = [[scale * rotation[i][j] for j in range(3)] + [translation[i]] for i in range(3)] + [[0, 0, 0, 1]]
     frame_doc = {"source_frame": frame.get("name", frame.get("convention", "UNSPECIFIED_SFM_FRAME")),
-                 "navigation_frame": ("floor-aligned local u/v with positive height along the evidenced floor normal"
-                                      if basis else "provisional local u/v/h from camera positions; up-axis and ground plane unverified"),
+                 "navigation_frame": ("floor-aligned local u/v/h from explicitly supplied geometric plane"
+                                      if plane_viewer else
+                                      "right-handed viewer-up local u/v/h; viewer-up proposal is not physical gravity" if basis else
+                                      "provisional local u/v/h from camera positions; up-axis and ground plane unverified"),
                  "viewer_frame": frame.get("viewer_frame", "PlayCanvas model frame"),
                  "source_to_viewer_matrix_row_major": transform_matrix,
                  "viewer_to_navigation": {"origin_viewer": basis["origin"] if basis else None,
@@ -1149,7 +1456,8 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                           "up_viewer": basis["normal"] if basis else None},
                  "uniform_scale": scale, "scale_status": frame.get("scale_status", "UNKNOWN_NON_METRIC"),
                  "viewer_transform_verified": transform_verified, "inverse_stored": "transpose(rotation)/uniform_scale with inverse translation; represented by the orthonormal frame basis above",
-                 "plane_definition": plane_viewer, "transform_provenance": frame.get("transform_provenance", "configured; verify against selected model before publication")}
+                 "plane_definition": plane_viewer, "navigation_up_evidence": frame.get("navigation_up_evidence"),
+                 "transform_provenance": frame.get("transform_provenance", "configured; verify against selected model before publication")}
     def center_record(row: dict[str, Any]) -> dict[str, Any]:
         return {"station_id": row["station_id"], "camera_id": row["camera_id"],
                 "image_id": row["image_id"], "image_name": row["image_name"],
@@ -1157,14 +1465,14 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                 "region_id": next((rid for rid, members in region_station_assignments.items() if row in members), None),
                 "pose_trust": "TRUSTED" if row["trust_explicit"] else "PROVISIONAL",
                 "trust_reason": row["trust_reason"]}
-    candidate_centers = [center_record(row) for row in retained]
+    candidate_centers = [center_record(row) for row in candidate_rows]
     trusted_centers = [center for center in candidate_centers if center["pose_trust"] == "TRUSTED"]
     provisional_centers = [center for center in candidate_centers if center["pose_trust"] == "PROVISIONAL"]
     pose_doc = {"input_pose_count": len(cameras), "trusted_input_count": sum(1 for row in projected if row["trust_explicit"]),
                 "provisional_pose_count": len(provisional),
                 "provisional_registered_pose_count": sum(1 for row in provisional if row["trust_reason"] == "COLMAP_REGISTERED_UNASSESSED"),
                 "pose_trust_source": "explicit configured trust classification; otherwise poses remain provisional candidate evidence",
-                "used_camera_station_count": len(retained), "excluded_pose_count": len(pose_exclusions), "excluded_poses": pose_exclusions,
+                "used_camera_station_count": len(candidate_rows), "excluded_pose_count": len(pose_exclusions), "excluded_poses": pose_exclusions,
                 "unresolved_components": unresolved_components,
                 "candidate_camera_centers": candidate_centers,
                 "trusted_camera_centers": trusted_centers,
@@ -1183,18 +1491,21 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                 "floor_constraints": [{"region_id": r["id"], **r["vertical_bounds"]["floor"]} for r in regions],
                 "ceiling_constraints": [{"region_id": r["id"], **(r["vertical_bounds"].get("ceiling") or {"value": None, "classification": "CEILING_UNOBSERVED"})} for r in regions],
                 "space_assumption": {"scene_type": scene_type,
-                                     "initial_model": ("open-air camera-coverage footprint; no walls or ceiling inferred" if scene_type == "outdoor" else
+                                     "initial_model": ("open-air camera-coverage exploration envelope; no walls or physical ceiling inferred" if scene_type == "outdoor" else
                                                        "single floor-aligned level per region" if scene_type == "indoor" else
-                                                       "scene enclosure type unclassified; camera-coverage proposal only"),
+                                                       "scene enclosure type unclassified; geometry-supported exploration proposal only"),
                                      "physical_walls_or_ceiling_inferred": False,
                                      "multi_level_suspected": pose_doc["vertical_spread"]["possible_multi_level_or_slope"],
                                      "requires_review_when_suspected": True},
                 "coverage_assumptions": {"scene_type": scene_type,
                                          "boundary": "CAMERA_TRAJECTORY_ALPHA_SHAPE_PROPOSAL",
                                          "coordinate_up_axis": frame.get("up_axis", "UNSPECIFIED"),
-                                         "ground_plane": ("GEOMETRY_INPUT_REQUIRED" if not plane_viewer else
+                                         "ground_plane": ("PHOTO_SFM_CANDIDATE_REQUIRES_REVIEW" if any(r.get("geometry_candidates", {}).get("ground_plane", {}).get("status") == "PROPOSED" for r in regions) else
+                                                          "GEOMETRY_INPUT_REQUIRED" if not plane_viewer else
                                                           "PROPOSED_REQUIRES_HUMAN_IDENTIFICATION" if str(plane_viewer.get("classification", "")).startswith("PROPOSED_") else
                                                           "GEOMETRY_SUPPORTED_OR_REVIEWED"),
+                                         "vertical_limit": ("EXPLORATION_LIMIT_PROPOSAL_NOT_PHYSICAL_CEILING" if any(r.get("exploration_limits") for r in regions) else
+                                                            "PHYSICAL_FLOOR_AND_CEILING" if ceiling_cfg else "UNVERIFIED"),
                                          "physical_walls_or_ceiling_inferred": False,
                                          "aligned_lidar_used": bool(source.get("aligned_lidar_geometry_used", False)),
                                          "aligned_lidar_diagnostics": source.get("aligned_lidar_diagnostics", {"status": "NOT_AVAILABLE"}),
@@ -1202,7 +1513,33 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                 "camera_clearance": {"horizontal_units": float(config.get("camera_clearance_units", 0.0)), "distance_unit": "reconstruction/viewer scene units; metric scale is not assumed", "interior_object_collision": False},
                 "guided_paths": source.get("guided_paths", config.get("guided_paths", [])), "viewpoints": source.get("viewpoints", config.get("viewpoints", [])),
                 "review": {"status": "REQUIRED", "approved": False, "decisions": [], "warnings": warnings,
-                           "required_checks": ["Confirm every region boundary", "Confirm floor and ceiling bounds per region", "Confirm any doorway transition", "Confirm default camera and guided paths"]},
+                           "ground_plane_reviewed": False,
+                           "required_checks": ["Confirm every region boundary and excluded component",
+                                               "Confirm each photo-SfM ground candidate or configured lower exploration limit",
+                                               "Confirm the virtual upper exploration limit; it is not a ceiling",
+                                               "Confirm any doorway transition", "Confirm the default camera and free-XYZ bounds"]},
+                "coverage_diagnostics": {"camera_component_count": len(components),
+                                         "supported_component_count": len(regions),
+                                         "excluded_camera_components": excluded_components,
+                                         "camera_candidate_count": len(projected),
+                                         "camera_used_count": len(candidate_rows),
+                                         "camera_excluded_count": len(pose_exclusions),
+                                         "sparse_point_count": len(sparse_input),
+                                         "sparse_point_track_length_metadata_available": len(sparse_tracks) == len(sparse_input),
+                                         "camera_trajectory": camera_trajectory,
+                                         "median_nearest_neighbor_spacing_units": spacing,
+                                         "projected_camera_bounds_uvh": ({"minimum": [min(row["uvh"][axis] for row in projected) for axis in range(3)],
+                                                                          "maximum": [max(row["uvh"][axis] for row in projected) for axis in range(3)]}
+                                                                         if projected else None),
+                                         "component_footprints": [{"component_id": f"camera-component-{index:02d}",
+                                                                    "camera_count": len(component),
+                                                                    "median_nearest_neighbor_spacing_units": _median_spacing([row["uvh"] for row in component]),
+                                                                    "convex_hull_area_square_units": abs(_signed_area(_convex_hull([row["uvh"] for row in component]))) if len(component) >= 3 else 0.0,
+                                                                    "proposal_status": ("INCLUDED_PROPOSAL" if any(row["station_id"] in candidate_station_ids for row in component) else
+                                                                                        "EXCLUDED_INSUFFICIENT_GEOMETRY" if any(row["station_id"] in insufficient_station_ids for row in component) else
+                                                                                        "UNRESOLVED_FOOTPRINT")}
+                                                                   for index, component in enumerate(components, 1)],
+                                         "aligned_lidar_used": False},
                 "validation": {}, "provenance": {"generator": "exhibition_archive.navigation", "generator_version": "0.1.0",
                                                   "algorithm": "camera-neighbor components + 2D alpha shape with convex review fallback", "configuration": config,
                                                   "input_station_ids": [row["station_id"] for row in projected],
@@ -1233,8 +1570,16 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     if any(item["outside_provisional_station_ids"] for item in containment):
         warnings.append({"code": "PROVISIONAL_STATION_OUTSIDE_PROPOSED_REGION", "severity": "REVIEW",
                          "message": "One or more provisional camera stations fall outside their candidate region; inspect the pose and region assignments before approval."})
-    if (not plane_viewer or len(retained) < 3 or not regions
-            or any(not region.get("vertical_bounds", {}).get("ceiling") for region in regions)):
+    def has_navigation_volume(region: dict[str, Any]) -> bool:
+        vertical = region.get("vertical_bounds", {})
+        floor, ceiling = vertical.get("floor") or {}, vertical.get("ceiling") or {}
+        limits = region.get("exploration_limits") or {}
+        minimum, maximum = limits.get("minimum_height") or {}, limits.get("maximum_height") or {}
+        return bool((floor.get("value") is not None and ceiling.get("value") is not None) or
+                    (minimum.get("value") is not None and maximum.get("value") is not None and
+                     float(maximum["value"]) > float(minimum["value"])))
+    if (not basis or len(candidate_rows) < 3 or not regions or
+            any(not has_navigation_volume(region) for region in regions)):
         result["status"] = "NAVIGATION_INSUFFICIENT_GEOMETRY"
     artifact["validation"] = result
     artifact["status"] = ("NAVIGATION_INSUFFICIENT_GEOMETRY" if result["status"] == "NAVIGATION_INSUFFICIENT_GEOMETRY"
@@ -1244,15 +1589,22 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     if basis and regions:
         plane_basis = {"normalUnit": basis["normal"], "offset": -_dot(basis["normal"], basis["origin"]),
                        "pointOnPlaneCommonViewer": basis["origin"], "basisU": basis["u"], "basisV": basis["v"],
-                       "construction": "floor-aligned basis from explicit plane normal; no global-up assumption"}
+                       "construction": ("floor-aligned basis from explicitly supplied geometric plane" if plane_viewer else
+                                        "right-handed viewer-up projection basis; not a physical ground-plane claim")}
         vertices_viewer = [_unproject([uv[0], uv[1], 0], basis) for uv in regions[0]["polygon_uv"]]
         viewer_regions = []
         for region in regions:
+            region_limits = region.get("exploration_limits")
             viewer_regions.append({"regionId": region["id"], "vertices2d": region["polygon_uv"],
                                    "floor": region["vertical_bounds"]["floor"], "ceiling": region["vertical_bounds"].get("ceiling"),
+                                   "explorationLimits": ({"upNormal": basis["normal"], "originCommonViewer": basis["origin"],
+                                                          "minimumHeight": region_limits["minimum_height"]["value"],
+                                                          "maximumHeight": region_limits["maximum_height"]["value"],
+                                                          "classification": "REVIEW_REQUIRED", "physicalCeiling": False}
+                                                         if region_limits else None),
                                    "classification": region["classification"], "status": region["status"]})
         envelope = {"schemaVersion": 1, "id": artifact["id"], "status": "NAVIGATION_NEEDS_REVIEW",
-                    "classification": "CAMERA_DERIVED_PROPOSAL", "coordinateFrame": "Explicit floor-aligned navigation frame mapped to PlayCanvas viewer coordinates",
+                    "classification": "CAMERA_DERIVED_PROPOSAL", "coordinateFrame": frame_doc["navigation_frame"],
                     "sourceModelSha256": source.get("source_model_sha256"), "sourceReconstruction": source_rec,
                     "horizontalBoundary": {"candidateId": artifact["id"], "algorithm": regions[0]["algorithm"],
                                            "classification": "CAMERA_DERIVED_PROPOSAL", "closed": True,
@@ -1262,16 +1614,37 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                            "cameraStationInclusion": {"insideOrOn": sum(x["trusted_station_count"] - len(x["outside_trusted_station_ids"]) for x in containment),
                                                                          "total": sum(x["trusted_station_count"] for x in containment)},
                                            "marginUnits": margin_units, "cameraClearanceUnits": artifact["camera_clearance"]["horizontal_units"]},
-                    "floor": {"normal": basis["normal"], "offset": -_dot(basis["normal"], basis["origin"]), "clearance": default_floor_clearance,
-                              "classification": plane_viewer["classification"] if plane_viewer else "FLOOR_UNOBSERVED"},
-                    "ceiling": {"heightAlongFloorNormal": ceiling_cfg.get("height_along_floor_normal_units", ceiling_cfg.get("value")) if ceiling_cfg else None,
-                                "clearance": default_ceiling_clearance, "classification": ceiling_cfg.get("classification", "INFERRED") if ceiling_cfg else "CEILING_UNOBSERVED"},
+                    "floor": ({"normal": basis["normal"], "offset": -_dot(basis["normal"], basis["origin"]), "clearance": default_floor_clearance,
+                               "classification": plane_viewer["classification"]} if plane_viewer else None),
+                    "ceiling": ({"heightAlongFloorNormal": ceiling_cfg.get("height_along_floor_normal_units", ceiling_cfg.get("value")),
+                                 "clearance": default_ceiling_clearance, "classification": ceiling_cfg.get("classification", "INFERRED")} if ceiling_cfg else None),
+                    "explorationLimits": ({"upNormal": basis["normal"], "originCommonViewer": basis["origin"],
+                                           "minimumHeight": regions[0]["exploration_limits"]["minimum_height"]["value"],
+                                           "maximumHeight": regions[0]["exploration_limits"]["maximum_height"]["value"],
+                                           "classification": "REVIEW_REQUIRED", "physicalCeiling": False,
+                                           "regions": [{"regionId": region["id"],
+                                                        "upNormal": basis["normal"],
+                                                        "originCommonViewer": basis["origin"],
+                                                        "minimumHeight": region["exploration_limits"]["minimum_height"]["value"],
+                                                        "maximumHeight": region["exploration_limits"]["maximum_height"]["value"]}
+                                                       for region in regions if region.get("exploration_limits")]}
+                                          if regions[0].get("exploration_limits") else None),
                     "navigation": {"interiorObjectCollision": False, "freeXYZWithinEnvelope": True, "regionConnectivity": "explicit approved portals only"},
-                    "limitations": ["Proposal only; camera coverage is not proof of traversability.", "Scene units are non-metric unless calibration is recorded."]}
+                    "limitations": ["Proposal only; camera coverage is not proof of traversability.",
+                                    "Scene units are non-metric unless calibration is recorded.",
+                                    "Exploration limits are virtual viewer constraints, not reconstructed ceilings."]}
         policy = {"schemaVersion": 1, "status": "NEEDS_REVIEW", "sourceModelSha256": source.get("source_model_sha256"),
-                  "cameraPolicy": "architectural-envelope", "navigation": {"interiorObjectCollision": False, "freeXYZWithinEnvelope": True,
+                  "cameraPolicy": "camera-coverage-exploration-envelope" if envelope.get("explorationLimits") else "architectural-envelope",
+                  "navigation": {"interiorObjectCollision": False, "freeXYZWithinEnvelope": True,
                                                                             "sweptHorizontalCrossingCheck": True, "publicApprovalRequired": True}}
         default_station_id = config.get("default_station_id", source.get("default_station_id"))
+        if default_station_id not in {station["stationId"] for station in stations} and candidate_rows:
+            # Match the first-visual reset rule: choose the supported registered
+            # camera nearest the component-wise median camera center.
+            medians = [_quantile([row["center_viewer"][axis] for row in projected], 0.5)
+                       for axis in range(3)]
+            default_row = min(candidate_rows, key=lambda row: _distance(row["center_viewer"], medians))
+            default_station_id = default_row["station_id"]
         if default_station_id not in {station["stationId"] for station in stations}:
             default_station_id = stations[0]["stationId"] if stations else None
         artifact["viewer_compatibility"] = {"envelope": envelope, "runtime_policy": policy,
@@ -1282,7 +1655,7 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     final_validation["errors"] = list(dict.fromkeys([*result.get("errors", []), *final_validation.get("errors", [])]))
     final_validation.update({key: value for key, value in result.items() if key not in final_validation})
     fatal_errors = list(final_validation["errors"])
-    if not plane_viewer:
+    if not basis:
         fatal_errors = [error for error in fatal_errors if error != "missing_viewer_to_navigation_basis"]
     if not regions:
         fatal_errors = [error for error in fatal_errors if error != "no_regions"]
@@ -1305,7 +1678,7 @@ def render_navigation_review_html(artifact: dict[str, Any]) -> str:
     warning_items = "".join(f"<li><b>{html.escape(item.get('severity','INFO'))}</b> {html.escape(item.get('message',''))}</li>" for item in warnings)
     page = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Navigation proposal review</title>
 <style>body{font:15px system-ui;margin:0;background:#101827;color:#e7edf6;display:grid;grid-template-columns:minmax(500px,2fr) minmax(320px,1fr);height:100vh}main{padding:18px;min-height:0;display:flex;flex-direction:column}aside{padding:20px;background:#192538;overflow:auto}h1{font-size:20px;margin:0 0 12px}p,li{line-height:1.5;color:#c4d0df}svg{width:100%;height:100%;min-height:400px;background:#0b1220;border:1px solid #33445c;border-radius:8px;touch-action:none}.region{fill:#53a5b344;stroke:#6bc5da;stroke-width:2;vector-effect:non-scaling-stroke}.vertex{fill:#ffcc66;stroke:#231b0b;stroke-width:1;vector-effect:non-scaling-stroke;cursor:move}.camera{fill:#c9e8ff;opacity:.8;pointer-events:none}.cameraProvisional{fill:#ff9b65;opacity:.9;pointer-events:none}.cameraExcluded{fill:#808a98;opacity:.8;pointer-events:none}.region-label{fill:white;font-size:14px}button{background:#357a89;border:0;color:white;border-radius:6px;padding:10px 14px;font-size:14px;cursor:pointer;margin:8px 4px 8px 0}label{display:block;margin-top:12px;color:#ced9e8}input,textarea{box-sizing:border-box;width:100%;padding:7px;background:#101827;border:1px solid #52647d;border-radius:4px;color:white}.tag{color:#f0c86f}.tiny{font-size:12px;color:#94a8bf}</style>
-<body><main><h1>Top-down navigation proposal</h1><div class="tiny">Blue dots are explicitly trusted stations; orange dots are provisional and grey dots are excluded. Drag vertices, edit vertical limits, review portals and save a versioned draft to the local Engine.</div><svg id="map" viewBox="0 0 1000 760" aria-label="Top-down navigation proposal"></svg></main><aside><h1 id="title"></h1><p id="summary"></p><ul>WARNINGS_PLACEHOLDER</ul><p id="frame"></p><label><input id="transformConfirmed" type="checkbox"> I verified this SfM-to-viewer transform against the selected model.</label><div id="bounds"></div><h2>Room connection</h2><label>From region <select id="fromRegion"></select></label><label>To region <select id="toRegion"></select></label><button id="portalButton">Draw doorway portal</button><p id="portalStatus" class="tiny">No portal edit active.</p><h2>Initial camera</h2><label>Default camera station <select id="defaultCamera"></select></label><label><input id="acceptProvisionalPoses" type="checkbox"> I reviewed and accept every provisional camera pose as trusted evidence.</label><h2>Decision</h2><label>Reviewer identity <input id="reviewer" value="Local reviewer"></label><label>Rationale <textarea id="rationale" rows="3">Reviewed navigation boundary and vertical limits.</textarea></label><p id="reviewStatus" class="tag">Engine approval state: CURRENT_ARTIFACT_STATUS</p><button id="saveDraft">Save draft to Engine</button><button id="approveNavigation">Approve navigation</button><button id="rejectNavigation">Reject navigation</button><button id="download">Download corrected navigation JSON</button><p class="tiny">Drafts are versioned in the project. Approval runs Engine geometry checks and records the exact artifact hash, reviewer, rationale, timestamp and input fingerprint.</p></aside>
+<body><main><h1>Top-down navigation proposal</h1><div class="tiny">Blue dots are explicitly trusted stations; orange dots are provisional and grey dots are excluded. Drag vertices, review exploration limits and save a versioned draft to the local Engine.</div><svg id="map" viewBox="0 0 1000 760" aria-label="Top-down navigation proposal"></svg></main><aside><h1 id="title"></h1><p id="summary"></p><ul>WARNINGS_PLACEHOLDER</ul><p id="frame"></p><label><input id="transformConfirmed" type="checkbox"> I verified this SfM-to-viewer transform against the selected model.</label><div id="bounds"></div><label id="groundReviewBlock"><input id="groundCandidateReviewed" type="checkbox"> I inspected and accept the photo-SfM lower-limit candidate as suitable for this exploration envelope.</label><h2>Room connection</h2><label>From region <select id="fromRegion"></select></label><label>To region <select id="toRegion"></select></label><button id="portalButton">Draw doorway portal</button><p id="portalStatus" class="tiny">No portal edit active.</p><h2>Initial camera</h2><label>Default camera station <select id="defaultCamera"></select></label><label><input id="acceptProvisionalPoses" type="checkbox"> I reviewed and accept every provisional camera pose as trusted evidence.</label><h2>Decision</h2><label>Reviewer identity <input id="reviewer" value="Local reviewer"></label><label>Rationale <textarea id="rationale" rows="3">Reviewed navigation boundary and exploration limits.</textarea></label><p id="reviewStatus" class="tag">Engine approval state: CURRENT_ARTIFACT_STATUS</p><button id="saveDraft">Save draft to Engine</button><button id="approveNavigation">Approve navigation</button><button id="rejectNavigation">Reject navigation</button><button id="download">Download corrected navigation JSON</button><p class="tiny">Drafts are versioned in the project. Approval runs Engine geometry checks and records the exact artifact hash, reviewer, rationale, timestamp and input fingerprint.</p></aside>
 <script>
 const doc=ARTIFACT_PLACEHOLDER, svg=document.querySelector('#map'), ns='http://www.w3.org/2000/svg';let expectedSha='CURRENT_ARTIFACT_SHA256',lastSavedEditorState=JSON.stringify(doc);
 document.querySelector('#title').textContent=doc.id;
@@ -1313,6 +1686,7 @@ document.querySelector('#summary').textContent=`${doc.status} · ${doc.regions.l
 document.querySelector('#frame').textContent=`Source frame: ${doc.coordinate_frame.source_frame} · Viewer frame: ${doc.coordinate_frame.viewer_frame} · uniform scale ${doc.coordinate_frame.uniform_scale} · transform verified: ${doc.coordinate_frame.viewer_transform_verified}`;
 document.querySelector('#transformConfirmed').checked=!!doc.coordinate_frame.viewer_transform_verified;
 const candidates=doc.pose_evidence.candidate_camera_centers??doc.pose_evidence.trusted_camera_centers??[],excluded=doc.pose_evidence.excluded_poses??[];
+const proposedGround=(doc.regions??[]).some(r=>r.geometry_candidates?.ground_plane?.status==='PROPOSED');document.querySelector('#groundReviewBlock').hidden=!proposedGround;document.querySelector('#groundCandidateReviewed').checked=!!doc.review?.ground_plane_reviewed;
 let all=[...candidates.map(x=>x.navigation_local_uvh),...excluded.map(x=>x.navigation_local_uvh).filter(Array.isArray),...doc.regions.flatMap(r=>r.polygon_uv)];if(!all.length)all=[[-1,-1],[1,1]];
 let xs=all.map(x=>x[0]),ys=all.map(x=>x[1]),minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys),pad=40;
 const sx=x=>pad+(x-minX)/(maxX-minX||1)*(1000-2*pad),sy=y=>760-pad-(y-minY)/(maxY-minY||1)*(760-2*pad),ux=x=>minX+(x-pad)/(1000-2*pad)*(maxX-minX||1),uy=y=>minY+(760-pad-y)/(760-2*pad)*(maxY-minY||1);
@@ -1329,8 +1703,8 @@ for(const r of doc.regions){for(const id of ['fromRegion','toRegion']){const o=d
 document.querySelector('#portalButton').onclick=()=>{portalMode=true;portalPoints=[];document.querySelector('#portalStatus').textContent='Click the two ends of a supported doorway on the map.'};
 const defaultCamera=document.querySelector('#defaultCamera');for(const c of candidates){if(!c.station_id)continue;const o=document.createElement('option');o.value=c.station_id;o.textContent=`${c.station_id} · ${c.pose_trust}`;defaultCamera.append(o)}defaultCamera.value=doc.viewer_compatibility?.stations?.defaultStationId??'';
 defaultCamera.onchange=()=>{doc.viewer_compatibility??={};doc.viewer_compatibility.stations??={stations:[]};doc.viewer_compatibility.stations.defaultStationId=defaultCamera.value};
-const bounds=document.querySelector('#bounds');for(const r of doc.regions){const h=document.createElement('div');h.innerHTML=`<h2>${r.id}</h2><p>Boundary: ${r.algorithm} · ${r.evidence.trusted_station_count} trusted / ${r.evidence.candidate_station_count} candidate stations · status ${r.status}</p><label>Floor height (local units) <input data-region="${r.id}" data-axis="floor" value="${r.vertical_bounds.floor.value??''}"></label><label>Ceiling height (local units) <input data-region="${r.id}" data-axis="ceiling" value="${r.vertical_bounds.ceiling?.value??''}"></label><p class="tiny">Floor evidence: ${r.vertical_bounds.floor.classification??'UNCLASSIFIED'} · Ceiling evidence: ${r.vertical_bounds.ceiling?.classification??'UNCLASSIFIED'} · Units follow the reconstruction scale; the engine does not assume meters.</p>`;bounds.append(h)}
-function syncEditorState(){for(const input of document.querySelectorAll('input[data-axis]')){const r=doc.regions.find(x=>x.id===input.dataset.region),v=input.value.trim()===''?null:Number(input.value);if(input.dataset.axis==='floor')r.vertical_bounds.floor.value=v;else{r.vertical_bounds.ceiling??={classification:'INFERRED',clearance:0,evidence:[]};r.vertical_bounds.ceiling.value=v}}doc.coordinate_frame.viewer_transform_verified=document.querySelector('#transformConfirmed').checked;if(document.querySelector('#acceptProvisionalPoses').checked){for(const c of candidates){if(c.pose_trust==='PROVISIONAL'){c.pose_trust='TRUSTED_BY_REVIEW';c.trust_reason='Reviewer accepted provisional camera pose';}}doc.pose_evidence.provisional_pose_reviewed=true;doc.pose_evidence.provisional_camera_centers=[];doc.pose_evidence.trusted_camera_centers=candidates.filter(c=>c.pose_trust!=='PROVISIONAL')}if(doc.viewer_compatibility?.stations)doc.viewer_compatibility.stations.defaultStationId=defaultCamera.value}
+const bounds=document.querySelector('#bounds');for(const r of doc.regions){const h=document.createElement('div');const exploration=r.exploration_limits;h.innerHTML=`<h2>${r.id}</h2><p>Boundary: ${r.algorithm} · ${r.evidence.trusted_station_count} trusted / ${r.evidence.candidate_station_count} candidate stations · status ${r.status}</p>${exploration?`<label>Lower exploration height (local units) <input data-region="${r.id}" data-axis="exploration-min" value="${exploration.minimum_height.value??''}"></label><label>Upper exploration height (local units) <input data-region="${r.id}" data-axis="exploration-max" value="${exploration.maximum_height.value??''}"></label><p class="tiny">The upper value limits viewer exploration. It is not a physical ceiling. Units follow the reconstruction scale; the engine does not assume meters.</p>`:`<label>Floor height (local units) <input data-region="${r.id}" data-axis="floor" value="${r.vertical_bounds.floor.value??''}"></label><label>Ceiling height (local units) <input data-region="${r.id}" data-axis="ceiling" value="${r.vertical_bounds.ceiling?.value??''}"></label><p class="tiny">Floor evidence: ${r.vertical_bounds.floor.classification??'UNCLASSIFIED'} · Ceiling evidence: ${r.vertical_bounds.ceiling?.classification??'UNCLASSIFIED'} · Units follow the reconstruction scale; the engine does not assume meters.</p>`}`;bounds.append(h)}
+function syncEditorState(){for(const input of document.querySelectorAll('input[data-axis]')){const r=doc.regions.find(x=>x.id===input.dataset.region),v=input.value.trim()===''?null:Number(input.value);if(input.dataset.axis==='floor')r.vertical_bounds.floor.value=v;else if(input.dataset.axis==='ceiling'){r.vertical_bounds.ceiling??={classification:'INFERRED',clearance:0,evidence:[]};r.vertical_bounds.ceiling.value=v}else{r.exploration_limits??={minimum_height:{},maximum_height:{},physical_ceiling_inferred:false};const key=input.dataset.axis==='exploration-min'?'minimum_height':'maximum_height';r.exploration_limits[key]??={classification:'CONFIGURED_EXPLORATION_LIMIT_PROPOSAL',physical_surface:false};r.exploration_limits[key].value=v}}doc.coordinate_frame.viewer_transform_verified=document.querySelector('#transformConfirmed').checked;doc.review??={};doc.review.ground_plane_reviewed=document.querySelector('#groundCandidateReviewed').checked;if(document.querySelector('#acceptProvisionalPoses').checked){for(const c of candidates){if(c.pose_trust==='PROVISIONAL'){c.pose_trust='TRUSTED_BY_REVIEW';c.trust_reason='Reviewer accepted provisional camera pose';}}doc.pose_evidence.provisional_pose_reviewed=true;doc.pose_evidence.provisional_camera_centers=[];doc.pose_evidence.trusted_camera_centers=candidates.filter(c=>c.pose_trust!=='PROVISIONAL')}if(doc.viewer_compatibility?.stations)doc.viewer_compatibility.stations.defaultStationId=defaultCamera.value}
 document.querySelector('#download').onclick=()=>{syncEditorState();const blob=new Blob([JSON.stringify(doc,null,2)+'\n'],{type:'application/json'}),a=document.createElement('a');a.href=URL.createObjectURL(blob);a.download='navigation-review-candidate.json';a.click();URL.revokeObjectURL(a.href)};
 async function submitReview(endpoint,needsRationale){syncEditorState();const reviewer=document.querySelector('#reviewer').value.trim(),rationale=document.querySelector('#rationale').value.trim();if(!reviewer||needsRationale&&!rationale){document.querySelector('#reviewStatus').textContent='Reviewer and rationale are required.';return}try{if(endpoint.endsWith('/approve')&&JSON.stringify(doc)!==lastSavedEditorState){const draftBody={artifact:doc,reviewer,expected_sha256:expectedSha},draftResponse=await fetch('/api/navigation/draft',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(draftBody)}),draftResult=await draftResponse.json();if(!draftResponse.ok)throw new Error(draftResult.error??`HTTP ${draftResponse.status}`);expectedSha=draftResult.sha256;doc.artifact_version=draftResult.artifact_version;lastSavedEditorState=JSON.stringify(doc)}const body={artifact:doc,reviewer,rationale,expected_sha256:expectedSha},response=await fetch(endpoint,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)}),result=await response.json();if(!response.ok)throw new Error(result.error??`HTTP ${response.status}`);if(result.sha256){expectedSha=result.sha256;doc.artifact_version=result.artifact_version;lastSavedEditorState=JSON.stringify(doc)}document.querySelector('#reviewStatus').textContent=`${result.status} · ${result.approval_status??result.validation?.status??''} · ${result.path??result.approved_artifact??''}`;if(result.approved_sha256)expectedSha=result.approved_sha256}catch(error){document.querySelector('#reviewStatus').textContent=`Review action blocked: ${error.message}`}}
 document.querySelector('#saveDraft').onclick=()=>submitReview('/api/navigation/draft',false);
@@ -1368,6 +1742,10 @@ def approve_navigation_artifact(artifact: dict[str, Any], reviewer: str, rationa
         raise ValueError("Navigation cannot be approved until the SfM-to-viewer transform is verified")
     if reviewed.get("pose_evidence", {}).get("unresolved_components"):
         raise ValueError("Navigation cannot be approved while camera components lack a simple region footprint")
+    proposed_ground = any(region.get("geometry_candidates", {}).get("ground_plane", {}).get("status") == "PROPOSED"
+                          for region in reviewed.get("regions", []))
+    if proposed_ground and not reviewed.get("review", {}).get("ground_plane_reviewed"):
+        raise ValueError("Navigation cannot be approved until the reviewer explicitly accepts the photo-SfM ground candidate")
     pose_evidence = reviewed.setdefault("pose_evidence", {})
     candidates = pose_evidence.get("candidate_camera_centers", pose_evidence.get("trusted_camera_centers", []))
     provisional = [center for center in candidates if center.get("pose_trust") == "PROVISIONAL"]
@@ -1408,18 +1786,34 @@ def approve_navigation_artifact(artifact: dict[str, Any], reviewer: str, rationa
         region = {**original, "status": "APPROVED_BY_REVIEW", "classification": "REVIEWED_NAVIGATION_BOUNDARY"}
         region["boundary_segments"] = [{**segment, "classification": "REVIEWED_BOUNDARY", "reviewer": reviewer} for segment in original.get("boundary_segments", [])]
         vertical = dict(original.get("vertical_bounds", {}))
+        has_exploration_limits = bool(original.get("exploration_limits"))
         for axis in ("floor", "ceiling"):
             bound = vertical.get(axis)
+            if has_exploration_limits and (bound is None or bound.get("value") is None):
+                continue
             if bound is None or bound.get("value") is None:
                 raise ValueError(f"Region {original['id']} has no {axis} value; add it to the reviewed artifact")
             vertical[axis] = {**bound, "classification": bound.get("classification", "UNCLASSIFIED"),
                               "review_status": "REVIEWED", "reviewed_by": reviewer, "reviewed_at_utc": timestamp}
         region["vertical_bounds"] = vertical
+        if has_exploration_limits:
+            limits = copy.deepcopy(original["exploration_limits"])
+            for key in ("minimum_height", "maximum_height"):
+                bound = limits.get(key) or {}
+                if bound.get("value") is None:
+                    raise ValueError(f"Region {original['id']} has no {key.replace('_', ' ')}; add it to the reviewed artifact")
+                bound.update({"classification": "REVIEWED_EXPLORATION_LIMIT", "review_status": "REVIEWED",
+                              "reviewed_by": reviewer, "reviewed_at_utc": timestamp})
+            limits.update({"review_status": "REVIEWED", "reviewed_by": reviewer, "reviewed_at_utc": timestamp,
+                           "physical_ceiling_inferred": False})
+            region["exploration_limits"] = limits
         region["boundary_segments"] = [{"classification": "REVIEWED_BOUNDARY", "reviewer": reviewer,
                                          "inferred_margin_units": 0.0} for _ in region.get("polygon_uv", [])]
         reviewed["regions"].append(region)
-    reviewed["floor_constraints"] = [{"region_id": region["id"], **region["vertical_bounds"]["floor"]} for region in reviewed["regions"]]
-    reviewed["ceiling_constraints"] = [{"region_id": region["id"], **region["vertical_bounds"]["ceiling"]} for region in reviewed["regions"]]
+    reviewed["floor_constraints"] = [{"region_id": region["id"], **(region["vertical_bounds"].get("floor") or {})}
+                                     for region in reviewed["regions"] if (region["vertical_bounds"].get("floor") or {}).get("value") is not None]
+    reviewed["ceiling_constraints"] = [{"region_id": region["id"], **(region["vertical_bounds"].get("ceiling") or {})}
+                                        for region in reviewed["regions"] if (region["vertical_bounds"].get("ceiling") or {}).get("value") is not None]
     initial_check = validate_navigation_artifact(reviewed).get("initial_camera_validation", {})
     if initial_check.get("status") != "PASS":
         raise ValueError(f"Default camera is not valid inside the reviewed navigation region: {initial_check}")
@@ -1441,9 +1835,19 @@ def approve_navigation_artifact(artifact: dict[str, Any], reviewer: str, rationa
         envelope = reviewed["viewer_compatibility"]["envelope"]
         envelope["status"] = "NAVIGATION_APPROVED_BY_REVIEW"
         h = envelope.setdefault("horizontalBoundary", {})
+        viewer_basis = reviewed.get("coordinate_frame", {}).get("viewer_to_navigation", {})
         h["regions"] = [{"regionId": region["id"], "vertices2d": region["polygon_uv"],
-                          "floor": region["vertical_bounds"]["floor"], "ceiling": region["vertical_bounds"]["ceiling"],
-                          "classification": region["classification"], "status": "APPROVED_BY_REVIEW"} for region in reviewed["regions"]]
+                          "floor": region["vertical_bounds"].get("floor"),
+                          "ceiling": region["vertical_bounds"].get("ceiling"),
+                          "explorationLimits": ({"upNormal": viewer_basis.get("up_viewer"),
+                                                 "originCommonViewer": viewer_basis.get("origin_viewer"),
+                                                 "minimumHeight": region["exploration_limits"]["minimum_height"]["value"],
+                                                 "maximumHeight": region["exploration_limits"]["maximum_height"]["value"],
+                                                 "classification": "REVIEWED_EXPLORATION_LIMIT",
+                                                 "physicalCeiling": False, "reviewStatus": "REVIEWED"}
+                                                if region.get("exploration_limits") else None),
+                          "classification": region["classification"], "status": "APPROVED_BY_REVIEW"}
+                         for region in reviewed["regions"]]
         if reviewed["regions"]:
             h["vertices2d"] = reviewed["regions"][0]["polygon_uv"]
             h["algorithm"] = reviewed["regions"][0]["algorithm"]
@@ -1453,11 +1857,33 @@ def approve_navigation_artifact(artifact: dict[str, Any], reviewer: str, rationa
                 basis = {"origin": viewer_basis["origin_viewer"], "u": viewer_basis["u_viewer"],
                          "v": viewer_basis["v_viewer"], "normal": viewer_basis["up_viewer"]}
                 h["verticesCommonViewer"] = [_unproject([uv[0], uv[1], 0], basis) for uv in h["vertices2d"]]
-            floor = reviewed["regions"][0]["vertical_bounds"]["floor"]
-            ceiling = reviewed["regions"][0]["vertical_bounds"]["ceiling"]
-            envelope["floor"] = {**envelope.get("floor", {}), "clearance": floor.get("clearance", 0.0), "classification": floor.get("classification")}
-            envelope["ceiling"] = {**envelope.get("ceiling", {}), "heightAlongFloorNormal": ceiling["value"],
-                                    "clearance": ceiling.get("clearance", 0.0), "classification": ceiling.get("classification")}
+            first_region = reviewed["regions"][0]
+            floor = first_region["vertical_bounds"].get("floor")
+            ceiling = first_region["vertical_bounds"].get("ceiling")
+            if floor and floor.get("value") is not None:
+                envelope["floor"] = {**(envelope.get("floor") or {}), "clearance": floor.get("clearance", 0.0),
+                                      "classification": floor.get("classification")}
+            if ceiling and ceiling.get("value") is not None:
+                envelope["ceiling"] = {**(envelope.get("ceiling") or {}), "heightAlongFloorNormal": ceiling["value"],
+                                        "clearance": ceiling.get("clearance", 0.0), "classification": ceiling.get("classification")}
+            if first_region.get("exploration_limits"):
+                limits = first_region["exploration_limits"]
+                viewer_basis = reviewed.get("coordinate_frame", {}).get("viewer_to_navigation", {})
+                envelope["explorationLimits"] = {**(envelope.get("explorationLimits") or {}),
+                                                  "upNormal": viewer_basis.get("up_viewer"),
+                                                  "originCommonViewer": viewer_basis.get("origin_viewer"),
+                                                  "minimumHeight": limits["minimum_height"]["value"],
+                                                  "maximumHeight": limits["maximum_height"]["value"],
+                                                  "classification": "REVIEWED_EXPLORATION_LIMIT",
+                                                  "regions": [{"regionId": region["id"],
+                                                               "upNormal": viewer_basis.get("up_viewer"),
+                                                               "originCommonViewer": viewer_basis.get("origin_viewer"),
+                                                               "minimumHeight": region["exploration_limits"]["minimum_height"]["value"],
+                                                               "maximumHeight": region["exploration_limits"]["maximum_height"]["value"]}
+                                                              for region in reviewed["regions"]
+                                                              if region.get("exploration_limits")],
+                                                  "physicalCeiling": False,
+                                                  "reviewStatus": "REVIEWED"}
         h["transitions"] = reviewed.get("transitions", [])
         h["cameraStationInclusion"] = {"insideOrOn": len(reviewed.get("pose_evidence", {}).get("candidate_camera_centers", [])),
                                        "total": len(reviewed.get("pose_evidence", {}).get("candidate_camera_centers", []))}

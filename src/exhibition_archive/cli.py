@@ -16,7 +16,8 @@ from . import __version__
 from .adapters import read_json, write_json
 from .state import ProjectState, utc_now
 from .workflow import (STAGES, WorkflowError, expensive_execution_plan, load_project, output_path,
-                       plan, project_path, reconcile_interrupted_execution, run_workflow, stage_fingerprint)
+                       plan, project_path, reconcile_interrupted_execution, run_navigation_generation_only,
+                       run_first_visual_preview_only, run_workflow, stage_fingerprint)
 from .navigation import approve_navigation_artifact, validate_navigation_artifact
 from .adapters import sha256_file, validate_navigation
 
@@ -1038,7 +1039,7 @@ def cmd_navigation(args) -> int:
             if config.get("integrations", {}).get("navigation", {}).get("mode", "adopt_existing") != "generate_from_sfm":
                 raise WorkflowError("navigation generate requires integrations.navigation.mode=generate_from_sfm")
             with state.lock():
-                result = run_workflow(root, config, state, resume=True)
+                result = run_navigation_generation_only(root, config, state)
             print(json.dumps(result, indent=2))
             return 0
         if args.navigation_action == "review":
@@ -1049,6 +1050,18 @@ def cmd_navigation(args) -> int:
             print(json.dumps(result, indent=2))
             return 0
         raise WorkflowError(f"Unsupported navigation action: {args.navigation_action}")
+    finally:
+        state.close()
+
+
+def cmd_preview(args) -> int:
+    root, config = load_project(args.project)
+    state = ProjectState(root)
+    try:
+        with state.lock():
+            result = run_first_visual_preview_only(root, config, state)
+        print(json.dumps(result, indent=2, ensure_ascii=False))
+        return 0
     finally:
         state.close()
 
@@ -1431,10 +1444,14 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--limitation", action="append", required=True,
                    help="Unresolved limitation; repeat for each known geometry or alignment limitation")
     p.set_defaults(func=cmd_sfm_geometry_review)
+    p = sub.add_parser("preview", help="Build private Reviewer and Visitor previews from current artifacts")
+    preview = p.add_subparsers(dest="preview_action", required=True)
+    q = preview.add_parser("refresh", help="Regenerate only the first-visual Reviewer and Visitor previews")
+    q.add_argument("project"); q.set_defaults(func=cmd_preview)
     p = sub.add_parser("navigation", help="Assess, generate, validate, inspect, or review navigation geometry")
     nav = p.add_subparsers(dest="navigation_action", required=True)
     for action, help_text in (("assess", "Inspect configured geometry and navigation readiness"),
-                              ("generate", "Run the cache-aware workflow through fresh navigation generation"),
+                              ("generate", "Generate a proposal from current SfM without running upstream stages"),
                               ("status", "Show proposal, approval, and publishing state")):
         q = nav.add_parser(action, help=help_text); q.add_argument("project"); q.set_defaults(func=cmd_navigation)
     q = nav.add_parser("validate", help="Validate a generated or reviewed navigation artifact")

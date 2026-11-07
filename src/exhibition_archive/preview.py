@@ -5,6 +5,7 @@ import hashlib
 import json
 import math
 import shutil
+import struct
 import subprocess
 from pathlib import Path
 from typing import Any
@@ -13,7 +14,17 @@ from . import __version__
 from .adapters import read_json, sha256_file, write_json
 from .backends import validate_gaussian_ply
 from .workflow import STAGES, output_path, project_path
-from .viewer_orientation import estimate_y_up_transform, map_pose_to_viewer
+from .viewer_orientation import estimate_y_up_transform, map_pose_to_viewer, rotate_vector_xyzw
+
+
+def _next_first_visual_revision(output_root: Path, execution_id: int) -> tuple[int, Path]:
+    revision_id = execution_id
+    revision_root = output_root / "first-visual"
+    version_dir = revision_root / f"revision-{revision_id:06d}"
+    while version_dir.exists():
+        revision_id += 1
+        version_dir = revision_root / f"revision-{revision_id:06d}"
+    return revision_id, version_dir
 
 
 def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path,
@@ -28,9 +39,7 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     if not model.is_file():
         raise ValueError(f"The first-visual training candidate is missing: {model}")
     identity = validate_gaussian_ply(model)
-    version_dir = output_path(root, config) / "first-visual" / f"revision-{execution_id:06d}"
-    if version_dir.exists():
-        raise FileExistsError(f"First-visual revision already exists; refusing to overwrite it: {version_dir}")
+    revision_id, version_dir = _next_first_visual_revision(output_path(root, config), execution_id)
     diagnostics = version_dir / "diagnostics"
     reviewer = version_dir / "reviewer"
     visitor = version_dir / "visitor"
@@ -75,14 +84,17 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
                      project_path(root, config, config["integrations"]["sfm"]["directory"])
                      if config.get("integrations", {}).get("sfm", {}).get("directory") else None)
     camera_rows: list[dict[str, Any]] = []
+    sparse_points: list[list[float]] = []
+    sparse_point_tracks: list[int] = []
     sparse_count = 0
     sparse_preview = diagnostics / "sfm-sparse-points.ply"
     if sfm_directory is not None and sfm_directory.is_dir():
-        from .lidar import colmap_sparse_point_count, sample_colmap_sparse_points
-        from .navigation import read_colmap_camera_poses
-        camera_rows = read_colmap_camera_poses(sfm_directory)
-        sparse_count = colmap_sparse_point_count(sfm_directory)
-        sparse_points = sample_colmap_sparse_points(sfm_directory, maximum=100_000)
+        from .navigation import read_colmap_reconstruction
+        reconstruction = read_colmap_reconstruction(sfm_directory)
+        camera_rows = reconstruction["cameras"]
+        sparse_points = reconstruction["sparse_points"]
+        sparse_point_tracks = reconstruction["sparse_point_tracks"]
+        sparse_count = len(sparse_points)
         _write_xyz_ply(sparse_preview, sparse_points, maximum=100_000)
         write_json(diagnostics / "camera-poses.json", {
             "coordinate_system": "COLMAP arbitrary non-metric world coordinates",
@@ -93,9 +105,11 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
         })
 
     navigation_details = _details(state.stage("navigation") or {})
+    navigation_proposal_doc: dict[str, Any] = {}
     navigation_proposal = _optional_path(navigation_details.get("proposal_path"))
     if navigation_proposal is not None and navigation_proposal.is_file():
         shutil.copy2(navigation_proposal, diagnostics / "navigation-proposal.json")
+        navigation_proposal_doc = read_json(navigation_proposal)
     navigation_review = _optional_path(navigation_details.get("review_path"))
     if navigation_review is not None and navigation_review.is_file():
         shutil.copy2(navigation_review, diagnostics / "navigation-review.html")
@@ -130,6 +144,16 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
             continue
         shutil.copy2(source, diagnostics / name)
 
+    navigation_coverage_summary = None
+    if navigation_proposal_doc.get("schema_version") == "exhibition-archive.navigation.v1" and camera_rows:
+        coverage_doc = _navigation_coverage_diagnostic(
+            navigation_proposal_doc, camera_rows, sparse_points, sparse_point_tracks,
+            initial_camera["orientation"]["rotation_quaternion_xyzw"], model)
+        write_json(diagnostics / "navigation-coverage.json", coverage_doc)
+        (diagnostics / "navigation-coverage.html").write_text(
+            render_navigation_coverage_html(coverage_doc), encoding="utf-8")
+        navigation_coverage_summary = coverage_doc["summary"]
+
     discovery_path = output_path(root, config) / "inputs" / "discovery.json"
     input_discovery: dict[str, Any] = {}
     if discovery_path.is_file():
@@ -160,6 +184,7 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     stage_states = state.stages()
     pipeline_summary = {
         "schema_version": "exhibition-archive.first-visual-summary.v1",
+        "revision_id": revision_id, "generation_execution_id": execution_id,
         "project_id": config["project_id"], "engine_version": __version__,
         "engine_git_commit": _git_commit(Path(__file__).resolve().parents[2]),
         "source_images": _source_image_stats(root, config),
@@ -183,6 +208,7 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
         "navigation": {"status": navigation_details.get("status", "UNVERIFIED"),
                        "review_required": True,
                        "reason": navigation_details.get("reason", "Generated navigation remains a proposal until reviewed.")},
+        "navigation_coverage": navigation_coverage_summary,
         "viewer_orientation": initial_camera["orientation"],
         "pipeline_stages": {stage["id"]: (stage_states.get(stage["id"]) or {}).get("status", "PENDING")
                             for stage in STAGES},
@@ -196,6 +222,7 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     write_json(version_dir / "pipeline-status.json", pipeline_summary)
     write_json(version_dir / "manifest.json", {
         "schema_version": "exhibition-archive.first-visual-manifest.v1",
+        "revision_id": revision_id, "generation_execution_id": execution_id,
         "project_id": config["project_id"], "engine_version": __version__,
         "engine_git_commit": pipeline_summary["engine_git_commit"],
         "source_photo_directory": config["source"]["photo_directory"],
@@ -236,6 +263,7 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     artifacts.extend(path for path in diagnostics.rglob("*") if path.is_file())
     return {"status": "COMPLETED", "artifacts": artifacts,
             "details": {"status": "AWAITING_VISUAL_REVIEW", "version_directory": str(version_dir),
+                        "revision_id": revision_id, "generation_execution_id": execution_id,
                         "reviewer_html": str(reviewer_html), "visitor_html": str(visitor / "index.html"),
                         "summary_path": str(report_path), "validation": {"status": "PASS", "failures": []},
                         "model_sha256": identity["sha256"], "navigation_status": pipeline_summary["navigation"]["status"],
@@ -347,6 +375,258 @@ def _write_xyz_ply(path: Path, points: list[list[float]], maximum: int) -> None:
             stream.write("%.9g %.9g %.9g\n" % tuple(point[:3]))
 
 
+def _gaussian_xyz_sample(path: Path, maximum: int = 20_000) -> dict[str, Any]:
+    """Read exact model extents and a deterministic XYZ sample without decoding Gaussian attributes."""
+    from .backends import PLY_TYPES
+    from .lidar import _format_from_header, _read_header
+
+    header, error = _read_header(path)
+    if header is None:
+        raise ValueError(error or "Could not read Gaussian PLY header")
+    vertex = next((element for element in header["elements"] if element["name"] == "vertex"), None)
+    if vertex is None or header["elements"].index(vertex) != 0:
+        raise ValueError("Gaussian PLY must begin with a vertex element")
+    properties = vertex["properties"]
+    if any(row.get("list") for row in properties):
+        raise ValueError("Gaussian PLY vertex has list-valued properties")
+    indices = {row["name"]: index for index, row in enumerate(properties)}
+    if not {"x", "y", "z"}.issubset(indices):
+        raise ValueError("Gaussian PLY is missing XYZ properties")
+    record_bytes = sum(PLY_TYPES[row["type"]][1] for row in properties)
+    offsets, offset = {}, 0
+    for row in properties:
+        offsets[row["name"]] = (offset, PLY_TYPES[row["type"]][0])
+        offset += PLY_TYPES[row["type"]][1]
+    fmt = _format_from_header(header)
+    if fmt not in {"binary_little_endian", "binary_big_endian", "ascii"}:
+        raise ValueError(f"Unsupported Gaussian PLY format {fmt}")
+    endian = ">" if fmt == "binary_big_endian" else "<"
+    count = int(vertex["count"])
+    stride = max(1, math.ceil(count / max(1, maximum)))
+    samples: list[list[float]] = []
+    minimum = [math.inf, math.inf, math.inf]
+    maximum_xyz = [-math.inf, -math.inf, -math.inf]
+    with path.open("rb") as stream:
+        stream.seek(header["body_offset"])
+        if fmt == "ascii":
+            for index in range(count):
+                raw = stream.readline()
+                values = raw.split()
+                if len(values) != len(properties):
+                    raise ValueError(f"Malformed Gaussian PLY row {index}")
+                xyz = [float(values[indices[name]]) for name in ("x", "y", "z")]
+                if not all(math.isfinite(value) for value in xyz):
+                    continue
+                for axis, value in enumerate(xyz):
+                    minimum[axis] = min(minimum[axis], value)
+                    maximum_xyz[axis] = max(maximum_xyz[axis], value)
+                if index % stride == 0 or index == count - 1:
+                    samples.append(xyz)
+        else:
+            chunk_records = max(1, (4 * 1024 * 1024) // record_bytes)
+            base = 0
+            while base < count:
+                chunk_count = min(chunk_records, count - base)
+                raw = stream.read(chunk_count * record_bytes)
+                if len(raw) != chunk_count * record_bytes:
+                    raise ValueError(f"Truncated Gaussian PLY at vertex {base}")
+                for local_index in range(chunk_count):
+                    row_offset = local_index * record_bytes
+                    xyz = [struct.unpack_from(endian + offsets[name][1], raw,
+                                              row_offset + offsets[name][0])[0]
+                           for name in ("x", "y", "z")]
+                    if not all(math.isfinite(value) for value in xyz):
+                        continue
+                    for axis, value in enumerate(xyz):
+                        minimum[axis] = min(minimum[axis], value)
+                        maximum_xyz[axis] = max(maximum_xyz[axis], value)
+                    index = base + local_index
+                    if index % stride == 0 or index == count - 1:
+                        samples.append(xyz)
+                base += chunk_count
+    if not samples or not all(math.isfinite(value) for value in (*minimum, *maximum_xyz)):
+        raise ValueError("Gaussian PLY has no finite sampled geometry")
+    return {"vertex_count": count, "sample_count": len(samples),
+            "raw_exact_bounds": {"minimum": minimum, "maximum": maximum_xyz},
+            "sampled_points": samples}
+
+
+def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[dict[str, Any]],
+                                   sparse_points: list[list[float]], sparse_tracks: list[int],
+                                   model_rotation: list[float], model_path: Path) -> dict[str, Any]:
+    from .navigation import _convex_hull, _signed_area
+
+    def q(values: list[float], fraction: float) -> float:
+        ordered = sorted(values)
+        if not ordered:
+            return 0.0
+        position = (len(ordered) - 1) * fraction
+        low, high = math.floor(position), math.ceil(position)
+        return ordered[low] + (ordered[high] - ordered[low]) * (position - low)
+
+    def dot(a, b):
+        return sum(x * y for x, y in zip(a, b))
+
+    def add_scaled(origin, axis, factor):
+        return [origin[index] + axis[index] * factor for index in range(3)]
+
+    frame = artifact["coordinate_frame"]
+    local = frame["viewer_to_navigation"]
+    origin, axis_u, axis_v, axis_up = (local["origin_viewer"], local["u_viewer"],
+                                      local["v_viewer"], local["up_viewer"])
+    coverage = artifact.get("coverage_diagnostics", {})
+    trajectory = coverage.get("camera_trajectory", [])
+    spacing_by_component = {row["component_id"]: row["median_nearest_neighbor_spacing_units"]
+                            for row in coverage.get("component_footprints", [])}
+    cameras = []
+    for row in trajectory:
+        center = row.get("viewer_center")
+        forward = row.get("viewer_forward")
+        if not (isinstance(center, list) and isinstance(forward, list)):
+            continue
+        length = max(0.0, float(spacing_by_component.get(row.get("component_id"), 0.0)) * 0.7)
+        cameras.append({**{key: row.get(key) for key in
+                           ("station_id", "image_name", "component_id", "coverage_status", "pose_trust")},
+                        "center": center,
+                        "forward_end": [center[axis] + forward[axis] * length for axis in range(3)]})
+    sparse_stride = max(1, math.ceil(len(sparse_points) / 12_000))
+    strong_points, weak_points = [], []
+    for index in range(0, min(len(sparse_points), len(sparse_tracks)), sparse_stride):
+        transformed = rotate_vector_xyzw(model_rotation, sparse_points[index])
+        record = [*transformed, int(sparse_tracks[index])]
+        (strong_points if sparse_tracks[index] >= 3 else weak_points).append(record)
+    model_geometry = _gaussian_xyz_sample(model_path)
+    sampled_viewer = [rotate_vector_xyzw(model_rotation, point)
+                      for point in model_geometry["sampled_points"]]
+    robust_min = [q([point[axis] for point in sampled_viewer], 0.01) for axis in range(3)]
+    robust_max = [q([point[axis] for point in sampled_viewer], 0.99) for axis in range(3)]
+    raw_min, raw_max = model_geometry["raw_exact_bounds"]["minimum"], model_geometry["raw_exact_bounds"]["maximum"]
+    raw_corners = [[raw_max[0] if bits & 1 else raw_min[0],
+                    raw_max[1] if bits & 2 else raw_min[1],
+                    raw_max[2] if bits & 4 else raw_min[2]] for bits in range(8)]
+    model_outer_corners = [rotate_vector_xyzw(model_rotation, point) for point in raw_corners]
+    robust_corners = [[robust_max[0] if bits & 1 else robust_min[0],
+                       robust_max[1] if bits & 2 else robust_min[1],
+                       robust_max[2] if bits & 4 else robust_min[2]] for bits in range(8)]
+    projected_model = [[dot([point[axis] - origin[axis] for axis in range(3)], axis_u),
+                        dot([point[axis] - origin[axis] for axis in range(3)], axis_v)]
+                       for point in sampled_viewer]
+    model_u = [point[0] for point in projected_model]
+    model_v = [point[1] for point in projected_model]
+    model_area = max(0.0, q(model_u, 0.99) - q(model_u, 0.01)) * max(0.0, q(model_v, 0.99) - q(model_v, 0.01))
+
+    active_regions = []
+    for region in artifact.get("regions", []):
+        limits = region.get("exploration_limits") or {}
+        minimum = (limits.get("minimum_height") or {}).get("value")
+        maximum = (limits.get("maximum_height") or {}).get("value")
+        polygon = region.get("polygon_uv", [])
+        lower = ([add_scaled(add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1]),
+                             axis_up, float(minimum)) for point in polygon]
+                 if minimum is not None else [])
+        upper = [add_scaled(point, axis_up, float(maximum) - float(minimum))
+                 for point in lower] if minimum is not None and maximum is not None else []
+        ground = (region.get("geometry_candidates", {}).get("ground_plane") or {})
+        ground_loop = []
+        if ground.get("status") == "PROPOSED":
+            normal = ground["normal"]
+            offset = float(ground["offset"])
+            denominator = dot(normal, axis_up)
+            if abs(denominator) > 1e-6:
+                for point in polygon:
+                    base_point = add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1])
+                    height = -(offset + dot(normal, base_point)) / denominator
+                    ground_loop.append(add_scaled(base_point, axis_up, height))
+        hull_area = abs(_signed_area(polygon))
+        local_support = region.get("evidence", {}).get("sparse_geometry_observation", {}).get(
+            "points_with_track_length_minimum_inside_candidate", 0)
+        ground_evidence = ground.get("evidence", {})
+        active_regions.append({"region_id": region["id"], "polygon_uv": polygon,
+                               "lower_loop": lower, "upper_loop": upper, "ground_loop": ground_loop,
+                               "horizontal_area_units2": hull_area,
+                               "camera_count": region.get("evidence", {}).get("candidate_station_count", 0),
+                               "local_multiview_point_count": local_support,
+                               "ground_candidate_inlier_count": ground_evidence.get("inlier_count", 0),
+                               "ground_candidate_coverage_fraction": ground_evidence.get("footprint_grid_occupied_fraction"),
+                               "ground_candidate_residual_p90_units": ground_evidence.get("residual_p90_units"),
+                               "ground_candidate_tilt_degrees": ground_evidence.get("tilt_from_view_up_degrees"),
+                               "minimum_height": minimum, "maximum_height": maximum,
+                               "upper_limit_is_physical_ceiling": False})
+    excluded_regions = []
+    for component in coverage.get("excluded_camera_components", []):
+        members = [row for row in trajectory if row.get("component_id") and
+                   row.get("station_id") in component.get("station_ids", [])]
+        heights = [row["navigation_local_uvh"][2] for row in members]
+        level = q(heights, 0.5) if heights else 0.0
+        poly = component.get("polygon_uv", [])
+        outline = [add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1])
+                   for point in poly]
+        outline = [add_scaled(point, axis_up, level) for point in outline]
+        excluded_regions.append({"component_id": component_for_id(members),
+                                 "outline": outline, "camera_count": len(component.get("station_ids", [])),
+                                 "reason": component.get("reason")})
+
+    camera_area = sum(region["horizontal_area_units2"] for region in active_regions)
+    track_ge_3 = sum(1 for value in sparse_tracks if value >= 3)
+    local_track_ge_3 = sum(region["local_multiview_point_count"] for region in active_regions)
+    summary = {"status": artifact.get("status"),
+               "status_summary": (f"{len(active_regions)} camera-supported region proposed; "
+                                  f"{coverage.get('camera_used_count', 0)} of {coverage.get('camera_candidate_count', 0)} camera poses included; "
+                                  f"{coverage.get('camera_excluded_count', 0)} camera poses excluded or unassigned. "
+                                  f"Ground candidate and virtual vertical limits require review."),
+               "registered_camera_count": len(camera_rows),
+               "camera_candidate_count": coverage.get("camera_candidate_count", 0),
+               "camera_used_count": coverage.get("camera_used_count", 0),
+               "camera_excluded_count": coverage.get("camera_excluded_count", 0),
+               "camera_component_count": coverage.get("camera_component_count", 0),
+               "component_footprints": coverage.get("component_footprints", []),
+               "candidate_region_count": len(active_regions),
+               "candidate_camera_footprint_area_units2": camera_area,
+               "gaussian_robust_footprint_area_units2": model_area,
+               "camera_to_gaussian_robust_area_fraction": camera_area / model_area if model_area > 0 else None,
+               "sparse_point_count": len(sparse_points), "sparse_track_length_ge_3_count": track_ge_3,
+               "local_track_length_ge_3_count": local_track_ge_3,
+               "local_track_length_ge_3_fraction": local_track_ge_3 / track_ge_3 if track_ge_3 else 0.0,
+               "lidar_consumed": artifact.get("coverage_assumptions", {}).get("aligned_lidar_used", False),
+               "navigation_up_status": (artifact.get("coordinate_frame", {}).get("navigation_up_evidence") or {}).get("status", "NOT_AVAILABLE"),
+               "navigation_up_interpretation": "Camera orientation proposal; not physical gravity.",
+               "human_review_required": True}
+    return {"summary": summary, "navigation_basis": {"origin": origin, "u": axis_u, "v": axis_v, "up": axis_up},
+            "cameras": cameras, "supported_sparse_points": strong_points, "weak_sparse_points": weak_points,
+            "regions": active_regions, "excluded_components": excluded_regions,
+            "gaussian_bounds": {"raw_exact_minimum": raw_min, "raw_exact_maximum": raw_max,
+                                "outer_oriented_box_corners_viewer": model_outer_corners,
+                                "sampled_1_99_aabb_viewer": {"minimum": robust_min, "maximum": robust_max},
+                                "sampled_points": model_geometry["sample_count"], "vertex_count": model_geometry["vertex_count"]},
+            "limitations": ["Camera centers establish capture coverage only; they do not prove every point inside the footprint is traversable.",
+                            "The excluded camera component has too little local multi-view SfM support for a bounded vertical envelope.",
+                            "The Gaussian model bounds include distant background; the proposed camera boundary deliberately does not expand to those bounds.",
+                            "The lower plane is a photo-SfM candidate requiring review. The upper value is a virtual exploration limit, not a ceiling.",
+                            "The camera-up transform provides viewer orientation evidence only and is not a gravity measurement."]}
+
+
+def component_for_id(members: list[dict[str, Any]]) -> str | None:
+    return members[0].get("component_id") if members else None
+
+
+def render_navigation_coverage_html(document: dict[str, Any]) -> str:
+    payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
+    page = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Navigation coverage diagnostic</title>
+<style>*{box-sizing:border-box}body{margin:0;background:#101511;color:#e8eee7;font:14px/1.45 system-ui,sans-serif}header{padding:12px 16px;background:#1a241d;border-bottom:1px solid #39443b}h1{font-size:18px;margin:0 0 4px}p{margin:4px 0;color:#b5c0b3}.layout{display:grid;grid-template-columns:minmax(0,1fr) 260px;min-height:680px;height:calc(100vh - 75px)}canvas{width:100%;height:100%;background:#0b100d;touch-action:none}.side{padding:12px;overflow:auto;background:#151d17;border-left:1px solid #39443b}.side label{display:block;margin:8px 0}.side input{margin-right:7px}.metric{display:flex;justify-content:space-between;border-bottom:1px solid #344037;padding:5px 0;gap:12px}.metric b{text-align:right}.note{color:#d9bd76;font-size:12px;margin-top:12px}button{background:#324c3a;border:1px solid #536b58;color:#e8eee7;border-radius:4px;padding:5px 8px;margin:3px;cursor:pointer}.legend{font-size:12px;color:#bcc8ba}@media(max-width:780px){.layout{grid-template-columns:1fr;height:auto}.side{border:0;border-top:1px solid #39443b}canvas{height:62vh;min-height:420px}}</style>
+<header><h1>Camera coverage and navigation proposal</h1><p>Drag to orbit · scroll to zoom. Coordinates use the corrected Viewer frame. A proposal is not an approval.</p></header><div class="layout"><canvas id="scene"></canvas><aside class="side"><div id="summary"></div><hr><b>Layers</b><label><input type="checkbox" data-layer="camera" checked>Camera positions and viewing directions</label><label><input type="checkbox" data-layer="strong" checked>Tracked SfM points (track ≥ 3)</label><label><input type="checkbox" data-layer="weak">Weakly tracked SfM points</label><label><input type="checkbox" data-layer="boundary" checked>Candidate exploration envelope</label><label><input type="checkbox" data-layer="ground" checked>Photo-SfM lower plane candidate</label><label><input type="checkbox" data-layer="excluded" checked>Excluded camera component</label><label><input type="checkbox" data-layer="model" checked>Gaussian model bounds</label><label><input type="checkbox" data-layer="axes" checked>Navigation axes</label><p class="legend">Blue: camera poses in proposal · orange: excluded or unassigned · green: multi-view points / lower-plane candidate · magenta: exploration envelope · grey: model extent.</p><div id="regionStats"></div><p class="note">Viewer-up is derived from camera orientations. The plane is a photo-SfM ground candidate and requires review. The upper bound is a virtual exploration limit, not a physical ceiling. Distant model background is visible as bounds only and does not define the navigation perimeter. LiDAR is not consumed.</p></aside></div>
+<script>const d=DATA;const canvas=document.querySelector('#scene'),ctx=canvas.getContext('2d'),layers=Object.fromEntries([...document.querySelectorAll('[data-layer]')].map(x=>[x.dataset.layer,x]));let yaw=.7,pitch=.48,zoom=1,drag=null,viewWidth=1,viewHeight=1;
+function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function metric(k,v){return `<div class="metric"><span>${esc(k)}</span><b>${esc(v)}</b></div>`}const s=d.summary,fmt=(n,digits=2)=>Number.isFinite(n)?n.toFixed(digits):'n/a';document.querySelector('#summary').innerHTML=metric('Proposal',s.status)+metric('Registered cameras',`${s.camera_used_count} / ${s.registered_camera_count}`)+metric('Camera components',s.camera_component_count)+metric('Candidate regions',s.candidate_region_count)+metric('Camera footprint',`${fmt(s.candidate_camera_footprint_area_units2)} scene units²`)+metric('Gaussian q1–q99 footprint',`${fmt(s.gaussian_robust_footprint_area_units2)} scene units²`)+metric('Camera / model area',`${fmt((s.camera_to_gaussian_robust_area_fraction??0)*100,1)}%`)+metric('Local track ≥3 points',`${s.local_track_length_ge_3_count} / ${s.sparse_track_length_ge_3_count} (${fmt((s.local_track_length_ge_3_fraction??0)*100,1)}%)`)+metric('LiDAR consumed',String(s.lidar_consumed))+metric('Camera-up',s.navigation_up_status);document.querySelector('#regionStats').innerHTML='<hr><b>Candidate regions</b>'+d.regions.map(r=>`<p>${esc(r.region_id)} · ${r.camera_count} cameras · ${fmt(r.horizontal_area_units2)} units²<br>Ground candidate: ${r.ground_candidate_inlier_count} inliers, ${fmt((r.ground_candidate_coverage_fraction??0)*100,0)}% grid coverage<br>Virtual height: ${fmt(r.minimum_height)} to ${fmt(r.maximum_height)} units</p>`).join('')+'<hr><b>Camera components</b>'+s.component_footprints.map(c=>`<p>${esc(c.component_id)} · ${c.camera_count} cameras · ${fmt(c.convex_hull_area_square_units)} units² · ${esc(c.proposal_status)}</p>`).join('');
+const all=[...d.cameras.map(x=>x.center),...d.supported_sparse_points.map(x=>x.slice(0,3)),...d.regions.flatMap(r=>[...r.lower_loop,...r.upper_loop]),...d.gaussian_bounds.outer_oriented_box_corners_viewer];let min=[0,0,0],max=[0,0,0];if(all.length){min=[0,1,2].map(a=>Math.min(...all.map(p=>p[a])));max=[0,1,2].map(a=>Math.max(...all.map(p=>p[a])))}const center=min.map((x,i)=>(x+max[i])/2),span=Math.max(...max.map((x,i)=>x-min[i]),1e-4);function project(p){let x=p[0]-center[0],y=p[1]-center[1],z=p[2]-center[2],cx=Math.cos(yaw),sx=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),xx=cx*x+sx*z,zz=-sx*x+cx*z,yy=cp*y-sp*zz;let scale=Math.min(viewWidth,viewHeight)*.8/span*zoom;return [viewWidth/2+xx*scale,viewHeight/2-yy*scale,zz]}function line(a,b,color,width=1){let p=project(a),q=project(b);ctx.strokeStyle=color;ctx.lineWidth=width;ctx.beginPath();ctx.moveTo(p[0],p[1]);ctx.lineTo(q[0],q[1]);ctx.stroke()}function loop(points,color,width=1,close=true){for(let i=0;i<points.length-(close?0:1);i++)line(points[i],points[(i+1)%points.length],color,width)}function box(corners,color){for(let i=0;i<8;i++)for(let bit of [1,2,4])if(!(i&bit))line(corners[i],corners[i|bit],color,1)}
+function render(){let rect=canvas.getBoundingClientRect(),ratio=devicePixelRatio||1;viewWidth=rect.width;viewHeight=rect.height;canvas.width=Math.round(rect.width*ratio);canvas.height=Math.round(rect.height*ratio);ctx.setTransform(ratio,0,0,ratio,0,0);if(layers.axes.checked){let o=d.navigation_basis.origin,scale=span*.12;line(o,[o[0]+d.navigation_basis.u[0]*scale,o[1]+d.navigation_basis.u[1]*scale,o[2]+d.navigation_basis.u[2]*scale],'#57b7ff',2);line(o,[o[0]+d.navigation_basis.v[0]*scale,o[1]+d.navigation_basis.v[1]*scale,o[2]+d.navigation_basis.v[2]*scale],'#dfbd5b',2);line(o,[o[0]+d.navigation_basis.up[0]*scale,o[1]+d.navigation_basis.up[1]*scale,o[2]+d.navigation_basis.up[2]*scale],'#69df8a',2)}
+if(layers.model.checked){box(d.gaussian_bounds.outer_oriented_box_corners_viewer,'#718079');let lo=d.gaussian_bounds.sampled_1_99_aabb_viewer.minimum,hi=d.gaussian_bounds.sampled_1_99_aabb_viewer.maximum,cs=[...Array(8)].map((_,i)=>[(i&1)?hi[0]:lo[0],(i&2)?hi[1]:lo[1],(i&4)?hi[2]:lo[2]]);box(cs,'#a0aaa0')}
+if(layers.ground.checked)for(let r of d.regions)if(r.ground_loop.length)loop(r.ground_loop,'#58d486',2);
+if(layers.boundary.checked)for(let r of d.regions){loop(r.lower_loop,'#ed62cc',2);loop(r.upper_loop,'#ed62cc',1);for(let i=0;i<r.lower_loop.length;i++)line(r.lower_loop[i],r.upper_loop[i],'#ed62cc',1)}
+if(layers.excluded.checked)for(let r of d.excluded_components)loop(r.outline,'#ff9d62',2);
+function points(rows,color,radius){for(let p of rows){let q=project(p),size=Math.max(1,radius);ctx.fillStyle=color;ctx.beginPath();ctx.arc(q[0],q[1],size,0,Math.PI*2);ctx.fill()}}if(layers.strong.checked)points(d.supported_sparse_points,'#50bf76',1.2);if(layers.weak.checked)points(d.weak_sparse_points,'#6b7770',1);if(layers.camera.checked){for(let c of d.cameras){let color=c.coverage_status==='INCLUDED_PROPOSAL'?'#6fcaff':'#ff9d62';line(c.center,c.forward_end,color,1);points([c.center],color,3)}}}
+for(let checkbox of Object.values(layers))checkbox.onchange=render;canvas.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];canvas.setPointerCapture(e.pointerId)});canvas.addEventListener('pointermove',e=>{if(!drag)return;let dx=e.clientX-drag[0],dy=e.clientY-drag[1];yaw+=dx*.008;pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*.008));drag=[e.clientX,e.clientY];render()});canvas.addEventListener('pointerup',()=>drag=null);canvas.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(.15,Math.min(8,zoom*Math.exp(-e.deltaY*.001)));render()},{passive:false});new ResizeObserver(render).observe(canvas);render();</script></html>'''
+    return page.replace("DATA", payload)
+
+
 def _reviewer_html(summary: dict[str, Any]) -> str:
     warning_items = "".join(f"<li>{html.escape(str(item))}</li>" for item in summary["warnings"])
     diagnostics = []
@@ -358,6 +638,8 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
               "lidar-inspection.json": "LiDAR inspection report",
               "navigation-proposal.json": "Navigation proposal",
               "navigation-review.html": "Navigation review page",
+              "navigation-coverage.html": "Interactive 3D camera, geometry, and boundary overlay",
+              "navigation-coverage.json": "Camera and geometry coverage measurements",
               "sfm-summary.json": "SfM metrics", "sfm-validation.json": "SfM validation",
               "sfm.log": "SfM log", "training.log": "Training log",
               "training-run.json": "Training run settings"}
@@ -368,6 +650,9 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
     lidar = summary["lidar"]
     training = summary["training"]
     viewer_orientation = summary.get("viewer_orientation", {})
+    coverage = summary.get("navigation_coverage") or {}
+    coverage_panel = (f"<section><h2>Navigation coverage proposal</h2><p>{html.escape(str(coverage.get('status_summary', 'No coverage proposal is available.')))}</p><iframe title=\"Interactive navigation coverage overlay\" src=\"../diagnostics/navigation-coverage.html\"></iframe><p class=\"muted\">Camera-up sets the display frame only. The photo-SfM lower-plane candidate and upper exploration limit require review; the upper limit is not a ceiling. The preview remains unbounded until navigation is approved.</p></section>"
+                      if coverage else "")
     orientation_status = viewer_orientation.get("status", "ORIENTATION_REVIEW_REQUIRED")
     orientation_label = {
         "CAMERA_UP_PROPOSAL_APPLIED_REVIEW_REQUIRED": "Proposal applied; review required",
@@ -382,6 +667,7 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
 <header><h1>Technical Reviewer · {html.escape(summary['project_id'])}</h1><p>First visual candidate · release authorization: NEEDS_REVIEW · no source photographs are included</p></header><main><section><h2>Candidate model preview</h2><iframe title="Unreviewed Visitor preview" src="../visitor/index.html"></iframe></section><aside>
 <section><h2>Evidence</h2><div class="metric"><span>Source photos</span><b>{sources['image_count']}</b></div><div class="metric"><span>Registered views</span><b>{sfm.get('registered_image_count','unknown')} / {sfm.get('source_image_count', sources['image_count'])}</b></div><div class="metric"><span>Sparse SfM points</span><b>{sfm.get('sparse_point_count',0)}</b></div><div class="metric"><span>Gaussian splats</span><b>{training.get('gaussian_count','unknown')}</b></div><div class="metric"><span>Model size</span><b>{training.get('model_size_bytes',0):,} bytes</b></div><div class="metric"><span>Training divisor</span><b>{html.escape(str(training.get('resolution_divisor','unknown')))}</b></div><div class="metric"><span>Backend image size</span><b>{html.escape(observed_size_text)}</b></div><div class="metric"><span>Resolution evidence</span><b>{html.escape(str(training_resolution.get('backend_report_status','NOT_AVAILABLE')))}</b></div><div class="metric"><span>LiDAR</span><b>{html.escape(str(lidar.get('inspection_status','NOT_DETECTED')))}</b></div><div class="metric"><span>LiDAR alignment</span><b>{html.escape(str(lidar.get('alignment_status','NOT_ATTEMPTED')))}</b></div><div class="metric"><span>Navigation</span><b>{html.escape(str(summary['navigation']['status']))}</b></div><div class="metric"><span>Viewer orientation</span><b>{html.escape(orientation_label)}</b></div></section>
 <section><h2>Warnings and limitations</h2><ul class="warning">{warning_items or '<li>No additional warning recorded.</li>'}</ul><p class="muted">SfM coordinates are arbitrary scale. The unbounded Visitor preview is for technical review only; navigation and public release remain unapproved.</p></section>
+{coverage_panel}
 <section><h2>Diagnostics</h2><div class="links">{''.join(diagnostics)}</div></section></aside></main></body></html>"""
 
 

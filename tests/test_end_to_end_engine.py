@@ -364,6 +364,7 @@ def test_dry_run_validates_and_does_not_create_output(tmp_path, capsys):
          patch("exhibition_archive.backends.build_sfm_command", return_value=["spirula", "sfm", "--quality", "high"]), \
          patch("exhibition_archive.backends.build_training_command", return_value=["spirula", "train", "3dgs", "--train-resolution-divisor", "1"]), \
          patch("exhibition_archive.backends.training_preset_configuration", return_value={"status": "CAPTURED", "effective_parameters": {"--train-resolution-divisor": "1"}}), \
+         patch("exhibition_archive.environment.inspect_python_environment", return_value={"status": "READY", "blockers": [], "warnings": []}), \
          patch("exhibition_archive.environment.repair_python_environment", side_effect=AssertionError("dry-run must not install")):
         args = build_parser().parse_args(["run", "--input", str(source), "--output", str(output),
                                           "--project-id", "playground-fixture", "--dry-run", "--json"])
@@ -437,7 +438,7 @@ def test_guided_sfm_review_records_only_the_explicit_component_decision(tmp_path
     assert "63824" in capsys.readouterr().err
 
 
-def test_outdoor_navigation_emits_camera_coverage_proposal_without_fake_ceiling():
+def test_outdoor_navigation_without_ground_support_stays_insufficient_without_fake_ceiling():
     source = {"source_reconstruction": {"identity": {"reconstruction_id": "open-air-fixture"}},
               "coordinate_frame": {"coordinates_are_viewer": True, "up_axis": "UNSPECIFIED",
                                    "source_to_viewer": {"uniform_scale": 1, "rotation": [[1, 0, 0], [0, 1, 0], [0, 0, 1]],
@@ -447,8 +448,9 @@ def test_outdoor_navigation_emits_camera_coverage_proposal_without_fake_ceiling(
     proposal = generate_navigation(source, {"scene_type": "outdoor", "camera_clearance_units": 0})
     assert proposal["space_assumption"]["scene_type"] == "outdoor"
     assert proposal["coverage_assumptions"]["physical_walls_or_ceiling_inferred"] is False
-    assert proposal["regions"]
-    assert proposal["regions"][0]["vertical_bounds"]["ceiling"] is None
+    assert proposal["regions"] == []
+    assert proposal["coverage_diagnostics"]["excluded_camera_components"]
+    assert proposal["coverage_diagnostics"]["excluded_camera_components"][0]["component_id"].startswith("camera-component-")
     assert proposal["status"] == "NAVIGATION_INSUFFICIENT_GEOMETRY"
 
 

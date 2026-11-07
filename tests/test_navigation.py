@@ -19,7 +19,7 @@ from exhibition_archive.navigation import (
 )
 from exhibition_archive.state import ProjectState
 from exhibition_archive.navigation_review import invalidate_navigation_approval
-from exhibition_archive.workflow import run_workflow, stage_fingerprint
+from exhibition_archive.workflow import run_navigation_generation_only, run_workflow, stage_fingerprint
 
 
 def source_for(points, *, floor=True, ceiling=True, frame_verified=True):
@@ -40,6 +40,38 @@ def source_for(points, *, floor=True, ceiling=True, frame_verified=True):
                                  "classification": "GEOMETRY_SUPPORTED", "source": "synthetic plane fixture"}
     if ceiling:
         source["ceiling"] = {"height_along_floor_normal_units": 4, "classification": "GEOMETRY_SUPPORTED"}
+    return source
+
+
+def outdoor_source(scale=1.0, *, source_z_up=False):
+    """Irregular, non-metric outdoor camera path with local tracked geometry."""
+    source = source_for([], floor=False, ceiling=False)
+    source["test_scale"] = scale
+    source["coordinate_frame"]["navigation_up_viewer"] = [0, 1, 0]
+    source["coordinate_frame"]["navigation_reference_axis_viewer"] = [1, 0, 0]
+    camera_xy = [(x, z) for x in range(6) for z in range(6) if not (x >= 4 and z >= 4)]
+    if source_z_up:
+        source["stations"] = [{"stationId": f"camera-{i:03d}", "center": [x * scale, z * scale, 2 * scale],
+                               "trusted": True, "trust_reason": "synthetic registered camera"}
+                              for i, (x, z) in enumerate(camera_xy)]
+    else:
+        source["stations"] = [{"stationId": f"camera-{i:03d}", "centerCommonViewer": [x * scale, 2 * scale, z * scale],
+                               "trusted": True, "trust_reason": "synthetic registered camera"}
+                              for i, (x, z) in enumerate(camera_xy)]
+    points = []
+    for x_index in range(11):
+        for z_index in range(11):
+            x, z = x_index * 0.5, z_index * 0.5
+            if x >= 4 and z >= 4:
+                continue
+            for y in (0.0, 1.0, 2.0, 3.0, 4.0):
+                points.append([x * scale, z * scale, y * scale] if source_z_up
+                              else [x * scale, y * scale, z * scale])
+    # These high-track points are deliberately disconnected distant background.
+    points.extend([[1000 * scale, 500 * scale, 1000 * scale] for _ in range(12)])
+    source["sparse_points"] = points
+    source["sparse_point_tracks"] = [4] * len(points)
+    source["sparse_point_count"] = len(points)
     return source
 
 
@@ -161,7 +193,7 @@ class GeometryGenerationTests(unittest.TestCase):
         self.assertEqual(artifact["status"], "NAVIGATION_INSUFFICIENT_GEOMETRY")
         self.assertTrue(artifact["space_assumption"]["multi_level_suspected"])
         self.assertIn("CEILING_UNOBSERVED", [item["code"] for item in artifact["review"]["warnings"]])
-        with self.assertRaisesRegex(ValueError, "ceiling value"):
+        with self.assertRaisesRegex(ValueError, "technically invalid"):
             approve_navigation_artifact(artifact, "Reviewer", "reviewed", timestamp="2026-10-29T00:00:00Z", source_artifact_sha256="0" * 64)
         sparse_coverage = generate_navigation(source_for([[0, 0, 2], [1, 0, 2]]), {"camera_clearance_units": 0})
         self.assertEqual(sparse_coverage["status"], "NAVIGATION_INSUFFICIENT_GEOMETRY")
@@ -212,6 +244,96 @@ class GeometryGenerationTests(unittest.TestCase):
         check = validate_navigation_artifact(artifact)
         self.assertEqual(check["status"], "INVALID")
         self.assertEqual(check["initial_camera_validation"]["error"], "default_camera_outside_vertical_bounds")
+
+    def test_photo_sfm_proposes_outdoor_limits_without_inventing_walls_or_a_ceiling(self):
+        source = outdoor_source(scale=1.0)
+        artifact = generate_navigation(source, {"scene_type": "outdoor", "camera_clearance_units": 0})
+        self.assertEqual(artifact["status"], "NAVIGATION_NEEDS_REVIEW")
+        self.assertEqual(len(artifact["regions"]), 1)
+        region = artifact["regions"][0]
+        self.assertEqual(region["geometry_candidates"]["ground_plane"]["status"], "PROPOSED")
+        self.assertGreaterEqual(region["geometry_candidates"]["ground_plane"]["evidence"]["inlier_count"], 30)
+        self.assertIsNone(region["vertical_bounds"]["floor"]["value"])
+        self.assertIsNone(region["vertical_bounds"]["ceiling"])
+        self.assertFalse(region["exploration_limits"]["physical_ceiling_inferred"])
+        self.assertGreater(region["exploration_limits"]["maximum_height"]["value"],
+                           region["exploration_limits"]["minimum_height"]["value"])
+        self.assertEqual(artifact["coverage_assumptions"]["physical_walls_or_ceiling_inferred"], False)
+        self.assertEqual(artifact["validation"]["initial_camera_validation"]["status"], "PASS")
+
+        low = region["exploration_limits"]["minimum_height"]["value"]
+        high = region["exploration_limits"]["maximum_height"]["value"]
+        inside = [2.0 * source["test_scale"], -2.0 * source["test_scale"], (low + high) / 2.0]
+        self.assertTrue(navigation_segment_allowed(artifact, inside, [inside[0] + source["test_scale"], inside[1], inside[2] + source["test_scale"]]))
+        self.assertFalse(navigation_segment_allowed(artifact, inside, [inside[0] + 1000 * source["test_scale"], inside[1], inside[2]]))
+        self.assertFalse(navigation_segment_allowed(artifact, inside, [inside[0], inside[1], high + source["test_scale"]]))
+        self.assertGreater(region["evidence"]["sparse_geometry_observation"]["points_with_track_length_minimum_inside_candidate"], 0)
+
+        review_candidate = json.loads(json.dumps(artifact))
+        review_candidate["review"]["ground_plane_reviewed"] = True
+        approved = approve_navigation_artifact(review_candidate, "Local reviewer", "Reviewed camera support and exploration limits.",
+                                               timestamp="2026-11-07T00:00:00Z", source_artifact_sha256="b" * 64)
+        self.assertEqual(approved["status"], "NAVIGATION_APPROVED_BY_REVIEW")
+        envelope = approved["viewer_compatibility"]["envelope"]
+        self.assertIsNone(envelope["floor"])
+        self.assertIsNone(envelope["ceiling"])
+        self.assertFalse(envelope["explorationLimits"]["physicalCeiling"])
+
+    def test_far_background_points_and_nonmetric_scale_do_not_expand_camera_boundary(self):
+        source = outdoor_source(scale=0.01)
+        expected_extent = max(abs(p["centerCommonViewer"][0]) for p in source["stations"])
+        artifact = generate_navigation(source, {"scene_type": "auto", "camera_clearance_units": 0})
+        self.assertEqual(artifact["status"], "NAVIGATION_NEEDS_REVIEW")
+        region = artifact["regions"][0]
+        max_boundary = max(max(abs(coordinate) for coordinate in point) for point in region["polygon_uv"])
+        self.assertLess(max_boundary, expected_extent * 2)
+        self.assertLess(region["exploration_limits"]["maximum_height"]["value"], 0.1)
+        self.assertGreater(artifact["coverage_diagnostics"]["sparse_point_count"],
+                           region["evidence"]["sparse_geometry_observation"]["points_with_track_length_minimum_inside_candidate"])
+
+    def test_missing_or_degenerate_ground_evidence_stays_insufficient(self):
+        source = outdoor_source(scale=1.0)
+        source["sparse_points"] = [[100 + i, 0, 100 + i] for i in range(40)]
+        source["sparse_point_tracks"] = [4] * len(source["sparse_points"])
+        artifact = generate_navigation(source, {"scene_type": "outdoor", "camera_clearance_units": 0})
+        self.assertEqual(artifact["status"], "NAVIGATION_INSUFFICIENT_GEOMETRY")
+        self.assertEqual(artifact["regions"], [])
+        self.assertEqual(artifact["coverage_diagnostics"]["camera_used_count"], 0)
+        self.assertTrue(artifact["coverage_diagnostics"]["excluded_camera_components"])
+        excluded = artifact["coverage_diagnostics"]["excluded_camera_components"][0]
+        self.assertTrue(excluded["component_id"].startswith("camera-component-"))
+        exclusion_warning = next(item for item in artifact["review"]["warnings"]
+                                 if item["code"] == "CAMERA_COMPONENT_EXCLUDED_INSUFFICIENT_GEOMETRY")
+        self.assertIn(excluded["component_id"], exclusion_warning["message"])
+
+        collinear = source_for([[x, 0, 2] for x in range(12)], floor=False, ceiling=False)
+        collinear["coordinate_frame"]["navigation_up_viewer"] = [0, 0, 1]
+        self.assertEqual(generate_navigation(collinear)["status"], "NAVIGATION_INSUFFICIENT_GEOMETRY")
+
+    def test_arbitrary_source_rotation_uses_one_right_handed_viewer_frame(self):
+        rotation = [[1, 0, 0], [0, 0, 1], [0, -1, 0]]  # source +Z maps to Viewer +Y
+        source = outdoor_source(scale=1.0, source_z_up=True)
+        source["coordinate_frame"] = {"convention": "SYNTHETIC_Z_UP_SFM", "scale_status": "UNKNOWN_NON_METRIC",
+                                       "navigation_up_viewer": [0, 1, 0],
+                                       "source_to_viewer": {"uniform_scale": 1.0, "rotation": rotation,
+                                                             "translation": [3, 4, 5], "verified": True}}
+        artifact = generate_navigation(source, {"scene_type": "outdoor", "camera_clearance_units": 0})
+        self.assertEqual(artifact["coordinate_frame"]["viewer_to_navigation"]["up_viewer"], [0.0, 1.0, 0.0])
+        center = artifact["pose_evidence"]["candidate_camera_centers"][0]["viewer_center"]
+        raw = source["stations"][0]["center"]
+        self.assertAlmostEqual(center[0], raw[0] + 3)
+        self.assertAlmostEqual(center[1], raw[2] + 4)
+        self.assertAlmostEqual(center[2], -raw[1] + 5)
+        self.assertTrue(artifact["coordinate_frame"]["viewer_transform_verified"])
+
+    def test_default_camera_outside_proposal_is_rejected(self):
+        artifact = generate_navigation(outdoor_source(), {"scene_type": "outdoor", "camera_clearance_units": 0})
+        default_id = artifact["viewer_compatibility"]["stations"]["defaultStationId"]
+        default = next(row for row in artifact["pose_evidence"]["candidate_camera_centers"] if row["station_id"] == default_id)
+        default["navigation_local_uvh"][0] += 100
+        check = validate_navigation_artifact(artifact)
+        self.assertEqual(check["initial_camera_validation"]["status"], "INVALID")
+        self.assertEqual(check["initial_camera_validation"]["error"], "default_camera_outside_navigation_region")
 
     def test_aligned_lidar_plane_is_recorded_as_a_review_only_navigation_input(self):
         points = [[x, y, 2] for x, y in [(0, 0), (1, 0), (2, 0), (2, 1), (1, 2), (0, 2), (0, 1)]]
@@ -368,6 +490,46 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 self.assertEqual(nav_fp, stage_fingerprint(root, config, state, "navigation"))
                 config["integrations"]["navigation"]["margin_units"] = 0.05
                 self.assertNotEqual(nav_fp, stage_fingerprint(root, config, state, "navigation"))
+            finally:
+                state.close()
+
+    def test_navigation_only_generation_does_not_run_upstream_or_downstream_stages(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp) / "project"
+            source_dir = root / "photos"; source_dir.mkdir(parents=True)
+            sfm_dir = root / "sfm"; self._write_minimal_colmap(sfm_dir)
+            config = {"schema_version": "exhibition-archive.project.v1", "project_id": "navigation-only-fixture",
+                      "source": {"photo_directory": str(source_dir), "read_only": True}, "output_directory": "output",
+                      "integrations": {"sfm": {"mode": "adopt_existing", "directory": str(sfm_dir)},
+                                       "navigation": {"mode": "generate_from_sfm"}},
+                      "publication": {"public_site": False}}
+            (root / "project.json").write_text(json.dumps(config), encoding="utf-8")
+            state = ProjectState(root)
+            try:
+                sfm_fingerprint = stage_fingerprint(root, config, state, "sfm", full_hash=True)
+                fixture_run = state.start_run("fixture")
+                artifact = root / "sfm-fixture.json"
+                artifact.write_text("{}", encoding="utf-8")
+                sfm_execution = state.start_stage(fixture_run, "sfm", sfm_fingerprint, True, {})
+                state.finish_stage(sfm_execution, "COMPLETED", "fixture-digest",
+                                   {"artifacts": [str(artifact)]})
+                state.set_stage("sfm", "COMPLETED", sfm_fingerprint, "fixture-digest", sfm_execution,
+                                {"reconstruction_directory": str(sfm_dir)})
+                state.end_run(fixture_run, "COMPLETED", {"status": "COMPLETED"})
+                prior_lidar_executions = state.db.execute(
+                    "SELECT COUNT(*) FROM stage_executions WHERE stage_id='lidar_registration'").fetchone()[0]
+
+                result = run_navigation_generation_only(root, config, state)
+
+                self.assertEqual(result["status"], "NEEDS_REVIEW")
+                self.assertEqual(result["mode"], "navigation_generate_only")
+                self.assertEqual(state.stage("sfm")["last_execution_id"], sfm_execution)
+                self.assertIsNone(state.stage("lidar_registration"))
+                self.assertIsNone(state.stage("training"))
+                self.assertEqual(state.db.execute(
+                    "SELECT COUNT(*) FROM stage_executions WHERE stage_id='lidar_registration'").fetchone()[0],
+                    prior_lidar_executions)
+                self.assertTrue(Path(json.loads(state.stage("navigation")["details_json"])["proposal_path"]).is_file())
             finally:
                 state.close()
 

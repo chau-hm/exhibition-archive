@@ -738,6 +738,8 @@ def _navigation_source(root: Path, config: dict, state: ProjectState | None = No
     sfm_cfg = config.get("integrations", {}).get("sfm", {})
     source_files: list[str] = []
     center_doc = None
+    sparse_point_tracks: list[int] = []
+    sparse_point_errors: list[float] = []
     if nav_cfg.get("camera_centers"):
         center_doc, paths = _navigation_input_value(root, config, nav_cfg["camera_centers"])
         source_files.extend(paths)
@@ -790,7 +792,31 @@ def _navigation_source(root: Path, config: dict, state: ProjectState | None = No
         source_rec["identity"] = {"reconstruction_id": nav_cfg.get("reconstruction_id", reconstruction_dir.name)}
         floor_default = None
         coordinate_frame = {**reconstruction["source_reconstruction"]["coordinate_frame"], **coordinate_frame}
-        coordinate_frame.setdefault("source_to_viewer", {"uniform_scale": 1, "rotation": [[1,0,0],[0,1,0],[0,0,1]], "translation": [0,0,0], "verified": False})
+        # Navigation consumes the same non-destructive rotation used by the
+        # first-visual model and opening camera. This verifies coordinate
+        # consistency, while the orientation evidence remains a camera-up
+        # proposal rather than a claim about physical gravity.
+        from .viewer_orientation import estimate_y_up_transform, rotate_vector_xyzw
+        orientation = estimate_y_up_transform(cameras)
+        quaternion = orientation["rotation_quaternion_xyzw"]
+        axes = [rotate_vector_xyzw(quaternion, axis) for axis in
+                ([1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0])]
+        rotation = [[axes[column][row] for column in range(3)] for row in range(3)]
+        coordinate_frame.update({
+            "viewer_frame": "PlayCanvas model frame; identical orientation transform to first-visual",
+            "navigation_up_viewer": [0.0, 1.0, 0.0],
+            "navigation_reference_axis_viewer": [1.0, 0.0, 0.0],
+            "up_axis": "VIEWER_Y_FROM_REGISTERED_CAMERA_UP_PROPOSAL",
+            "navigation_up_evidence": orientation,
+            "transform_provenance": (
+                "The source-to-viewer rotation is the same camera-up proposal applied to the Gaussian model and "
+                "opening camera; this marks coordinate consistency only, not physical gravity or a ground plane."
+            ),
+            "source_to_viewer": {"uniform_scale": 1.0, "rotation": rotation,
+                                 "translation": [0.0, 0.0, 0.0], "verified": True},
+        })
+        sparse_point_tracks = reconstruction.get("sparse_point_tracks", [])
+        sparse_point_errors = reconstruction.get("sparse_point_errors", [])
     aligned_lidar_diagnostics: dict[str, Any] = {"status": "NOT_AVAILABLE", "navigation_consumed": False}
     if not center_doc:
         lidar_dir = output_path(root, config) / "lidar"
@@ -858,7 +884,10 @@ def _navigation_source(root: Path, config: dict, state: ProjectState | None = No
         floor_value.setdefault("coordinate_frame", "viewer" if coordinate_frame.get("coordinates_are_viewer") else "source")
         floor_value.setdefault("classification", "GEOMETRY_SUPPORTED" if floor_value.get("source") else "PROPOSED")
     source = {"source_reconstruction": source_rec, "coordinate_frame": coordinate_frame, "cameras": cameras,
-              "camera_models": camera_models, "sparse_points": sparse_points, "sparse_point_count": len(sparse_points),
+              "camera_models": camera_models, "sparse_points": sparse_points,
+              "sparse_point_tracks": sparse_point_tracks,
+              "sparse_point_errors": sparse_point_errors,
+              "sparse_point_count": len(sparse_points),
               "floor_plane": floor_value, "ceiling": ceiling_value,
               "aligned_lidar_geometry_used": aligned_lidar_diagnostics.get("navigation_consumed", False),
               "aligned_lidar_diagnostics": aligned_lidar_diagnostics,
@@ -1969,6 +1998,136 @@ def _execute_stage(root: Path, config: dict, state: ProjectState, stage_id: str,
             raise WorkflowError(f"Archive verification failed: {result.get('failures', [])}")
         return {"status": "COMPLETED", "artifacts": [target], "details": result}
     raise WorkflowError(f"Unknown stage: {stage_id}")
+
+
+def run_navigation_generation_only(root: Path, config: dict, state: ProjectState) -> dict[str, Any]:
+    """Regenerate only the navigation proposal from the current validated SfM result."""
+    if _navigation_mode(config) != "generate_from_sfm":
+        raise WorkflowError("Navigation-only generation requires integrations.navigation.mode=generate_from_sfm")
+    sfm = state.stage("sfm") or {}
+    sfm_fingerprint = stage_fingerprint(root, config, state, "sfm", full_hash=True)
+    if (sfm.get("status") not in {"COMPLETED", "ADOPTED"} or
+            sfm.get("input_fingerprint") != sfm_fingerprint or
+            not _stage_artifacts_valid(state, "sfm", output_path(root, config) / "work")):
+        raise WorkflowError("Navigation-only generation requires a current, validated SfM stage; no upstream stage was run.")
+
+    fingerprint = stage_fingerprint(root, config, state, "navigation", full_hash=True)
+    stage_root = output_path(root, config) / "work"
+    stage_root.mkdir(parents=True, exist_ok=True)
+    run_id = state.start_run("navigation_generate_only")
+    execution_id = state.start_stage(
+        run_id, "navigation", fingerprint, False,
+        {"stage_contract": next(stage for stage in STAGES if stage["id"] == "navigation"),
+         "execution_context": {"kind": "operator-initiated-local-cli", "backend_execution": False,
+                               "upstream_stages_executed": []}},
+    )
+    state.set_stage("navigation", "RUNNING", fingerprint, None, execution_id,
+                    {"navigation_only": True, "upstream_stages_executed": []})
+    summary: dict[str, Any] = {
+        "run_id": run_id, "mode": "navigation_generate_only", "status": "RUNNING",
+        "stages": {"navigation": "RUNNING"}, "completed": [], "needs_review": [],
+        "blocked": [], "skipped": list(stage["id"] for stage in STAGES if stage["id"] != "navigation"),
+    }
+    try:
+        result = execute_navigation_generation(root, config, state, stage_root, execution_id)
+        artifacts = [Path(item).resolve() for item in result.get("artifacts", [])]
+        if not artifacts or any(not path.is_file() for path in artifacts):
+            raise WorkflowError("Navigation generation reported missing artifacts")
+        for path in artifacts:
+            kind = "json" if path.suffix.casefold() == ".json" else "file"
+            state.add_artifact("navigation", path, kind, sha256_file(path), path.stat().st_size,
+                               {"project_id": config["project_id"], "navigation_only": True})
+        digest = json_digest([
+            {"path": str(path.relative_to(root) if root in path.parents else path),
+             "sha256": state.cached_hash(path)} for path in artifacts
+        ])
+        status = result["status"]
+        details = {**result.get("details", {}), "artifacts": [str(path) for path in artifacts],
+                   "navigation_only": True, "upstream_stages_executed": []}
+        state.finish_stage(execution_id, status, digest, {**result, "artifacts": [str(path) for path in artifacts]})
+        state.set_stage("navigation", status, fingerprint, digest, execution_id, details)
+        summary["stages"]["navigation"] = status
+        summary["status"] = status
+        if status == "NEEDS_REVIEW":
+            summary["needs_review"].append("navigation")
+            summary["stop_reason"] = "The navigation proposal is ready for explicit human review."
+        else:
+            summary["completed"].append("navigation")
+        state.end_run(run_id, summary["status"], summary)
+        return summary
+    except Exception as exc:
+        state.finish_stage(execution_id, "FAILED", None, {"error": str(exc), "navigation_only": True}, str(exc))
+        state.set_stage("navigation", "FAILED", fingerprint, None, execution_id,
+                        {"error": str(exc), "navigation_only": True})
+        summary["status"] = "FAILED"
+        summary["stages"]["navigation"] = "FAILED"
+        summary["failed"] = {"stage": "navigation", "error": str(exc)}
+        state.end_run(run_id, "FAILED", summary)
+        raise
+
+
+def run_first_visual_preview_only(root: Path, config: dict, state: ProjectState) -> dict[str, Any]:
+    """Rebuild the private Reviewer/Visitor from current local artifacts only."""
+    training = state.stage("training") or {}
+    training_fingerprint = stage_fingerprint(root, config, state, "training", full_hash=False)
+    if (training.get("status") not in {"COMPLETED", "ADOPTED"} or
+            training.get("input_fingerprint") != training_fingerprint or
+            not _stage_artifacts_valid(state, "training", output_path(root, config) / "work")):
+        raise WorkflowError("Viewer-only regeneration requires a current validated training stage; no upstream stage was run.")
+    if config.get("integrations", {}).get("navigation", {}).get("mode") == "generate_from_sfm":
+        navigation = state.stage("navigation") or {}
+        navigation_details = json.loads(navigation.get("details_json") or "{}")
+        navigation_fingerprint = stage_fingerprint(root, config, state, "navigation", full_hash=True)
+        proposal = Path(navigation_details.get("proposal_path", ""))
+        if (navigation.get("status") != "NEEDS_REVIEW" or
+                navigation.get("input_fingerprint") != navigation_fingerprint or
+                not proposal.is_file()):
+            raise WorkflowError("Viewer-only regeneration requires the current generated navigation proposal; no upstream stage was run.")
+
+    fingerprint = stage_fingerprint(root, config, state, "first_visual", full_hash=False)
+    stage_root = output_path(root, config) / "work"
+    stage_root.mkdir(parents=True, exist_ok=True)
+    run_id = state.start_run("first_visual_preview_only")
+    execution_id = state.start_stage(
+        run_id, "first_visual", fingerprint, False,
+        {"stage_contract": next(stage for stage in STAGES if stage["id"] == "first_visual"),
+         "execution_context": {"kind": "operator-initiated-local-cli", "backend_execution": False,
+                               "upstream_stages_executed": []}},
+    )
+    state.set_stage("first_visual", "RUNNING", fingerprint, None, execution_id,
+                    {"preview_only": True, "upstream_stages_executed": []})
+    try:
+        from .preview import build_first_visual_preview
+        result = build_first_visual_preview(root, config, state, stage_root, execution_id)
+        artifacts = [Path(item).resolve() for item in result.get("artifacts", [])]
+        if not artifacts or any(not path.is_file() for path in artifacts):
+            raise WorkflowError("First-visual generation reported missing artifacts")
+        for path in artifacts:
+            kind = "json" if path.suffix.casefold() == ".json" else "file"
+            state.add_artifact("first_visual", path, kind, sha256_file(path), path.stat().st_size,
+                               {"project_id": config["project_id"], "preview_only": True})
+        digest = json_digest([
+            {"path": str(path.relative_to(root) if root in path.parents else path),
+             "sha256": state.cached_hash(path)} for path in artifacts
+        ])
+        status = result["status"]
+        details = {**result.get("details", {}), "artifacts": [str(path) for path in artifacts],
+                   "preview_only": True, "upstream_stages_executed": []}
+        state.finish_stage(execution_id, status, digest, {**result, "artifacts": [str(path) for path in artifacts]})
+        state.set_stage("first_visual", status, fingerprint, digest, execution_id, details)
+        summary = {"run_id": run_id, "mode": "first_visual_preview_only",
+                   "status": "AWAITING_VISUAL_REVIEW", "stages": {"first_visual": status},
+                   "completed": ["first_visual"], "needs_review": [], "blocked": [],
+                   "skipped": [stage["id"] for stage in STAGES if stage["id"] != "first_visual"],
+                   "stop_reason": "The private Reviewer and Visitor previews are ready for visual review."}
+        state.end_run(run_id, summary["status"], summary)
+        return {**summary, "first_visual": details}
+    except Exception as exc:
+        state.finish_stage(execution_id, "FAILED", None, {"error": str(exc), "preview_only": True}, str(exc))
+        state.set_stage("first_visual", "FAILED", fingerprint, None, execution_id,
+                        {"error": str(exc), "preview_only": True})
+        state.end_run(run_id, "FAILED", {"status": "FAILED", "stage": "first_visual", "error": str(exc)})
+        raise
 
 
 def run_workflow(root: Path, config: dict, state: ProjectState, resume: bool = False, force_hash: bool = False,
