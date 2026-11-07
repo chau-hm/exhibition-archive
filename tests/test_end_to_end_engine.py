@@ -604,11 +604,13 @@ def test_reviewer_and_visitor_preview_reference_real_fixture_assets(tmp_path):
                                                   "backend_report_status": "NOT_REPORTED_BY_BACKEND",
                                                   "source_image_dimensions": []}})
         output_dir = work / "first-visual-stage"
-        result = build_first_visual_preview(root, config, state, output_dir, 1)
+        result = build_first_visual_preview(root, config, state, output_dir, 1,
+                                            update_current_summary=False)
         assert result["details"]["validation"]["status"] == "PASS"
         version = Path(result["details"]["version_directory"])
         assert (version / "reviewer" / "index.html").is_file()
         assert (version / "visitor" / "assets" / "exhibition.ply").is_file()
+        assert (version / "first-visual-summary.md").is_file()
         pipeline_status = json.loads((version / "pipeline-status.json").read_text())
         assert "training-run.json" in pipeline_status["diagnostic_files"]
         assert pipeline_status["pipeline_stages"]["first_visual"] == "COMPLETED"
@@ -617,9 +619,20 @@ def test_reviewer_and_visitor_preview_reference_real_fixture_assets(tmp_path):
         reviewer_html = (version / "reviewer" / "index.html").read_text()
         assert "Resolution evidence" in reviewer_html
         assert "NOT_REPORTED_BY_BACKEND" in reviewer_html
+        assert "Review required; identity fallback" in reviewer_html
+        assert "ORIENTATION_REVIEW_REQUIRED" not in reviewer_html
         metadata = json.loads((version / "visitor" / "config" / "exhibition.json").read_text())
         assert metadata["release_authorization"] == "NEEDS_REVIEW"
         assert metadata["navigation"]["status"] == "UNVERIFIED"
+        orientation = metadata["initial_camera"]["orientation"]
+        assert orientation["status"] == "ORIENTATION_REVIEW_REQUIRED"
+        assert orientation["applied"] is False
+        settings = json.loads((version / "visitor" / "config" / "settings.json").read_text())
+        assert settings["cameras"][0]["initial"] == metadata["initial_camera"]["pose_supersplat"]
+        assert metadata["master"]["sha256"] == result["details"]["model_sha256"]
+        assert '../visitor/index.html' in reviewer_html
+        assert "Viewer orientation" in reviewer_html
+        assert pipeline_status["viewer_orientation"]["status"] == "ORIENTATION_REVIEW_REQUIRED"
         manifest = json.loads((version / "manifest.json").read_text())
         assert manifest["source_point_clouds"][0]["sha256"] == "fixture-sha"
         assert manifest["effective_training_configuration"] == effective_training_configuration

@@ -13,10 +13,11 @@ from . import __version__
 from .adapters import read_json, sha256_file, write_json
 from .backends import validate_gaussian_ply
 from .workflow import STAGES, output_path, project_path
+from .viewer_orientation import estimate_y_up_transform, map_pose_to_viewer
 
 
 def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path,
-                               execution_id: int) -> dict[str, Any]:
+                               execution_id: int, *, update_current_summary: bool = True) -> dict[str, Any]:
     """Build private, versioned Reviewer and Visitor previews for the unreviewed first model."""
     training_stage = state.stage("training") or {}
     training_details = _details(training_stage)
@@ -182,9 +183,11 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
         "navigation": {"status": navigation_details.get("status", "UNVERIFIED"),
                        "review_required": True,
                        "reason": navigation_details.get("reason", "Generated navigation remains a proposal until reviewed.")},
+        "viewer_orientation": initial_camera["orientation"],
         "pipeline_stages": {stage["id"]: (stage_states.get(stage["id"]) or {}).get("status", "PENDING")
                             for stage in STAGES},
-        "warnings": _preview_warnings(sfm_details, lidar_report, navigation_details),
+        "warnings": _preview_warnings(sfm_details, lidar_report, navigation_details,
+                                      initial_camera["orientation"]),
         "reviewer_html": "reviewer/index.html", "visitor_html": "visitor/index.html",
         "release_authorization": "NEEDS_REVIEW", "first_visual_only": True,
     }
@@ -221,7 +224,8 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     })
     reviewer_html = reviewer / "index.html"
     reviewer_html.write_text(_reviewer_html(pipeline_summary), encoding="utf-8")
-    report_path = output_path(root, config) / "reports" / "first-visual-summary.md"
+    report_path = (output_path(root, config) / "reports" / "first-visual-summary.md"
+                   if update_current_summary else version_dir / "first-visual-summary.md")
     report_path.parent.mkdir(parents=True, exist_ok=True)
     report_path.write_text(_summary_markdown(pipeline_summary), encoding="utf-8")
     failures = _validate_preview(version_dir, identity)
@@ -266,13 +270,28 @@ def _build_visitor_config(root: Path, config: dict) -> tuple[dict, dict]:
     else:
         position, target = [0, 0, 3], [0, 0, 0]
         camera_source = {"selection": "viewer reset-camera fallback; no reconstruction path"}
-    pose = {"position": [float(x) for x in position], "target": [float(x) for x in target], "fov": 70.75}
-    initial_camera = {"coordinate_frame": "COLMAP / Gaussian model coordinates; up-axis remains unverified",
-                      "source": camera_source, "pose_supersplat": pose,
-                      "model_scene_transform_supersplat": {"translation": [0, 0, 0],
-                                                            "rotationQuaternionXYZW": [0, 0, 0, 1],
-                                                            "uniformScale": 1.0},
-                      "navigation_status": "UNVERIFIED"}
+    pose_colmap = {"position": [float(x) for x in position],
+                   "target": [float(x) for x in target], "fov": 70.75}
+    orientation = estimate_y_up_transform(camera_rows)
+    pose = map_pose_to_viewer(pose_colmap, orientation["rotation_quaternion_xyzw"])
+    coordinate_frame = (
+        "COLMAP world rotated to PlayCanvas Y-up using registered-camera up consensus"
+        if orientation["applied"] else
+        "COLMAP world with identity transform; PlayCanvas Y-up fallback requires orientation review"
+    )
+    initial_camera = {
+        "coordinate_frame": coordinate_frame,
+        "source": camera_source,
+        "pose_colmap": pose_colmap,
+        "pose_supersplat": pose,
+        "model_scene_transform_supersplat": {
+            "translation": [0, 0, 0],
+            "rotationQuaternionXYZW": orientation["rotation_quaternion_xyzw"],
+            "uniformScale": 1.0,
+        },
+        "orientation": orientation,
+        "navigation_status": "UNVERIFIED",
+    }
     settings = {"version": 2, "tonemapping": "none", "highPrecisionRendering": False,
                 "background": {"color": [0.012, 0.016, 0.013]},
                 "postEffectSettings": {"sharpness": {"enabled": False, "amount": 0},
@@ -348,14 +367,20 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
     sfm = summary["sfm"]
     lidar = summary["lidar"]
     training = summary["training"]
+    viewer_orientation = summary.get("viewer_orientation", {})
+    orientation_status = viewer_orientation.get("status", "ORIENTATION_REVIEW_REQUIRED")
+    orientation_label = {
+        "CAMERA_UP_PROPOSAL_APPLIED_REVIEW_REQUIRED": "Proposal applied; review required",
+        "ORIENTATION_REVIEW_REQUIRED": "Review required; identity fallback",
+    }.get(orientation_status, str(orientation_status).replace("_", " ").title())
     training_resolution = training.get("training_resolution", {})
     observed_size = training_resolution.get("backend_reported_training_resolution")
     observed_size_text = (f"{observed_size[0]} × {observed_size[1]} px"
                           if isinstance(observed_size, list) and len(observed_size) == 2 else "not reported")
     return f"""<!doctype html><html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Reviewer · {html.escape(summary['project_id'])}</title><style>
-*{{box-sizing:border-box}}body{{margin:0;background:#111512;color:#e7ebe3;font:15px/1.5 system-ui,sans-serif}}header{{padding:1rem 1.4rem;background:#1d241f;border-bottom:1px solid #38433a}}h1,h2{{margin:.2rem 0 .8rem}}header p,.muted{{color:#abb6aa}}main{{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.8fr);gap:1rem;padding:1rem;max-width:1600px;margin:auto}}section{{background:#1a201b;border:1px solid #344037;border-radius:.7rem;padding:1rem;min-width:0}}iframe{{width:100%;height:min(72vh,850px);border:0;border-radius:.45rem;background:#080a08}}a{{color:#c4d5b6}}.links{{display:grid;gap:.45rem}}.metric{{display:grid;grid-template-columns:1fr auto;gap:.6rem;border-bottom:1px solid #344037;padding:.4rem 0}}.warning{{background:#33291b;border:1px solid #755c34;padding:.7rem;border-radius:.5rem}}@media(max-width:850px){{main{{grid-template-columns:1fr}}iframe{{height:65vh}}}}</style></head><body>
+*{{box-sizing:border-box}}body{{margin:0;background:#111512;color:#e7ebe3;font:15px/1.5 system-ui,sans-serif}}header{{padding:1rem 1.4rem;background:#1d241f;border-bottom:1px solid #38433a}}h1,h2{{margin:.2rem 0 .8rem}}header p,.muted{{color:#abb6aa}}main{{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.8fr);gap:1rem;padding:1rem;max-width:1600px;margin:auto}}section{{background:#1a201b;border:1px solid #344037;border-radius:.7rem;padding:1rem;min-width:0}}iframe{{width:100%;height:min(72vh,850px);border:0;border-radius:.45rem;background:#080a08}}a{{color:#c4d5b6}}.links{{display:grid;gap:.45rem}}.metric{{display:grid;grid-template-columns:1fr auto;gap:.6rem;border-bottom:1px solid #344037;padding:.4rem 0}}.metric b{{min-width:0;text-align:right;overflow-wrap:anywhere}}.warning{{background:#33291b;border:1px solid #755c34;padding:.7rem;border-radius:.5rem}}@media(max-width:850px){{main{{grid-template-columns:1fr}}iframe{{height:65vh}}}}</style></head><body>
 <header><h1>Technical Reviewer · {html.escape(summary['project_id'])}</h1><p>First visual candidate · release authorization: NEEDS_REVIEW · no source photographs are included</p></header><main><section><h2>Candidate model preview</h2><iframe title="Unreviewed Visitor preview" src="../visitor/index.html"></iframe></section><aside>
-<section><h2>Evidence</h2><div class="metric"><span>Source photos</span><b>{sources['image_count']}</b></div><div class="metric"><span>Registered views</span><b>{sfm.get('registered_image_count','unknown')} / {sfm.get('source_image_count', sources['image_count'])}</b></div><div class="metric"><span>Sparse SfM points</span><b>{sfm.get('sparse_point_count',0)}</b></div><div class="metric"><span>Gaussian splats</span><b>{training.get('gaussian_count','unknown')}</b></div><div class="metric"><span>Model size</span><b>{training.get('model_size_bytes',0):,} bytes</b></div><div class="metric"><span>Training divisor</span><b>{html.escape(str(training.get('resolution_divisor','unknown')))}</b></div><div class="metric"><span>Backend image size</span><b>{html.escape(observed_size_text)}</b></div><div class="metric"><span>Resolution evidence</span><b>{html.escape(str(training_resolution.get('backend_report_status','NOT_AVAILABLE')))}</b></div><div class="metric"><span>LiDAR</span><b>{html.escape(str(lidar.get('inspection_status','NOT_DETECTED')))}</b></div><div class="metric"><span>LiDAR alignment</span><b>{html.escape(str(lidar.get('alignment_status','NOT_ATTEMPTED')))}</b></div><div class="metric"><span>Navigation</span><b>{html.escape(str(summary['navigation']['status']))}</b></div></section>
+<section><h2>Evidence</h2><div class="metric"><span>Source photos</span><b>{sources['image_count']}</b></div><div class="metric"><span>Registered views</span><b>{sfm.get('registered_image_count','unknown')} / {sfm.get('source_image_count', sources['image_count'])}</b></div><div class="metric"><span>Sparse SfM points</span><b>{sfm.get('sparse_point_count',0)}</b></div><div class="metric"><span>Gaussian splats</span><b>{training.get('gaussian_count','unknown')}</b></div><div class="metric"><span>Model size</span><b>{training.get('model_size_bytes',0):,} bytes</b></div><div class="metric"><span>Training divisor</span><b>{html.escape(str(training.get('resolution_divisor','unknown')))}</b></div><div class="metric"><span>Backend image size</span><b>{html.escape(observed_size_text)}</b></div><div class="metric"><span>Resolution evidence</span><b>{html.escape(str(training_resolution.get('backend_report_status','NOT_AVAILABLE')))}</b></div><div class="metric"><span>LiDAR</span><b>{html.escape(str(lidar.get('inspection_status','NOT_DETECTED')))}</b></div><div class="metric"><span>LiDAR alignment</span><b>{html.escape(str(lidar.get('alignment_status','NOT_ATTEMPTED')))}</b></div><div class="metric"><span>Navigation</span><b>{html.escape(str(summary['navigation']['status']))}</b></div><div class="metric"><span>Viewer orientation</span><b>{html.escape(orientation_label)}</b></div></section>
 <section><h2>Warnings and limitations</h2><ul class="warning">{warning_items or '<li>No additional warning recorded.</li>'}</ul><p class="muted">SfM coordinates are arbitrary scale. The unbounded Visitor preview is for technical review only; navigation and public release remain unapproved.</p></section>
 <section><h2>Diagnostics</h2><div class="links">{''.join(diagnostics)}</div></section></aside></main></body></html>"""
 
@@ -438,12 +463,17 @@ def _public_lidar_summary(report: dict, alignment_path: Path,
             "warnings": report.get("warnings", []) + alignment.get("warnings", [])}
 
 
-def _preview_warnings(sfm: dict, lidar: dict, navigation: dict) -> list[str]:
+def _preview_warnings(sfm: dict, lidar: dict, navigation: dict,
+                      orientation: dict | None = None) -> list[str]:
     warnings = []
     warnings.extend(str(value) for value in sfm.get("warnings", []))
     warnings.extend(str(value) for value in lidar.get("warnings", []))
     if navigation.get("status") not in {"COMPLETED", "ADOPTED"}:
         warnings.append("Navigation geometry is a proposal or remains unverified; the Visitor preview has no enforced scene boundary.")
+    if orientation and orientation.get("applied"):
+        warnings.append("Viewer Y-up is an unreviewed proposal from registered camera orientations; it does not establish physical gravity or validate navigation.")
+    else:
+        warnings.append("Camera-up evidence was insufficient; the viewer keeps the raw pose with an identity transform and requires orientation review.")
     warnings.append("The first-visual model is an unreviewed candidate. Do not treat this preview as an approved public release.")
     return warnings
 
@@ -459,6 +489,7 @@ def _summary_markdown(summary: dict) -> str:
             f"- Training resolution observation: {summary['training'].get('training_resolution', {}).get('backend_report_status', 'NOT_AVAILABLE')}\n"
             f"- Model: {summary['training']['model_format']}, {summary['training']['gaussian_count']} Gaussians, {summary['training']['model_size_bytes']} bytes, SHA-256 `{summary['training']['model_sha256']}`\n"
             f"- Navigation: {summary['navigation']['status']} (review required)\n"
+            f"- Viewer orientation: {summary['viewer_orientation']['status']} (camera-pose proposal; physical up and navigation remain unverified)\n"
             f"- Reviewer: `{summary['reviewer_html']}`; Visitor preview: `{summary['visitor_html']}`\n"
             f"- Release authorization: {summary['release_authorization']}\n\n"
             "## Warnings\n\n" + "\n".join(f"- {item}" for item in summary["warnings"]) + "\n")
