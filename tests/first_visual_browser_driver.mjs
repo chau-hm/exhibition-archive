@@ -217,6 +217,10 @@ check('model and camera use the same orientation transform',
   JSON.stringify(initialState.modelTransform.rotationQuaternionXYZW) === JSON.stringify(sceneTransform.rotationQuaternionXYZW) &&
   JSON.stringify(initialState.modelTransform.translation) === JSON.stringify(sceneTransform.translation),
   { modelTransform: initialState.modelTransform, cameraTransform: sceneTransform });
+check('ordinary Visitor does not expose technical navigation diagnostics',
+  await evaluate("!document.querySelector('.navigation-diagnostic-panel')"));
+check('ordinary Visitor states its free-flight boundary is unbounded until approval',
+  await evaluate("document.querySelector('.preview-status')?.textContent.includes('Free flight is unbounded until navigation approval')"));
 await screenshot('visitor-opening');
 
 for (let index = 1; index <= 2; index++) {
@@ -283,6 +287,82 @@ check('Technical Reviewer embeds the same corrected Visitor pose',
   reviewerPose.positionError < 0.04 && reviewerPose.forwardDot > 0.995 && reviewerPose.basis.ok,
   { title: reviewerState?.title, frameSource: reviewerState?.src, pose: reviewerPose });
 await screenshot('reviewer-opening');
+
+await call('Page.navigate', { url: `${siteUrl}/visitor/index.html?acceptance=1&navigationDiagnostics=1` });
+await waitForViewer();
+const framingControls = await evaluate(`(() => ({
+  perspective: Boolean(document.querySelector('[data-nav-frame="perspective"]')),
+  topDown: Boolean(document.querySelector('[data-nav-frame="top-down"]')),
+  reset: Boolean(document.querySelector('[data-nav-frame="reset"]'))
+}))()`);
+await evaluate(`document.querySelector('[data-nav-frame="perspective"]')?.click()`);
+await sleep(1600);
+const framedCameraState = await currentState();
+check('diagnostic Frame boundary preset frames the candidate region',
+  framingControls.perspective && framingControls.topDown && framingControls.reset &&
+  distance(framedCameraState.position, lookEnd.position) > 2,
+  { controls: framingControls, position: framedCameraState.position });
+await evaluate(`document.querySelector('[data-nav-frame="top-down"]')?.click()`);
+await sleep(1600);
+const topDownCameraState = await currentState();
+check('diagnostic Top down preset points along viewer Y',
+  Math.abs(normalize(topDownCameraState.forward)[1]) > 0.95,
+  { forward: topDownCameraState.forward });
+await evaluate(`document.querySelector('[data-nav-frame="reset"]')?.click()`);
+await sleep(1600);
+const diagnosticResetState = await currentState();
+check('diagnostic reset restores the normal opening camera',
+  resetCheck(diagnosticResetState).positionError < 0.04 &&
+  resetCheck(diagnosticResetState).forwardDot > 0.995,
+  resetCheck(diagnosticResetState));
+await evaluate(`document.querySelector('[data-nav-frame="perspective"]')?.click()`);
+await sleep(1600);
+const overlayState = await evaluate(`(async () => {
+  const deadline = Date.now() + 15000;
+  let panel, canvas, status;
+  while (Date.now() < deadline) {
+    panel = document.querySelector('.navigation-diagnostic-panel');
+    canvas = document.querySelector('.navigation-diagnostic-canvas');
+    status = panel?.querySelector('[data-diagnostic-status]')?.textContent ?? '';
+    if (canvas?.width > 0 && status && !status.startsWith('Loading')) break;
+    await new Promise(resolve => setTimeout(resolve, 100));
+  }
+  let coloredPixels = 0;
+  if (canvas?.width && canvas?.height) {
+    const context = canvas.getContext('2d');
+    const pixels = context.getImageData(0, 0, canvas.width, canvas.height).data;
+    for (let index = 3; index < pixels.length; index += 4) if (pixels[index] > 0) coloredPixels++;
+  }
+  return { status, panel: Boolean(panel), overlayCanvas: Boolean(canvas?.width && canvas?.height),
+    layerControlCount: panel?.querySelectorAll('[data-nav-layer]').length ?? 0,
+    framingControlCount: panel?.querySelectorAll('[data-nav-frame]').length ?? 0,
+    projection: panel?.querySelector('[data-diagnostic-projection]')?.textContent ?? '',
+    unboundedWarning: panel?.textContent?.includes('remains unbounded') ?? false, coloredPixels };
+})()`);
+const panelLayout = await evaluate(`(() => {
+  const panel = document.querySelector('.navigation-diagnostic-panel');
+  const heading = panel?.querySelector('h2');
+  if (!panel || !heading) return null;
+  const panelRect = panel.getBoundingClientRect();
+  const headingRect = heading.getBoundingClientRect();
+  const topElement = document.elementFromPoint(headingRect.left + 8, headingRect.top + headingRect.height / 2);
+  const css = getComputedStyle(heading);
+  return { panelWidth: panelRect.width, headingWidth: headingRect.width,
+    headingScrollWidth: heading.scrollWidth, headingClientWidth: heading.clientWidth,
+    headingVisible: css.visibility !== 'hidden' && Number(css.opacity) > 0,
+    hitTestInsidePanel: Boolean(topElement?.closest('.navigation-diagnostic-panel')) };
+})()`);
+check('technical overlay controls remain visible above the model canvas',
+  panelLayout && panelLayout.panelWidth >= 250 && panelLayout.headingWidth > 100 &&
+  panelLayout.headingScrollWidth <= panelLayout.headingClientWidth + 1 &&
+  panelLayout.headingVisible && panelLayout.hitTestInsidePanel, panelLayout);
+check('model-relative navigation overlay loads against the Visitor scene',
+  overlayState.panel && overlayState.overlayCanvas && overlayState.layerControlCount >= 5 &&
+  overlayState.framingControlCount === 3 &&
+  overlayState.status.includes('NAVIGATION_NEEDS_REVIEW') && overlayState.status.includes('77/77 cameras') &&
+  overlayState.unboundedWarning && overlayState.coloredPixels > 0 &&
+  /Overlay projection: [1-9]\d*\/77 cameras in view · [1-9]\d* segments/.test(overlayState.projection), overlayState);
+await screenshot('navigation-model-overlay');
 
 check('page has no uncaught browser exceptions', browserErrors.length === 0, { browserErrors });
 check('page has no failed network requests', networkErrors.length === 0, { networkErrors });

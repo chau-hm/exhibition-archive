@@ -4,6 +4,7 @@ import html
 import hashlib
 import json
 import math
+import os
 import shutil
 import struct
 import subprocess
@@ -52,7 +53,14 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     css = visitor / "css"
     for directory in (assets, config_dir, vendor, js, css):
         directory.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(model, assets / "exhibition.ply")
+    model_asset = assets / "exhibition.ply"
+    try:
+        # Viewer revisions are immutable and share one volume with the source
+        # candidate in the local Engine workspace. A hard link preserves the
+        # validated model identity without making another 744 MB copy.
+        os.link(model, model_asset)
+    except OSError:
+        shutil.copy2(model, model_asset)
 
     visitor_cfg, initial_camera = _build_visitor_config(root, config)
     _write_visitor_assets(visitor, config, initial_camera)
@@ -148,10 +156,14 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     if navigation_proposal_doc.get("schema_version") == "exhibition-archive.navigation.v1" and camera_rows:
         coverage_doc = _navigation_coverage_diagnostic(
             navigation_proposal_doc, camera_rows, sparse_points, sparse_point_tracks,
-            initial_camera["orientation"]["rotation_quaternion_xyzw"], model)
+            initial_camera["model_scene_transform_supersplat"], model)
         write_json(diagnostics / "navigation-coverage.json", coverage_doc)
         (diagnostics / "navigation-coverage.html").write_text(
             render_navigation_coverage_html(coverage_doc), encoding="utf-8")
+        trajectory_report = coverage_doc.get("trajectory_report")
+        if trajectory_report:
+            write_json(diagnostics / "navigation-trajectory-report.json", trajectory_report)
+        write_json(diagnostics / "navigation-overlay.json", _navigation_model_overlay(coverage_doc))
         navigation_coverage_summary = coverage_doc["summary"]
 
     discovery_path = output_path(root, config) / "inputs" / "discovery.json"
@@ -346,7 +358,7 @@ def _write_visitor_assets(visitor: Path, config: dict, initial_camera: dict) -> 
     html_text = (template / "index.html").read_text(encoding="utf-8")
     title = html.escape(str(config.get("viewer", {}).get("title", config["project_id"])), quote=True)
     html_text = html_text.replace("__EXHIBITION_TITLE__", title)
-    banner = '<div class="preview-status" role="status">First visual preview · Navigation unverified · Not approved for public release</div>\n    '
+    banner = '<div class="preview-status" role="status">First visual preview · Free flight is unbounded until navigation approval · Not approved for public release</div>\n    '
     html_text = html_text.replace('<div id="viewer"', banner + '<div id="viewer"')
     (visitor / "index.html").write_text(html_text, encoding="utf-8")
     shutil.copy2(template / "style.css", visitor / "css" / "viewer.css")
@@ -453,8 +465,8 @@ def _gaussian_xyz_sample(path: Path, maximum: int = 20_000) -> dict[str, Any]:
 
 def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[dict[str, Any]],
                                    sparse_points: list[list[float]], sparse_tracks: list[int],
-                                   model_rotation: list[float], model_path: Path) -> dict[str, Any]:
-    from .navigation import _convex_hull, _signed_area
+                                   model_transform: dict[str, Any], model_path: Path) -> dict[str, Any]:
+    from .navigation import _polygon_perimeter, _signed_area, _validate_initial_camera
 
     def q(values: list[float], fraction: float) -> float:
         ordered = sorted(values)
@@ -470,10 +482,62 @@ def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[
     def add_scaled(origin, axis, factor):
         return [origin[index] + axis[index] * factor for index in range(3)]
 
+    model_rotation = model_transform["rotationQuaternionXYZW"]
+    model_translation = [float(value) for value in model_transform["translation"]]
+    model_scale = float(model_transform["uniformScale"])
     frame = artifact["coordinate_frame"]
+    source_to_viewer = frame.get("source_to_viewer_matrix_row_major")
+    navigation_scale = float(frame.get("uniform_scale", 0.0))
+    if (not isinstance(source_to_viewer, list) or len(source_to_viewer) != 4 or
+            any(not isinstance(row, list) or len(row) != 4 for row in source_to_viewer) or
+            not math.isfinite(navigation_scale) or navigation_scale <= 0):
+        raise ValueError("Navigation diagnostic needs the proposal's verified source-to-viewer transform")
+    source_to_viewer = [[float(value) for value in row] for row in source_to_viewer]
+    navigation_rotation = [[source_to_viewer[row][column] / navigation_scale for column in range(3)]
+                           for row in range(3)]
+    navigation_translation = [source_to_viewer[index][3] for index in range(3)]
+    if (not all(math.isfinite(value) for row in source_to_viewer for value in row) or
+            any(abs(source_to_viewer[3][index] - expected) > 1e-8
+                for index, expected in enumerate((0.0, 0.0, 0.0, 1.0)))):
+        raise ValueError("Navigation diagnostic source-to-viewer transform is not a finite affine similarity")
+    for row in range(3):
+        for other in range(3):
+            basis_dot = sum(navigation_rotation[row][axis] * navigation_rotation[other][axis]
+                            for axis in range(3))
+            if abs(basis_dot - (1.0 if row == other else 0.0)) > 1e-5:
+                raise ValueError("Navigation diagnostic source-to-viewer transform is not rigid and uniformly scaled")
+    determinant = (
+        navigation_rotation[0][0] * (navigation_rotation[1][1] * navigation_rotation[2][2] - navigation_rotation[1][2] * navigation_rotation[2][1])
+        - navigation_rotation[0][1] * (navigation_rotation[1][0] * navigation_rotation[2][2] - navigation_rotation[1][2] * navigation_rotation[2][0])
+        + navigation_rotation[0][2] * (navigation_rotation[1][0] * navigation_rotation[2][1] - navigation_rotation[1][1] * navigation_rotation[2][0]))
+    if determinant < 0.999:
+        raise ValueError("Navigation diagnostic source-to-viewer transform changes handedness")
+    navigation_to_model_scale = model_scale / navigation_scale
+
+    def to_source_vector(vector: list[float]) -> list[float]:
+        return [sum(navigation_rotation[row][axis] * vector[row] for row in range(3)) / navigation_scale
+                for axis in range(3)]
+
+    def transform_point(point: list[float]) -> list[float]:
+        relative_source = to_source_vector([point[axis] - navigation_translation[axis] for axis in range(3)])
+        rotated = rotate_vector_xyzw(model_rotation, relative_source)
+        return [model_translation[index] + model_scale * rotated[index] for index in range(3)]
+
+    def transform_direction(direction: list[float]) -> list[float]:
+        return [value * model_scale for value in rotate_vector_xyzw(model_rotation, to_source_vector(direction))]
+
+    def transformed_unit(axis: list[float]) -> list[float]:
+        vector = transform_direction(axis)
+        norm = math.sqrt(dot(vector, vector)) or 1.0
+        return [value / norm for value in vector]
+
     local = frame["viewer_to_navigation"]
     origin, axis_u, axis_v, axis_up = (local["origin_viewer"], local["u_viewer"],
                                       local["v_viewer"], local["up_viewer"])
+    model_origin = transform_point(origin)
+    model_axis_u, model_axis_v, model_axis_up = (transformed_unit(axis_u), transformed_unit(axis_v),
+                                                 transformed_unit(axis_up))
+
     coverage = artifact.get("coverage_diagnostics", {})
     trajectory = coverage.get("camera_trajectory", [])
     spacing_by_component = {row["component_id"]: row["median_nearest_neighbor_spacing_units"]
@@ -484,19 +548,25 @@ def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[
         forward = row.get("viewer_forward")
         if not (isinstance(center, list) and isinstance(forward, list)):
             continue
-        length = max(0.0, float(spacing_by_component.get(row.get("component_id"), 0.0)) * 0.7)
+        length = max(0.0, float(spacing_by_component.get(row.get("spatial_component_id"),
+                                                         spacing_by_component.get(row.get("component_id"), 0.0))) * 0.7)
+        transformed_center = transform_point(center)
+        transformed_forward = transform_direction(forward)
         cameras.append({**{key: row.get(key) for key in
-                           ("station_id", "image_name", "component_id", "coverage_status", "pose_trust")},
-                        "center": center,
-                        "forward_end": [center[axis] + forward[axis] * length for axis in range(3)]})
+                           ("station_id", "image_name", "component_id", "spatial_component_id",
+                            "capture_sequence_index", "capture_timestamp", "baseline_coverage_status",
+                            "coverage_status", "pose_trust", "triangulated_observation_count")},
+                        "center": transformed_center,
+                        "forward_end": [transformed_center[axis] + transformed_forward[axis] * length
+                                        for axis in range(3)]})
     sparse_stride = max(1, math.ceil(len(sparse_points) / 12_000))
     strong_points, weak_points = [], []
     for index in range(0, min(len(sparse_points), len(sparse_tracks)), sparse_stride):
-        transformed = rotate_vector_xyzw(model_rotation, sparse_points[index])
+        transformed = transform_point(sparse_points[index])
         record = [*transformed, int(sparse_tracks[index])]
         (strong_points if sparse_tracks[index] >= 3 else weak_points).append(record)
     model_geometry = _gaussian_xyz_sample(model_path)
-    sampled_viewer = [rotate_vector_xyzw(model_rotation, point)
+    sampled_viewer = [transform_point(point)
                       for point in model_geometry["sampled_points"]]
     robust_min = [q([point[axis] for point in sampled_viewer], 0.01) for axis in range(3)]
     robust_max = [q([point[axis] for point in sampled_viewer], 0.99) for axis in range(3)]
@@ -504,12 +574,12 @@ def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[
     raw_corners = [[raw_max[0] if bits & 1 else raw_min[0],
                     raw_max[1] if bits & 2 else raw_min[1],
                     raw_max[2] if bits & 4 else raw_min[2]] for bits in range(8)]
-    model_outer_corners = [rotate_vector_xyzw(model_rotation, point) for point in raw_corners]
+    model_outer_corners = [transform_point(point) for point in raw_corners]
     robust_corners = [[robust_max[0] if bits & 1 else robust_min[0],
                        robust_max[1] if bits & 2 else robust_min[1],
                        robust_max[2] if bits & 4 else robust_min[2]] for bits in range(8)]
-    projected_model = [[dot([point[axis] - origin[axis] for axis in range(3)], axis_u),
-                        dot([point[axis] - origin[axis] for axis in range(3)], axis_v)]
+    projected_model = [[dot([point[axis] - model_origin[axis] for axis in range(3)], model_axis_u),
+                        dot([point[axis] - model_origin[axis] for axis in range(3)], model_axis_v)]
                        for point in sampled_viewer]
     model_u = [point[0] for point in projected_model]
     model_v = [point[1] for point in projected_model]
@@ -521,8 +591,8 @@ def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[
         minimum = (limits.get("minimum_height") or {}).get("value")
         maximum = (limits.get("maximum_height") or {}).get("value")
         polygon = region.get("polygon_uv", [])
-        lower = ([add_scaled(add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1]),
-                             axis_up, float(minimum)) for point in polygon]
+        lower = ([transform_point(add_scaled(add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1]),
+                                               axis_up, float(minimum))) for point in polygon]
                  if minimum is not None else [])
         upper = [add_scaled(point, axis_up, float(maximum) - float(minimum))
                  for point in lower] if minimum is not None and maximum is not None else []
@@ -536,13 +606,21 @@ def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[
                 for point in polygon:
                     base_point = add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1])
                     height = -(offset + dot(normal, base_point)) / denominator
-                    ground_loop.append(add_scaled(base_point, axis_up, height))
+                    ground_loop.append(transform_point(add_scaled(base_point, axis_up, height)))
         hull_area = abs(_signed_area(polygon))
         local_support = region.get("evidence", {}).get("sparse_geometry_observation", {}).get(
             "points_with_track_length_minimum_inside_candidate", 0)
         ground_evidence = ground.get("evidence", {})
+        boundary_segments = [{"start": transform_point(add_scaled(add_scaled(origin, axis_u, item["start_uv"][0]),
+                                                                    axis_v, item["start_uv"][1])),
+                              "end": transform_point(add_scaled(add_scaled(origin, axis_u, item["end_uv"][0]),
+                                                                  axis_v, item["end_uv"][1])),
+                              "classification": item.get("classification"),
+                              "length_units": item.get("length_units")}
+                             for item in region.get("boundary_segments", [])]
         active_regions.append({"region_id": region["id"], "polygon_uv": polygon,
                                "lower_loop": lower, "upper_loop": upper, "ground_loop": ground_loop,
+                               "boundary_segments": boundary_segments,
                                "horizontal_area_units2": hull_area,
                                "camera_count": region.get("evidence", {}).get("candidate_station_count", 0),
                                "local_multiview_point_count": local_support,
@@ -559,16 +637,19 @@ def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[
         heights = [row["navigation_local_uvh"][2] for row in members]
         level = q(heights, 0.5) if heights else 0.0
         poly = component.get("polygon_uv", [])
-        outline = [add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1])
+        outline = [transform_point(add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1]))
                    for point in poly]
         outline = [add_scaled(point, axis_up, level) for point in outline]
         excluded_regions.append({"component_id": component_for_id(members),
                                  "outline": outline, "camera_count": len(component.get("station_ids", [])),
                                  "reason": component.get("reason")})
 
-    camera_area = sum(region["horizontal_area_units2"] for region in active_regions)
+    camera_area = sum(region["horizontal_area_units2"] for region in active_regions) * navigation_to_model_scale ** 2
     track_ge_3 = sum(1 for value in sparse_tracks if value >= 3)
     local_track_ge_3 = sum(region["local_multiview_point_count"] for region in active_regions)
+    reconciliation = coverage.get("trajectory_reconciliation", {})
+    sequence = reconciliation.get("sequence", {})
+    comparison = reconciliation.get("strategy_comparison", {})
     summary = {"status": artifact.get("status"),
                "status_summary": (f"{len(active_regions)} camera-supported region proposed; "
                                   f"{coverage.get('camera_used_count', 0)} of {coverage.get('camera_candidate_count', 0)} camera poses included; "
@@ -578,6 +659,7 @@ def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[
                "camera_candidate_count": coverage.get("camera_candidate_count", 0),
                "camera_used_count": coverage.get("camera_used_count", 0),
                "camera_excluded_count": coverage.get("camera_excluded_count", 0),
+               "camera_region_unassigned_count": artifact.get("pose_evidence", {}).get("geometry_unbounded_station_count", 0),
                "camera_component_count": coverage.get("camera_component_count", 0),
                "component_footprints": coverage.get("component_footprints", []),
                "candidate_region_count": len(active_regions),
@@ -590,16 +672,97 @@ def _navigation_coverage_diagnostic(artifact: dict[str, Any], camera_rows: list[
                "lidar_consumed": artifact.get("coverage_assumptions", {}).get("aligned_lidar_used", False),
                "navigation_up_status": (artifact.get("coordinate_frame", {}).get("navigation_up_evidence") or {}).get("status", "NOT_AVAILABLE"),
                "navigation_up_interpretation": "Camera orientation proposal; not physical gravity.",
+               "capture_order_status": reconciliation.get("capture_order_status"),
+               "trajectory_path_length_units": sequence.get("path_length_units"),
+               "trajectory_endpoint_gap_units": (sequence.get("route_endpoint_gap") or {}).get("horizontal_distance_units"),
+               "trajectory_angular_coverage_degrees": sequence.get("polar_angular_coverage_degrees_about_camera_centroid"),
+               "inferred_component_bridge_count": len(sequence.get("component_transition_edges", [])),
+               "baseline_proposal_id": reconciliation.get("baseline_proposal", {}).get("proposal_id"),
+               "strategy_comparison": comparison,
+               "initial_camera_validation": _validate_initial_camera(artifact),
                "human_review_required": True}
-    return {"summary": summary, "navigation_basis": {"origin": origin, "u": axis_u, "v": axis_v, "up": axis_up},
+    sequence_by_index = {row.get("sequence_index"): row
+                         for row in sequence.get("consecutive_pairs", [])}
+    transition_edges = {row.get("sequence_index"): row
+                        for row in sequence.get("component_transition_edges", [])}
+    station_to_camera = {row.get("station_id"): row for row in cameras}
+    path_segments = []
+    for sequence_index, edge in sorted(sequence_by_index.items()):
+        first, second = station_to_camera.get(edge.get("from_station_id")), station_to_camera.get(edge.get("to_station_id"))
+        if first and second:
+            bridge = transition_edges.get(sequence_index, {})
+            path_segments.append({"sequence_index": sequence_index, "from": first["center"], "to": second["center"],
+                                  "from_image_name": first.get("image_name"), "to_image_name": second.get("image_name"),
+                                  "distance_units": edge.get("horizontal_distance_units"),
+                                  "classification": edge.get("gap_assessment", bridge.get("bridge_assessment", "OBSERVED_CONSECUTIVE_CAMERA_STEP")),
+                                  "inferred": edge.get("gap_assessment") != "OBSERVED_CONSECUTIVE_CAMERA_STEP",
+                                  "spatial_component_transition": edge.get("crosses_spatial_component", False)})
+    endpoint_gap = sequence.get("route_endpoint_gap")
+    endpoint_segment = None
+    if endpoint_gap:
+        first = station_to_camera.get(endpoint_gap.get("from_station_id"))
+        second = station_to_camera.get(endpoint_gap.get("to_station_id"))
+        if first and second:
+            endpoint_segment = {"from": first["center"], "to": second["center"],
+                                "from_image_name": first.get("image_name"), "to_image_name": second.get("image_name"),
+                                "distance_units": endpoint_gap.get("horizontal_distance_units"),
+                                "classification": endpoint_gap.get("classification"), "inferred": True}
+    baseline_regions = []
+    baseline_strategy = comparison.get("strategy_a_existing_v1", {})
+    baseline_limits = baseline_strategy.get("vertical_limits_units", [])
+    baseline_polygons = baseline_strategy.get("region_polygons_uv", [])
+    for index, polygon in enumerate(baseline_polygons):
+        limit = baseline_limits[index] if index < len(baseline_limits) else [None, None]
+        minimum = limit[0] if isinstance(limit, list) and limit else None
+        baseline_loop = ([transform_point(add_scaled(add_scaled(add_scaled(origin, axis_u, point[0]), axis_v, point[1]),
+                                                      axis_up, float(minimum))) for point in polygon]
+                         if minimum is not None else [])
+        baseline_regions.append({"region_id": f"v1-region-{index + 1:02d}", "loop": baseline_loop,
+                                 "polygon_uv": polygon, "area_units2": abs(_signed_area(polygon)),
+                                 "perimeter_units": _polygon_perimeter(polygon)})
+    trajectory_report = {"schema_version": "exhibition-archive.navigation-trajectory-report.v1",
+                         "proposal_status": artifact.get("status"),
+                         "coordinate_frame": "corrected Viewer Y-up frame after the same model-scene transform used by the 3DGS Visitor",
+                         "capture_order_status": reconciliation.get("capture_order_status"),
+                         "capture_order_source": reconciliation.get("capture_order_source"),
+                         "sequence_metrics": sequence,
+                         "registration_confidence": reconciliation.get("camera_registration_confidence"),
+                         "local_ground_confidence": reconciliation.get("local_ground_confidence"),
+                         "baseline_exclusion_explanation": reconciliation.get("baseline_exclusion_explanation"),
+                         "strategy_comparison": comparison,
+                         "initial_camera_validation": _validate_initial_camera(artifact),
+                         "limitations": ["Camera positions support the photographed perimeter, not all interior traversability.",
+                                         "The component bridge is a virtual review segment; no camera station is fabricated.",
+                                         "The route start/end gap remains open and is not used to close the boundary.",
+                                         "Photo-SfM ground and preserved vertical limits are review proposals, not physical gravity, floor, or ceiling measurements.",
+                                         "Rejected LiDAR was not consumed."]}
+    previously_excluded_count = sum(row.get("baseline_coverage_status") == "EXCLUDED_INSUFFICIENT_GEOMETRY"
+                                    for row in cameras)
+    return {"summary": summary,
+            "navigation_basis": {"origin": model_origin, "u": model_axis_u,
+                                 "v": model_axis_v, "up": model_axis_up},
             "cameras": cameras, "supported_sparse_points": strong_points, "weak_sparse_points": weak_points,
-            "regions": active_regions, "excluded_components": excluded_regions,
+            "regions": active_regions, "baseline_regions": baseline_regions,
+            "trajectory_report": trajectory_report,
+            "trajectory": {"path_segments": path_segments, "endpoint_gap": endpoint_segment,
+                           "angular_coverage_degrees": sequence.get("polar_angular_coverage_degrees_about_camera_centroid"),
+                           "start_image_name": (reconciliation.get("ordered_image_names") or [None])[0],
+                           "end_image_name": (reconciliation.get("ordered_image_names") or [None])[-1]},
+            "excluded_components": excluded_regions,
             "gaussian_bounds": {"raw_exact_minimum": raw_min, "raw_exact_maximum": raw_max,
                                 "outer_oriented_box_corners_viewer": model_outer_corners,
                                 "sampled_1_99_aabb_viewer": {"minimum": robust_min, "maximum": robust_max},
                                 "sampled_points": model_geometry["sample_count"], "vertex_count": model_geometry["vertex_count"]},
+            "model_scene_transform": model_transform,
+            "navigation_to_model_transform": {
+                "formula": "model_scene_transform composed with inverse proposal source_to_viewer transform",
+                "relative_uniform_scale": navigation_to_model_scale,
+                "proposal_source_to_viewer_matrix_row_major": source_to_viewer,
+                "model_scene_transform": model_transform,
+                "interpretation": "Navigation evidence is already in the proposal Viewer frame; this relative transform maps it into the displayed Gaussian frame without reapplying a shared orientation rotation.",
+            },
             "limitations": ["Camera centers establish capture coverage only; they do not prove every point inside the footprint is traversable.",
-                            "The excluded camera component has too little local multi-view SfM support for a bounded vertical envelope.",
+                            f"{previously_excluded_count} camera position(s) were classified as insufficient-geometry omissions by the v1 proposal; that classification does not invalidate their registered poses.",
                             "The Gaussian model bounds include distant background; the proposed camera boundary deliberately does not expand to those bounds.",
                             "The lower plane is a photo-SfM candidate requiring review. The upper value is a virtual exploration limit, not a ceiling.",
                             "The camera-up transform provides viewer orientation evidence only and is not a gravity measurement."]}
@@ -609,22 +772,90 @@ def component_for_id(members: list[dict[str, Any]]) -> str | None:
     return members[0].get("component_id") if members else None
 
 
+def _navigation_model_overlay(document: dict[str, Any]) -> dict[str, Any]:
+    """Extract lightweight, transformed navigation lines for the diagnostic Viewer query."""
+    return {
+        "schema_version": "exhibition-archive.navigation-model-overlay.v1",
+        "proposal_status": document.get("summary", {}).get("status"),
+        "summary": {key: document.get("summary", {}).get(key) for key in
+                    ("registered_camera_count", "camera_used_count", "camera_excluded_count",
+                     "camera_region_unassigned_count",
+                     "capture_order_status", "trajectory_path_length_units",
+                     "trajectory_endpoint_gap_units", "trajectory_angular_coverage_degrees",
+                     "inferred_component_bridge_count", "initial_camera_validation")},
+        "cameras": [{key: row.get(key) for key in
+                     ("station_id", "image_name", "capture_sequence_index", "center",
+                      "forward_end", "baseline_coverage_status", "coverage_status",
+                      "triangulated_observation_count")}
+                    for row in document.get("cameras", [])],
+        "observed_path_segments": document.get("trajectory", {}).get("path_segments", []),
+        "inferred_endpoint_gap": document.get("trajectory", {}).get("endpoint_gap"),
+        "baseline_v1": [{"region_id": row.get("region_id"), "loop": row.get("loop")}
+                         for row in document.get("baseline_regions", [])],
+        "candidate_v2": [{"region_id": row.get("region_id"),
+                           "lower_loop": row.get("lower_loop"),
+                           "upper_loop": row.get("upper_loop"),
+                           "ground_loop": row.get("ground_loop"),
+                           "boundary_segments": row.get("boundary_segments", [])}
+                          for row in document.get("regions", [])],
+        "limitations": document.get("limitations", []),
+    }
+
+
 def render_navigation_coverage_html(document: dict[str, Any]) -> str:
     payload = json.dumps(document, ensure_ascii=False, separators=(",", ":")).replace("</", "<\\/")
-    page = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Navigation coverage diagnostic</title>
-<style>*{box-sizing:border-box}body{margin:0;background:#101511;color:#e8eee7;font:14px/1.45 system-ui,sans-serif}header{padding:12px 16px;background:#1a241d;border-bottom:1px solid #39443b}h1{font-size:18px;margin:0 0 4px}p{margin:4px 0;color:#b5c0b3}.layout{display:grid;grid-template-columns:minmax(0,1fr) 260px;min-height:680px;height:calc(100vh - 75px)}canvas{width:100%;height:100%;background:#0b100d;touch-action:none}.side{padding:12px;overflow:auto;background:#151d17;border-left:1px solid #39443b}.side label{display:block;margin:8px 0}.side input{margin-right:7px}.metric{display:flex;justify-content:space-between;border-bottom:1px solid #344037;padding:5px 0;gap:12px}.metric b{text-align:right}.note{color:#d9bd76;font-size:12px;margin-top:12px}button{background:#324c3a;border:1px solid #536b58;color:#e8eee7;border-radius:4px;padding:5px 8px;margin:3px;cursor:pointer}.legend{font-size:12px;color:#bcc8ba}@media(max-width:780px){.layout{grid-template-columns:1fr;height:auto}.side{border:0;border-top:1px solid #39443b}canvas{height:62vh;min-height:420px}}</style>
-<header><h1>Camera coverage and navigation proposal</h1><p>Drag to orbit · scroll to zoom. Coordinates use the corrected Viewer frame. A proposal is not an approval.</p></header><div class="layout"><canvas id="scene"></canvas><aside class="side"><div id="summary"></div><hr><b>Layers</b><label><input type="checkbox" data-layer="camera" checked>Camera positions and viewing directions</label><label><input type="checkbox" data-layer="strong" checked>Tracked SfM points (track ≥ 3)</label><label><input type="checkbox" data-layer="weak">Weakly tracked SfM points</label><label><input type="checkbox" data-layer="boundary" checked>Candidate exploration envelope</label><label><input type="checkbox" data-layer="ground" checked>Photo-SfM lower plane candidate</label><label><input type="checkbox" data-layer="excluded" checked>Excluded camera component</label><label><input type="checkbox" data-layer="model" checked>Gaussian model bounds</label><label><input type="checkbox" data-layer="axes" checked>Navigation axes</label><p class="legend">Blue: camera poses in proposal · orange: excluded or unassigned · green: multi-view points / lower-plane candidate · magenta: exploration envelope · grey: model extent.</p><div id="regionStats"></div><p class="note">Viewer-up is derived from camera orientations. The plane is a photo-SfM ground candidate and requires review. The upper bound is a virtual exploration limit, not a physical ceiling. Distant model background is visible as bounds only and does not define the navigation perimeter. LiDAR is not consumed.</p></aside></div>
-<script>const d=DATA;const canvas=document.querySelector('#scene'),ctx=canvas.getContext('2d'),layers=Object.fromEntries([...document.querySelectorAll('[data-layer]')].map(x=>[x.dataset.layer,x]));let yaw=.7,pitch=.48,zoom=1,drag=null,viewWidth=1,viewHeight=1;
-function esc(v){return String(v??'').replace(/[&<>"']/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[c]))}function metric(k,v){return `<div class="metric"><span>${esc(k)}</span><b>${esc(v)}</b></div>`}const s=d.summary,fmt=(n,digits=2)=>Number.isFinite(n)?n.toFixed(digits):'n/a';document.querySelector('#summary').innerHTML=metric('Proposal',s.status)+metric('Registered cameras',`${s.camera_used_count} / ${s.registered_camera_count}`)+metric('Camera components',s.camera_component_count)+metric('Candidate regions',s.candidate_region_count)+metric('Camera footprint',`${fmt(s.candidate_camera_footprint_area_units2)} scene units²`)+metric('Gaussian q1–q99 footprint',`${fmt(s.gaussian_robust_footprint_area_units2)} scene units²`)+metric('Camera / model area',`${fmt((s.camera_to_gaussian_robust_area_fraction??0)*100,1)}%`)+metric('Local track ≥3 points',`${s.local_track_length_ge_3_count} / ${s.sparse_track_length_ge_3_count} (${fmt((s.local_track_length_ge_3_fraction??0)*100,1)}%)`)+metric('LiDAR consumed',String(s.lidar_consumed))+metric('Camera-up',s.navigation_up_status);document.querySelector('#regionStats').innerHTML='<hr><b>Candidate regions</b>'+d.regions.map(r=>`<p>${esc(r.region_id)} · ${r.camera_count} cameras · ${fmt(r.horizontal_area_units2)} units²<br>Ground candidate: ${r.ground_candidate_inlier_count} inliers, ${fmt((r.ground_candidate_coverage_fraction??0)*100,0)}% grid coverage<br>Virtual height: ${fmt(r.minimum_height)} to ${fmt(r.maximum_height)} units</p>`).join('')+'<hr><b>Camera components</b>'+s.component_footprints.map(c=>`<p>${esc(c.component_id)} · ${c.camera_count} cameras · ${fmt(c.convex_hull_area_square_units)} units² · ${esc(c.proposal_status)}</p>`).join('');
-const all=[...d.cameras.map(x=>x.center),...d.supported_sparse_points.map(x=>x.slice(0,3)),...d.regions.flatMap(r=>[...r.lower_loop,...r.upper_loop]),...d.gaussian_bounds.outer_oriented_box_corners_viewer];let min=[0,0,0],max=[0,0,0];if(all.length){min=[0,1,2].map(a=>Math.min(...all.map(p=>p[a])));max=[0,1,2].map(a=>Math.max(...all.map(p=>p[a])))}const center=min.map((x,i)=>(x+max[i])/2),span=Math.max(...max.map((x,i)=>x-min[i]),1e-4);function project(p){let x=p[0]-center[0],y=p[1]-center[1],z=p[2]-center[2],cx=Math.cos(yaw),sx=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),xx=cx*x+sx*z,zz=-sx*x+cx*z,yy=cp*y-sp*zz;let scale=Math.min(viewWidth,viewHeight)*.8/span*zoom;return [viewWidth/2+xx*scale,viewHeight/2-yy*scale,zz]}function line(a,b,color,width=1){let p=project(a),q=project(b);ctx.strokeStyle=color;ctx.lineWidth=width;ctx.beginPath();ctx.moveTo(p[0],p[1]);ctx.lineTo(q[0],q[1]);ctx.stroke()}function loop(points,color,width=1,close=true){for(let i=0;i<points.length-(close?0:1);i++)line(points[i],points[(i+1)%points.length],color,width)}function box(corners,color){for(let i=0;i<8;i++)for(let bit of [1,2,4])if(!(i&bit))line(corners[i],corners[i|bit],color,1)}
-function render(){let rect=canvas.getBoundingClientRect(),ratio=devicePixelRatio||1;viewWidth=rect.width;viewHeight=rect.height;canvas.width=Math.round(rect.width*ratio);canvas.height=Math.round(rect.height*ratio);ctx.setTransform(ratio,0,0,ratio,0,0);if(layers.axes.checked){let o=d.navigation_basis.origin,scale=span*.12;line(o,[o[0]+d.navigation_basis.u[0]*scale,o[1]+d.navigation_basis.u[1]*scale,o[2]+d.navigation_basis.u[2]*scale],'#57b7ff',2);line(o,[o[0]+d.navigation_basis.v[0]*scale,o[1]+d.navigation_basis.v[1]*scale,o[2]+d.navigation_basis.v[2]*scale],'#dfbd5b',2);line(o,[o[0]+d.navigation_basis.up[0]*scale,o[1]+d.navigation_basis.up[1]*scale,o[2]+d.navigation_basis.up[2]*scale],'#69df8a',2)}
-if(layers.model.checked){box(d.gaussian_bounds.outer_oriented_box_corners_viewer,'#718079');let lo=d.gaussian_bounds.sampled_1_99_aabb_viewer.minimum,hi=d.gaussian_bounds.sampled_1_99_aabb_viewer.maximum,cs=[...Array(8)].map((_,i)=>[(i&1)?hi[0]:lo[0],(i&2)?hi[1]:lo[1],(i&4)?hi[2]:lo[2]]);box(cs,'#a0aaa0')}
-if(layers.ground.checked)for(let r of d.regions)if(r.ground_loop.length)loop(r.ground_loop,'#58d486',2);
-if(layers.boundary.checked)for(let r of d.regions){loop(r.lower_loop,'#ed62cc',2);loop(r.upper_loop,'#ed62cc',1);for(let i=0;i<r.lower_loop.length;i++)line(r.lower_loop[i],r.upper_loop[i],'#ed62cc',1)}
-if(layers.excluded.checked)for(let r of d.excluded_components)loop(r.outline,'#ff9d62',2);
-function points(rows,color,radius){for(let p of rows){let q=project(p),size=Math.max(1,radius);ctx.fillStyle=color;ctx.beginPath();ctx.arc(q[0],q[1],size,0,Math.PI*2);ctx.fill()}}if(layers.strong.checked)points(d.supported_sparse_points,'#50bf76',1.2);if(layers.weak.checked)points(d.weak_sparse_points,'#6b7770',1);if(layers.camera.checked){for(let c of d.cameras){let color=c.coverage_status==='INCLUDED_PROPOSAL'?'#6fcaff':'#ff9d62';line(c.center,c.forward_end,color,1);points([c.center],color,3)}}}
-for(let checkbox of Object.values(layers))checkbox.onchange=render;canvas.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];canvas.setPointerCapture(e.pointerId)});canvas.addEventListener('pointermove',e=>{if(!drag)return;let dx=e.clientX-drag[0],dy=e.clientY-drag[1];yaw+=dx*.008;pitch=Math.max(-1.45,Math.min(1.45,pitch+dy*.008));drag=[e.clientX,e.clientY];render()});canvas.addEventListener('pointerup',()=>drag=null);canvas.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(.15,Math.min(8,zoom*Math.exp(-e.deltaY*.001)));render()},{passive:false});new ResizeObserver(render).observe(canvas);render();</script></html>'''
-    return page.replace("DATA", payload)
+    previously_excluded_count = sum(row.get("baseline_coverage_status") == "EXCLUDED_INSUFFICIENT_GEOMETRY"
+                                    for row in document.get("cameras", []))
+    limitation_items = "".join(f"<li>{html.escape(str(item))}</li>"
+                               for item in document.get("limitations", []))
+    page = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><meta name="color-scheme" content="dark"><title>Navigation trajectory review</title>
+<style>
+*{box-sizing:border-box}body{margin:0;background:#101511;color:#e8eee7;font:14px/1.45 system-ui,sans-serif}header{padding:12px 16px;background:#1a241d;border-bottom:1px solid #39443b}h1{font-size:18px;margin:0 0 4px}p{margin:4px 0;color:#b5c0b3}.layout{display:grid;grid-template-columns:minmax(0,1fr) 330px;height:calc(100vh - 74px);min-height:620px}canvas{width:100%;height:100%;background:#0b100d;touch-action:none}.side{padding:12px;overflow:auto;background:#151d17;border-left:1px solid #39443b}.side label{display:block;margin:7px 0}.side input{margin-right:7px}.metric{display:flex;justify-content:space-between;border-bottom:1px solid #344037;padding:5px 0;gap:12px}.metric b{text-align:right}.note{color:#e1c979;font-size:12px;margin-top:12px}.muted{font-size:12px;color:#aebaae}button,.link{display:inline-block;background:#324c3a;border:1px solid #536b58;color:#e8eee7;border-radius:4px;padding:6px 9px;margin:3px;cursor:pointer;text-decoration:none}.legend{font-size:12px;color:#bcc8ba}table{border-collapse:collapse;width:100%;font-size:11px}td,th{text-align:left;border-bottom:1px solid #344037;padding:5px 3px}th{color:#c4d5b6}#tooltip{position:absolute;display:none;pointer-events:none;padding:6px 8px;border:1px solid #536b58;border-radius:5px;background:#111a;color:#fff;font-size:12px;z-index:2}@media(max-width:850px){.layout{grid-template-columns:1fr;height:auto}.side{border:0;border-top:1px solid #39443b}canvas{height:62vh;min-height:420px}}
+</style>
+<header><h1>Camera trajectory and navigation proposal</h1><p>Geometry-only overview in the corrected Viewer Y-up frame. Use the linked diagnostic overlay to inspect the same lines against the existing 3DGS model.</p></header>
+<div class="layout"><div style="position:relative;min-height:420px"><canvas id="scene"></canvas><div id="tooltip"></div></div><aside class="side"><div id="summary"></div><p><a class="link" href="../visitor/index.html?navigationDiagnostics=1" target="_blank" rel="noopener">Open against the existing 3DGS model</a> <a class="link" href="navigation-trajectory-report.json" target="_blank" rel="noopener">Trajectory report</a></p><div><button id="topDown">Top down</button><button id="perspective">Perspective</button><button id="frame">Frame trajectory</button></div><hr><b>Layers</b><label><input type="checkbox" data-layer="camera" checked>All camera positions and viewing directions</label><label><input type="checkbox" data-layer="oldExcluded" checked>v1 insufficient-geometry poses (OLD_EXCLUDED_COUNT)</label><label><input type="checkbox" data-layer="path" checked>Ordered camera path</label><label><input type="checkbox" data-layer="gaps" checked>Inferred bridge and open endpoints</label><label><input type="checkbox" data-layer="v1" checked>Existing v1 boundary</label><label><input type="checkbox" data-layer="v2" checked>Candidate v2 envelope</label><label><input type="checkbox" data-layer="ground" checked>Photo-SfM lower-plane candidate</label><label><input type="checkbox" data-layer="strong">Tracked SfM points (track ≥ 3)</label><label><input type="checkbox" data-layer="weak">Weakly tracked SfM points</label><label><input type="checkbox" data-layer="model">Gaussian q1–q99 and exact bounds</label><label><input type="checkbox" data-layer="axes" checked>Navigation axes</label><p class="legend">Blue: candidate camera · amber: poses previously omitted by v1 geometry checks · gold dashed: v1 · magenta dashed: inferred v2 edge · cyan: locally camera-position-supported edge · yellow dashed: inferred bridge · red dashed: open route endpoints · green: provisional photo-SfM lower candidate.</p><div id="comparison"></div><div id="gaps"></div><div id="regionStats"></div><ul class="note">LIMITATIONS_PLACEHOLDER</ul></aside></div>
+<script>
+const d=DATA,canvas=document.querySelector('#scene'),ctx=canvas.getContext('2d'),tip=document.querySelector('#tooltip'),layers=Object.fromEntries([...document.querySelectorAll('[data-layer]')].map(e=>[e.dataset.layer,e]));
+let yaw=0,pitch=1.52,zoom=1,drag=null,width=1,height=1,projectedCameras=[];
+const fmt=(n,d=2)=>Number.isFinite(Number(n))?Number(n).toFixed(d):'n/a',metric=(a,b)=>`<div class="metric"><span>${a}</span><b>${b}</b></div>`,s=d.summary,t=d.trajectory??{},basis=d.navigation_basis;
+document.querySelector('#summary').innerHTML=metric('Proposal',s.status)+metric('Camera poses',`${s.camera_used_count} / ${s.registered_camera_count}`)+metric('Spatial groups → reconciled',`${s.component_footprints.length} → ${s.camera_component_count}`)+metric('Capture order',s.capture_order_status)+metric('Path length',`${fmt(s.trajectory_path_length_units)} scene units`)+metric('Polar coverage',`${fmt(s.trajectory_angular_coverage_degrees,1)}°`)+metric('Start/end gap',`${fmt(s.trajectory_endpoint_gap_units)} scene units`)+metric('Initial camera',s.initial_camera_validation?.status??'not checked')+metric('Navigation state','Needs human review');
+const cmp=s.strategy_comparison??{},a=cmp.strategy_a_existing_v1??{},b=cmp.strategy_b_reconciled_camera_envelope_v2??{},c=cmp.strategy_c_ordered_trajectory_corridor??{};
+document.querySelector('#comparison').innerHTML='<hr><b>Candidate comparison</b><table><thead><tr><th>Measure</th><th>v1</th><th>v2</th><th>Path</th></tr></thead><tbody>'+[
+['Cameras',a.included_camera_positions,b.included_camera_positions,s.registered_camera_count],
+['Not in bounded region',a.excluded_camera_positions,b.excluded_camera_positions,'—'],
+['Pose-exclusion rows recorded',a.pose_excluded_camera_positions,b.pose_excluded_camera_positions,'—'],
+['Components',a.connected_components,b.connected_components,'—'],
+['Gap assessments',a.capture_gap_count??'not reconciled',b.capture_gap_count??'—','—'],
+['Area (units²)',fmt(a.footprint_area_units2),fmt(b.footprint_area_units2),fmt(c.area_units2)],
+['Perimeter',fmt(a.boundary_perimeter_units),fmt(b.boundary_perimeter_units),'—'],
+['Vertices',a.boundary_vertices,b.boundary_vertices,'—'],
+['Ground inliers',a.ground_support?.[0]?.inliers,b.ground_support?.[0]?.inliers,'—'],
+['Ground grid coverage',fmt((a.ground_support?.[0]?.occupied_grid_fraction??0)*100,1)+'%',fmt((b.ground_support?.[0]?.occupied_grid_fraction??0)*100,1)+'%','—']
+].map(row=>'<tr>'+row.map(value=>`<td>${value??'—'}</td>`).join('')+'</tr>').join('')+'</tbody></table><p class="muted">v2 area change: ${fmt(b.area_change_from_v1_percent,1)}%. Camera coverage and ground support are reported separately.</p>';
+const bridgeSegments=(t.path_segments??[]).filter(row=>row.inferred),endpoint=t.endpoint_gap;
+document.querySelector('#gaps').innerHTML='<hr><b>Trajectory breaks</b>'+bridgeSegments.map(x=>`<p>${x.from_image_name} → ${x.to_image_name}: ${fmt(x.distance_units)} units; inferred bridge; ${x.classification}</p>`).join('')+(endpoint?`<p>Open route: ${endpoint.from_image_name} → ${endpoint.to_image_name}: ${fmt(endpoint.distance_units)} units (${fmt(endpoint.distance_to_median_sequence_step_ratio)}× median step); deliberately not connected.</p>`:'<p>No route endpoint gap reported.</p>');
+document.querySelector('#regionStats').innerHTML='<hr><b>Region evidence</b>'+d.regions.map(r=>`<p>${r.region_id}: ${r.camera_count} cameras · ${fmt(r.horizontal_area_units2)} units²<br>Ground: ${r.ground_candidate_inlier_count} inliers · ${fmt((r.ground_candidate_coverage_fraction??0)*100,1)}% cells · residual p90 ${fmt(r.ground_candidate_residual_p90_units)} units<br>Vertical proposal: ${fmt(r.minimum_height)} to ${fmt(r.maximum_height)} units</p>`).join('');
+function toLocal(p){const delta=p.map((x,i)=>x-basis.origin[i]);return [delta.reduce((v,x,i)=>v+x*basis.u[i],0),delta.reduce((v,x,i)=>v+x*basis.up[i],0),delta.reduce((v,x,i)=>v+x*basis.v[i],0)]}
+const fitPoints=[...d.cameras.map(x=>toLocal(x.center)),...d.baseline_regions.flatMap(r=>r.loop.map(toLocal)),...d.regions.flatMap(r=>[...r.lower_loop,...r.upper_loop].map(toLocal)),...(t.path_segments??[]).flatMap(x=>[toLocal(x.from),toLocal(x.to)])];
+const lo=[0,1,2].map(axis=>Math.min(...fitPoints.map(p=>p[axis]))),hi=[0,1,2].map(axis=>Math.max(...fitPoints.map(p=>p[axis]))),center=lo.map((x,i)=>(x+hi[i])/2),span=Math.max(...hi.map((x,i)=>x-lo[i]),1e-5);
+function projectWorld(p){let q=toLocal(p),x=q[0]-center[0],y=q[1]-center[1],z=q[2]-center[2],cy=Math.cos(yaw),sy=Math.sin(yaw),cp=Math.cos(pitch),sp=Math.sin(pitch),xx=cy*x+sy*z,zz=-sy*x+cy*z,yy=cp*y-sp*zz,scale=Math.min(width,height)*.84/span*zoom;return [width/2+xx*scale,height/2-yy*scale,zz]}
+function line(a,b,color,w=1,dash=[]){const p=projectWorld(a),q=projectWorld(b);ctx.strokeStyle=color;ctx.lineWidth=w;ctx.setLineDash(dash);ctx.beginPath();ctx.moveTo(p[0],p[1]);ctx.lineTo(q[0],q[1]);ctx.stroke();ctx.setLineDash([])}
+function loop(points,color,w=1,dash=[]){for(let i=0;i<points.length;i++)line(points[i],points[(i+1)%points.length],color,w,dash)}
+function draw(){const rect=canvas.getBoundingClientRect(),ratio=devicePixelRatio||1;width=rect.width;height=rect.height;canvas.width=Math.round(width*ratio);canvas.height=Math.round(height*ratio);ctx.setTransform(ratio,0,0,ratio,0,0);projectedCameras=[];
+if(layers.axes.checked){const o=basis.origin,L=span*.12;for(const [axis,color] of [[basis.u,'#57b7ff'],[basis.v,'#dfbd5b'],[basis.up,'#69df8a']])line(o,o.map((x,i)=>x+axis[i]*L),color,2)}
+if(layers.model.checked){const corners=d.gaussian_bounds.outer_oriented_box_corners_viewer.map(projectWorld);ctx.strokeStyle='#728078';ctx.setLineDash([]);for(let i=0;i<8;i++)for(const bit of [1,2,4])if(!(i&bit)){const p=corners[i],q=corners[i|bit];ctx.beginPath();ctx.moveTo(p[0],p[1]);ctx.lineTo(q[0],q[1]);ctx.stroke()}}
+if(layers.v1.checked)for(const r of d.baseline_regions)loop(r.loop,'#e2ba51',2,[7,5]);
+if(layers.ground.checked)for(const r of d.regions)if(r.ground_loop.length)loop(r.ground_loop,'#69d987',2);
+if(layers.v2.checked)for(const r of d.regions){if(r.boundary_segments?.length){for(const edge of r.boundary_segments){const supported=edge.classification==='CAMERA_POSITION_SUPPORTED_ENVELOPE';line(edge.start,edge.end,supported?'#55d7d0':'#e35dcc',2,supported?[]:[7,5])}}else if(r.lower_loop.length)loop(r.lower_loop,'#e35dcc',2);if(r.upper_loop.length)loop(r.upper_loop,'#aa62c2',1);for(let i=0;i<Math.min(r.lower_loop.length,r.upper_loop.length);i++)line(r.lower_loop[i],r.upper_loop[i],'#744c79',1)}
+if(layers.path.checked)for(const segment of t.path_segments??[])line(segment.from,segment.to,segment.inferred?'#ffdb62':'#9caab0',segment.inferred?3:1.5,segment.inferred?[7,4]:[]);
+if(layers.gaps.checked&&endpoint)line(endpoint.from,endpoint.to,'#f07b69',2,[5,5]);
+if(layers.strong.checked||layers.weak.checked)for(const row of [...d.supported_sparse_points,...d.weak_sparse_points]){if(row[3]>=3&&!layers.strong.checked||row[3]<3&&!layers.weak.checked)continue;const p=projectWorld(row),color=row[3]>=3?'#55bd78':'#67746d';ctx.fillStyle=color;ctx.beginPath();ctx.arc(p[0],p[1],1.4,0,Math.PI*2);ctx.fill()}
+if(layers.camera.checked)for(const cam of d.cameras){if(cam.baseline_coverage_status==='EXCLUDED_INSUFFICIENT_GEOMETRY'&&!layers.oldExcluded.checked)continue;const oldExcluded=cam.baseline_coverage_status==='EXCLUDED_INSUFFICIENT_GEOMETRY',color=oldExcluded?'#ff9d62':'#73caff',p=projectWorld(cam.center),q=projectWorld(cam.forward_end);ctx.strokeStyle=color;ctx.lineWidth=1;ctx.beginPath();ctx.moveTo(p[0],p[1]);ctx.lineTo(q[0],q[1]);ctx.stroke();ctx.fillStyle=color;ctx.beginPath();ctx.arc(p[0],p[1],3,0,Math.PI*2);ctx.fill();projectedCameras.push({x:p[0],y:p[1],cam})}}
+function frameTrajectory(){yaw=0;pitch=1.52;zoom=1;draw()}document.querySelector('#topDown').onclick=()=>{yaw=0;pitch=1.52;draw()};document.querySelector('#perspective').onclick=()=>{yaw=.72;pitch=.48;draw()};document.querySelector('#frame').onclick=frameTrajectory;for(const checkbox of Object.values(layers))checkbox.onchange=draw;
+canvas.addEventListener('pointerdown',e=>{drag=[e.clientX,e.clientY];canvas.setPointerCapture(e.pointerId)});canvas.addEventListener('pointermove',e=>{if(drag){const dx=e.clientX-drag[0],dy=e.clientY-drag[1];yaw+=dx*.008;pitch=Math.max(-1.45,Math.min(1.56,pitch+dy*.008));drag=[e.clientX,e.clientY];draw();return}const rect=canvas.getBoundingClientRect(),x=e.clientX-rect.left,y=e.clientY-rect.top;let nearest=null,best=10;for(const item of projectedCameras){const distance=Math.hypot(item.x-x,item.y-y);if(distance<best){best=distance;nearest=item}}if(nearest){const cam=nearest.cam;tip.style.display='block';tip.style.left=`${Math.min(width-250,x+12)}px`;tip.style.top=`${Math.max(6,y+12)}px`;tip.textContent=`${cam.image_name} · ${cam.station_id} · ${cam.triangulated_observation_count??'n/a'} triangulated observations · v1 ${cam.baseline_coverage_status??'not classified'}`}else tip.style.display='none'});canvas.addEventListener('pointerup',()=>drag=null);canvas.addEventListener('pointerleave',()=>tip.style.display='none');canvas.addEventListener('wheel',e=>{e.preventDefault();zoom=Math.max(.2,Math.min(8,zoom*Math.exp(-e.deltaY*.001)));draw()},{passive:false});new ResizeObserver(draw).observe(canvas);frameTrajectory();
+</script></html>'''
+    return page.replace("OLD_EXCLUDED_COUNT", str(previously_excluded_count)).replace(
+        "LIMITATIONS_PLACEHOLDER", limitation_items).replace("DATA", payload)
 
 
 def _reviewer_html(summary: dict[str, Any]) -> str:
@@ -640,6 +871,8 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
               "navigation-review.html": "Navigation review page",
               "navigation-coverage.html": "Interactive 3D camera, geometry, and boundary overlay",
               "navigation-coverage.json": "Camera and geometry coverage measurements",
+              "navigation-trajectory-report.json": "Full ordered camera trajectory report",
+              "navigation-overlay.json": "Model-relative Viewer overlay data",
               "sfm-summary.json": "SfM metrics", "sfm-validation.json": "SfM validation",
               "sfm.log": "SfM log", "training.log": "Training log",
               "training-run.json": "Training run settings"}
@@ -651,7 +884,7 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
     training = summary["training"]
     viewer_orientation = summary.get("viewer_orientation", {})
     coverage = summary.get("navigation_coverage") or {}
-    coverage_panel = (f"<section><h2>Navigation coverage proposal</h2><p>{html.escape(str(coverage.get('status_summary', 'No coverage proposal is available.')))}</p><iframe title=\"Interactive navigation coverage overlay\" src=\"../diagnostics/navigation-coverage.html\"></iframe><p class=\"muted\">Camera-up sets the display frame only. The photo-SfM lower-plane candidate and upper exploration limit require review; the upper limit is not a ceiling. The preview remains unbounded until navigation is approved.</p></section>"
+    coverage_panel = (f"<section><h2>Navigation coverage proposal</h2><p>{html.escape(str(coverage.get('status_summary', 'No coverage proposal is available.')))}</p><iframe title=\"Interactive navigation coverage overlay\" src=\"../diagnostics/navigation-coverage.html\"></iframe><p><a href=\"../visitor/index.html?navigationDiagnostics=1\" target=\"_blank\" rel=\"noopener\">Open camera and v1/v2 boundaries against the existing 3DGS model</a></p><p class=\"muted\">Camera-up sets the display frame only. The photo-SfM lower-plane candidate and upper exploration limit require review; the upper limit is not a ceiling. The preview remains unbounded until navigation is approved.</p></section>"
                       if coverage else "")
     orientation_status = viewer_orientation.get("status", "ORIENTATION_REVIEW_REQUIRED")
     orientation_label = {

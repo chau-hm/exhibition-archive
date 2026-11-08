@@ -15,6 +15,15 @@ body { overflow: hidden; }
 #viewer { position: absolute; inset: 0; background: #151714; }
 #viewer .sse-viewer { width: 100%; height: 100%; }
 #viewer canvas { touch-action: none; }
+.navigation-diagnostic-canvas { position: absolute; inset: 0; width: 100%; height: 100%; pointer-events: none; z-index: 1; }
+.navigation-diagnostic-panel { position: absolute; z-index: 3; top: 7.5rem; right: 14px; width: min(310px, calc(100vw - 28px)); max-height: calc(100vh - 10rem); overflow: auto; padding: 12px; border: 1px solid #b8c8aa70; border-radius: 10px; background: #121914e8; color: #eef3e9; font: 12px/1.45 system-ui, sans-serif; box-shadow: 0 8px 28px #0008; backdrop-filter: blur(10px); }
+.navigation-diagnostic-panel h2 { margin: 0 0 7px; font-size: 14px; }
+.navigation-diagnostic-panel p { margin: 5px 0; color: #d1ddce; }
+.navigation-diagnostic-panel label { display: block; margin: 6px 0; }
+.navigation-diagnostic-actions { display: flex; flex-wrap: wrap; gap: 4px; }
+.navigation-diagnostic-hint { font-size: 11px; opacity: .82; }
+.navigation-diagnostic-panel button { margin: 5px 4px 0 0; padding: 5px 8px; border: 1px solid #a6b79780; border-radius: 5px; background: #28372d; color: #f4f2eb; font: inherit; }
+.navigation-diagnostic-panel [data-diagnostic-hover] { color: #f0cf7a; min-height: 1.5em; overflow-wrap: anywhere; }
 
 #loading {
   position: absolute;

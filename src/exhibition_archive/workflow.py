@@ -5,6 +5,8 @@ import json
 import os
 import re
 import shutil
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path, PurePosixPath
 from typing import Any, Callable
 
@@ -732,6 +734,99 @@ def _navigation_input_value(root: Path, config: dict, value: Any) -> tuple[Any, 
     return value, []
 
 
+def _camera_capture_metadata(image_path: Path) -> dict[str, Any]:
+    """Read ordering and pixel-orientation evidence from the prepared SfM image."""
+    from PIL import Image
+
+    with Image.open(image_path) as image:
+        exif = image.getexif()
+        exif_ifd = exif.get_ifd(34665) if exif else {}
+        date_original = exif_ifd.get(36867)
+        subseconds = str(exif_ifd.get(37521, "0")).strip()
+        offset = str(exif_ifd.get(36881, "")).strip()
+        result: dict[str, Any] = {"capture_metadata_status": "DATE_TIME_ORIENTATION_READ",
+                                  "capture_order_source": "EXIF DateTimeOriginal",
+                                  "prepared_image_orientation": int(exif.get(274, 1)),
+                                  "prepared_image_width": int(image.width),
+                                  "prepared_image_height": int(image.height)}
+        if date_original:
+            parsed = datetime.strptime(str(date_original), "%Y:%m:%d %H:%M:%S")
+            digits = "".join(character for character in subseconds if character.isdigit())
+            if digits:
+                parsed = parsed.replace(microsecond=int((digits + "000000")[:6]))
+            match = re.fullmatch(r"([+-])(\d{2}):?(\d{2})", offset)
+            if match:
+                minutes = (int(match.group(2)) * 60 + int(match.group(3))) * (1 if match.group(1) == "+" else -1)
+                parsed = parsed.replace(tzinfo=timezone(timedelta(minutes=minutes)))
+                parsed = parsed.astimezone(timezone.utc)
+            result["capture_timestamp"] = parsed.isoformat()
+            result["capture_metadata_status"] = "ORDERED_EXIF_TIMESTAMP"
+        else:
+            result["capture_metadata_status"] = "CAPTURE_TIME_UNAVAILABLE"
+            result["capture_order_source"] = None
+        return result
+
+
+def _latest_navigation_baseline(root: Path, config: dict[str, Any]) -> dict[str, Any] | None:
+    """Read the stable pre-reconciliation proposal used as comparison evidence.
+
+    New trajectory-reconciled proposals point back to their original baseline.
+    Follow that hash-verified link so repeated v2 generations do not compare
+    against the previous v2 result and silently erase the v1 delta.
+    """
+    proposal_dir = output_path(root, config) / "navigation" / "proposals"
+    if not proposal_dir.is_dir():
+        return None
+    paths = sorted(proposal_dir.glob("navigation-proposal-v*.json"), reverse=True)
+    documents: list[tuple[Path, dict[str, Any]]] = []
+    for path in paths:
+        if path.is_symlink() or not path.is_file():
+            continue
+        try:
+            document = read_json(path)
+        except (OSError, ValueError, TypeError):
+            continue
+        if document.get("schema_version") == "exhibition-archive.navigation.v1":
+            documents.append((path, document))
+
+    def is_pre_reconciliation(document: dict[str, Any]) -> bool:
+        return not document.get("coverage_diagnostics", {}).get("trajectory_reconciliation")
+
+    def result(path: Path, document: dict[str, Any]) -> dict[str, Any]:
+        return {"document": document, "path": str(path.resolve()), "sha256": sha256_file(path)}
+
+    # Follow the newest v2 proposal's pinned v1 provenance first. Resolve only
+    # files inside the proposal directory and verify the recorded digest before
+    # treating the referenced document as comparison or vertical-limit evidence.
+    for _, document in documents:
+        anchor = document.get("coverage_diagnostics", {}).get(
+            "trajectory_reconciliation", {}).get("baseline_proposal", {})
+        anchor_path = anchor.get("path") if isinstance(anchor, dict) else None
+        anchor_sha = anchor.get("sha256") if isinstance(anchor, dict) else None
+        if not isinstance(anchor_path, str) or not isinstance(anchor_sha, str):
+            continue
+        candidate = Path(anchor_path)
+        try:
+            candidate_resolved = candidate.resolve(strict=True)
+            proposal_dir_resolved = proposal_dir.resolve(strict=True)
+            if (candidate_resolved.parent != proposal_dir_resolved or candidate.is_symlink() or
+                    not candidate_resolved.is_file() or sha256_file(candidate_resolved) != anchor_sha):
+                continue
+            anchored_document = read_json(candidate_resolved)
+        except (OSError, ValueError, TypeError):
+            continue
+        if (anchored_document.get("schema_version") == "exhibition-archive.navigation.v1" and
+                is_pre_reconciliation(anchored_document)):
+            return result(candidate_resolved, anchored_document)
+
+    # For workspaces created before v2, use the newest legacy proposal. If no
+    # stable v1 exists, report no baseline instead of comparing v2 with itself.
+    for path, document in documents:
+        if is_pre_reconciliation(document):
+            return result(path, document)
+    return None
+
+
 def _navigation_source(root: Path, config: dict, state: ProjectState | None = None) -> tuple[dict[str, Any], dict[str, Any]]:
     """Resolve trusted poses, coordinate frame and geometry for fresh navigation generation."""
     nav_cfg = config.get("integrations", {}).get("navigation", {})
@@ -788,6 +883,29 @@ def _navigation_source(root: Path, config: dict, state: ProjectState | None = No
         reconstruction = read_colmap_reconstruction(reconstruction_dir, trust)
         source_files.extend(str((reconstruction_dir / name).resolve()) for name in ("cameras.bin", "images.bin", "points3D.bin"))
         cameras, sparse_points, camera_models = reconstruction["cameras"], reconstruction["sparse_points"], reconstruction["camera_models"]
+        try:
+            image_directory, _ = effective_sfm_dataset(root, config, validate_files=False)
+        except (BackendError, DatasetPreparationRequired, OSError, ValueError):
+            image_directory = None
+        orientation_values: Counter[int] = Counter()
+        dimension_mismatches = []
+        if image_directory is not None:
+            for camera in cameras:
+                image_path = image_directory / str(camera.get("image_name", ""))
+                try:
+                    metadata = _camera_capture_metadata(image_path)
+                except (OSError, ValueError, TypeError):
+                    metadata = {"capture_metadata_status": "CAPTURE_METADATA_UNAVAILABLE",
+                                "capture_order_source": None}
+                camera.update(metadata)
+                orientation = camera.get("prepared_image_orientation")
+                if isinstance(orientation, int):
+                    orientation_values[orientation] += 1
+                camera_model = next((item for item in camera_models if item["camera_id"] == camera["camera_id"]), None)
+                if (camera_model and camera.get("prepared_image_width") is not None and
+                        (camera["prepared_image_width"], camera["prepared_image_height"]) !=
+                        (camera_model["width"], camera_model["height"])):
+                    dimension_mismatches.append(camera["image_name"])
         source_rec = reconstruction["source_reconstruction"]
         source_rec["identity"] = {"reconstruction_id": nav_cfg.get("reconstruction_id", reconstruction_dir.name)}
         floor_default = None
@@ -894,6 +1012,17 @@ def _navigation_source(root: Path, config: dict, state: ProjectState | None = No
               "transitions": nav_cfg.get("transitions", []), "guided_paths": nav_cfg.get("guided_paths", []),
               "viewpoints": nav_cfg.get("viewpoints", []), "source_files": source_files,
               "source_model_sha256": nav_cfg.get("source_model_sha256")}
+    if not center_doc:
+        source["image_orientation_evidence"] = {
+            "prepared_orientation_counts": dict(orientation_values),
+            "camera_dimension_mismatch_count": len(dimension_mismatches),
+            "camera_dimension_mismatch_image_names": dimension_mismatches,
+            "interpretation": "Prepared-image metadata is used to establish sequence order and check image dimensions; it does not change camera poses.",
+        }
+    baseline = _latest_navigation_baseline(root, config)
+    if baseline:
+        source["baseline_navigation"] = baseline["document"]
+        source["baseline_navigation_provenance"] = {"path": baseline["path"], "sha256": baseline["sha256"]}
     generation_config = {key: value for key, value in nav_cfg.items() if key not in {"mode", "camera_centers", "trusted_pose_classification", "floor_plane", "ceiling", "envelope", "runtime_policy"}}
     return source, generation_config
 
@@ -946,8 +1075,12 @@ def execute_navigation_generation(root: Path, config: dict, state: ProjectState,
     summary = {"status": proposal["status"], "proposal_id": proposal.get("id", f"unverified-{execution_id:06d}"),
                "envelope_id": proposal.get("id"), "proposal_path": str(proposal_path),
                "review_path": str(review_path), "region_count": len(proposal.get("regions", [])),
-               "trusted_camera_count": pose_evidence.get("used_camera_station_count", 0),
+               "registered_camera_position_candidate_count": pose_evidence.get("used_camera_station_count", 0),
+               "explicitly_trusted_input_camera_count": pose_evidence.get("trusted_input_count", 0),
+               "provisional_registered_camera_position_count": pose_evidence.get("provisional_registered_pose_count", 0),
                "excluded_pose_count": pose_evidence.get("excluded_pose_count", 0),
+               "geometry_unbounded_camera_position_count": pose_evidence.get("geometry_unbounded_station_count", 0),
+               "camera_registration_confidence": pose_evidence.get("camera_registration_confidence"),
                "aligned_lidar_used": proposal.get("coverage_assumptions", {}).get("aligned_lidar_used", False),
                "aligned_lidar_navigation_consumed": bool(proposal.get("provenance", {}).get("aligned_lidar_diagnostics", {}).get("navigation_consumed", False)),
                "ground_plane_candidate_status": proposal.get("coverage_assumptions", {}).get("ground_plane"),

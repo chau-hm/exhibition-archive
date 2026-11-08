@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import math
 import struct
@@ -9,6 +10,8 @@ import unittest
 from pathlib import Path
 
 from exhibition_archive.navigation import (
+    _components,
+    _reconcile_camera_trajectory,
     approve_navigation_artifact,
     colmap_camera_center,
     generate_navigation,
@@ -19,7 +22,12 @@ from exhibition_archive.navigation import (
 )
 from exhibition_archive.state import ProjectState
 from exhibition_archive.navigation_review import invalidate_navigation_approval
-from exhibition_archive.workflow import run_navigation_generation_only, run_workflow, stage_fingerprint
+from exhibition_archive.workflow import (
+    _latest_navigation_baseline,
+    run_navigation_generation_only,
+    run_workflow,
+    stage_fingerprint,
+)
 
 
 def source_for(points, *, floor=True, ceiling=True, frame_verified=True):
@@ -109,6 +117,185 @@ class CameraPoseTests(unittest.TestCase):
             self.assertEqual(result["cameras"][0]["image_name"], "frame-17.jpg")
             self.assertEqual(result["cameras"][0]["camera_center"], [1.0, 2.0, 3.0])
             self.assertEqual(result["camera_models"][0]["parameters"], [1000, 960, 540])
+
+
+class CameraTrajectoryReconciliationTests(unittest.TestCase):
+    @staticmethod
+    def _stations(xs, *, timestamp_offset=0):
+        return [{"station_id": f"station-{i:03d}", "image_name": f"IMG_{i:03d}.jpg",
+                 "uvh": [float(x), 0.0, 2.0], "center_viewer": [float(x), 2.0, 0.0],
+                 "forward_viewer": [0.0, 0.0, -1.0], "capture_timestamp": timestamp_offset + i,
+                 "registered": True, "triangulated_observation_count": 80}
+                for i, x in enumerate(xs)]
+
+    def test_locally_supported_capture_gap_is_a_virtual_review_bridge(self):
+        stations = self._stations([0, 1, 2, 3.8, 4.8, 5.8])
+        spatial = _components(stations, 1.5)
+        self.assertEqual(len(spatial), 2)
+
+        reconciled, report = _reconcile_camera_trajectory(stations, spatial, 1.5, {})
+
+        edge, = report["sequence"]["component_transition_edges"]
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(sum(map(len, reconciled)), len(stations))  # no camera station was fabricated
+        self.assertEqual(edge["bridge_assessment"], "INFERRED_VIRTUAL_CAPTURE_GAP_REQUIRES_REVIEW")
+        self.assertAlmostEqual(edge["horizontal_distance_units"], 1.8)
+        self.assertAlmostEqual(report["bridge_rule"]["baseline_p95_step_units"], 1.0)
+        self.assertEqual(report["bridge_rule"]["baseline_step_count"], 4)
+        self.assertTrue(report["bridge_rule"]["all_accepted_bridge_edges_require_human_review"])
+
+    def test_distant_disconnected_route_is_not_used_to_inflate_its_own_bridge_limit(self):
+        stations = self._stations([0, 1, 2, 15, 16, 17])
+        spatial = _components(stations, 1.5)
+
+        reconciled, report = _reconcile_camera_trajectory(stations, spatial, 1.5, {})
+
+        edge, = report["sequence"]["component_transition_edges"]
+        self.assertEqual(len(reconciled), 2)
+        self.assertEqual(edge["bridge_assessment"], "SPATIAL_COMPONENTS_REMAIN_SEPARATE")
+        self.assertEqual(report["bridge_rule"]["distance_limit_units"], 2.0)
+        self.assertGreater(edge["horizontal_distance_units"], report["bridge_rule"]["distance_limit_units"])
+
+    def test_ambiguous_capture_order_cannot_reconcile_spatial_components(self):
+        stations = self._stations([0, 1, 2, 3.8, 4.8, 5.8])
+        stations[-1]["capture_timestamp"] = stations[-2]["capture_timestamp"]
+        spatial = _components(stations, 1.5)
+
+        reconciled, report = _reconcile_camera_trajectory(stations, spatial, 1.5, {})
+
+        self.assertEqual(report["capture_order_status"], "UNAVAILABLE_OR_AMBIGUOUS")
+        self.assertEqual(report["ordered_station_ids"], [])
+        self.assertEqual(len(reconciled), 2)
+        self.assertEqual(report["sequence"]["component_transition_edges"], [])
+
+    def test_explicit_timestamps_define_order_and_open_u_route_is_not_closed(self):
+        stations = self._stations([0, 1, 2, 2, 2, 1, 0])
+        stations = [dict(station, uvh=[station["uvh"][0], float(y), 2.0],
+                         center_viewer=[station["center_viewer"][0], 2.0, float(y)])
+                    for station, y in zip(stations, [0, 0, 0, 1, 2, 2, 2])]
+        stations.reverse()  # input/COLMAP order is deliberately unrelated to capture order
+        spatial = _components(stations, 1.1)
+
+        reconciled, report = _reconcile_camera_trajectory(stations, spatial, 1.1, {})
+
+        self.assertEqual(report["ordered_image_names"], [f"IMG_{i:03d}.jpg" for i in range(7)])
+        self.assertEqual(len(reconciled), 1)
+        endpoint = report["sequence"]["route_endpoint_gap"]
+        self.assertEqual(endpoint["classification"], "OPEN_CAPTURE_ROUTE_ENDPOINTS; NOT_CONNECTED")
+        self.assertEqual(endpoint["horizontal_distance_units"], 2.0)
+        self.assertEqual(report["sequence"]["component_transition_edges"], [])
+
+    def test_almost_closed_camera_loop_reports_its_open_endpoints_without_closure(self):
+        angles = [math.radians(22.5 + 7.5 * index) for index in range(43)]
+        stations = [{"station_id": f"ring-{index:02d}", "image_name": f"capture-{index:02d}.jpg",
+                     "uvh": [10 * math.cos(angle), 10 * math.sin(angle), 2.0],
+                     "center_viewer": [10 * math.cos(angle), 2.0, 10 * math.sin(angle)],
+                     "forward_viewer": [-math.cos(angle), 0.0, -math.sin(angle)],
+                     "capture_order_index": index, "registered": True,
+                     "triangulated_observation_count": 100}
+                    for index, angle in enumerate(angles)]
+        spacing = 20 * math.sin(math.radians(7.5) / 2)
+        radius = spacing * 2.5
+        spatial = _components(stations, radius)
+
+        reconciled, report = _reconcile_camera_trajectory(stations, spatial, radius, {})
+
+        sequence = report["sequence"]
+        endpoint = sequence["route_endpoint_gap"]
+        self.assertEqual(report["capture_order_status"], "VERIFIED_EXPLICIT_ORDER")
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(len(sequence["consecutive_pairs"]), len(stations) - 1)
+        self.assertGreater(sequence["polar_angular_coverage_degrees_about_camera_centroid"], 300)
+        self.assertEqual(endpoint["classification"], "OPEN_CAPTURE_ROUTE_ENDPOINTS; NOT_CONNECTED")
+        self.assertEqual(sequence["component_transition_edges"], [])
+
+    def test_complete_circular_capture_path_reports_closure_from_observed_positions(self):
+        angles = [2 * math.pi * index / 48 for index in range(49)]
+        stations = [{"station_id": f"circle-{index:02d}", "image_name": f"capture-{index:02d}.jpg",
+                     "uvh": [8 * math.cos(angle), 8 * math.sin(angle), 2.0],
+                     "center_viewer": [8 * math.cos(angle), 2.0, 8 * math.sin(angle)],
+                     "forward_viewer": [-math.cos(angle), 0.0, -math.sin(angle)],
+                     "capture_order_index": index, "registered": True,
+                     "triangulated_observation_count": 100}
+                    for index, angle in enumerate(angles)]
+        spacing = 16 * math.sin(math.pi / 48)
+        spatial = _components(stations, spacing * 2.5)
+
+        reconciled, report = _reconcile_camera_trajectory(stations, spatial, spacing * 2.5, {})
+
+        sequence = report["sequence"]
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(sequence["distinct_camera_positions"], 48)
+        self.assertEqual(sequence["duplicate_or_near_duplicate_positions"], 1)
+        self.assertGreater(sequence["polar_angular_coverage_degrees_about_camera_centroid"], 350)
+        self.assertIsNone(sequence["route_endpoint_gap"])
+        self.assertEqual(sequence["nonadjacent_path_self_intersections"], 0)
+
+    def test_two_unrelated_camera_loops_do_not_join_on_capture_order_alone(self):
+        stations = []
+        for loop_index, center_x in enumerate((0.0, 30.0)):
+            for index in range(16):
+                angle = 2 * math.pi * index / 16
+                x, y = center_x + 4 * math.cos(angle), 4 * math.sin(angle)
+                stations.append({"station_id": f"loop-{loop_index}-{index}",
+                                 "image_name": f"loop-{loop_index}-{index}.jpg",
+                                 "uvh": [x, y, 2.0], "center_viewer": [x, 2.0, y],
+                                 "forward_viewer": [-math.cos(angle), 0.0, -math.sin(angle)],
+                                 "capture_order_index": loop_index * 16 + index,
+                                 "registered": True, "triangulated_observation_count": 100})
+        spatial = _components(stations, 2.5)
+
+        reconciled, report = _reconcile_camera_trajectory(stations, spatial, 2.5, {})
+
+        self.assertEqual(len(spatial), 2)
+        self.assertEqual(len(reconciled), 2)
+        edge, = report["sequence"]["component_transition_edges"]
+        self.assertEqual(edge["bridge_assessment"], "SPATIAL_COMPONENTS_REMAIN_SEPARATE")
+        self.assertGreater(edge["horizontal_distance_units"], edge["bridge_limit_units"])
+
+    def test_nonuniform_near_collinear_path_reports_spacing_and_pca_degeneracy(self):
+        xs = [0.0, 0.05, 0.11, 0.18, 1.0, 2.8, 2.8, 3.2, 4.1]
+        stations = self._stations(xs)
+        spatial = _components(stations, 2.0)
+
+        reconciled, report = _reconcile_camera_trajectory(stations, spatial, 2.0, {})
+
+        sequence = report["sequence"]
+        self.assertEqual(len(reconciled), 1)
+        self.assertEqual(sequence["distinct_camera_positions"], len(xs) - 1)
+        self.assertEqual(sequence["duplicate_or_near_duplicate_positions"], 1)
+        self.assertGreater(sequence["horizontal_distance_units"]["maximum"],
+                           sequence["horizontal_distance_units"]["median"] * 5)
+        self.assertLess(sequence["pca_minor_to_major_ratio"], 1e-8)
+
+
+class NavigationBaselineTests(unittest.TestCase):
+    def test_repeated_v2_proposals_keep_comparison_anchored_to_original_v1(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            proposals = root / "output" / "navigation" / "proposals"
+            proposals.mkdir(parents=True)
+            legacy = proposals / "navigation-proposal-v000014.json"
+            legacy.write_text(json.dumps({"schema_version": "exhibition-archive.navigation.v1",
+                                          "id": "original-v1",
+                                          "regions": [{"id": "v1-region"}]}), encoding="utf-8")
+            digest = hashlib.sha256(legacy.read_bytes()).hexdigest()
+            anchor = {"path": str(legacy.resolve()), "proposal_id": "original-v1", "sha256": digest}
+            for version in (17, 23):
+                document = {"schema_version": "exhibition-archive.navigation.v1",
+                            "id": f"v2-{version}",
+                            "coverage_diagnostics": {"trajectory_reconciliation": {
+                                "baseline_proposal": anchor}},
+                            "regions": [{"id": f"v2-region-{version}"}]}
+                (proposals / f"navigation-proposal-v{version:06d}.json").write_text(
+                    json.dumps(document), encoding="utf-8")
+
+            baseline = _latest_navigation_baseline(root, {"output_directory": "output"})
+
+        self.assertIsNotNone(baseline)
+        self.assertEqual(baseline["document"]["id"], "original-v1")
+        self.assertEqual(Path(baseline["path"]).name, "navigation-proposal-v000014.json")
+        self.assertEqual(baseline["sha256"], digest)
 
 
 class GeometryGenerationTests(unittest.TestCase):
@@ -299,6 +486,11 @@ class GeometryGenerationTests(unittest.TestCase):
         self.assertEqual(artifact["status"], "NAVIGATION_INSUFFICIENT_GEOMETRY")
         self.assertEqual(artifact["regions"], [])
         self.assertEqual(artifact["coverage_diagnostics"]["camera_used_count"], 0)
+        self.assertEqual(artifact["pose_evidence"]["excluded_pose_count"], 0)
+        self.assertEqual(len(artifact["pose_evidence"]["registered_camera_position_candidates"]),
+                         artifact["pose_evidence"]["input_pose_count"])
+        self.assertEqual(artifact["pose_evidence"]["geometry_unbounded_station_count"],
+                         artifact["pose_evidence"]["input_pose_count"])
         self.assertTrue(artifact["coverage_diagnostics"]["excluded_camera_components"])
         excluded = artifact["coverage_diagnostics"]["excluded_camera_components"][0]
         self.assertTrue(excluded["component_id"].startswith("camera-component-"))
@@ -444,6 +636,12 @@ class WorkflowIntegrationTests(unittest.TestCase):
                 self.assertEqual(proposal["pose_evidence"]["provisional_registered_pose_count"], 25)
                 self.assertEqual(proposal["pose_evidence"]["trusted_camera_centers"], [])
                 self.assertEqual(len(proposal["pose_evidence"]["provisional_camera_centers"]), 25)
+                summary = json.loads((root / "output" / "work" / "navigation-summary.json").read_text())
+                self.assertEqual(summary["registered_camera_position_candidate_count"], 25)
+                self.assertEqual(summary["explicitly_trusted_input_camera_count"], 0)
+                self.assertEqual(summary["provisional_registered_camera_position_count"], 25)
+                self.assertEqual(summary["geometry_unbounded_camera_position_count"], 0)
+                self.assertNotIn("trusted_camera_count", summary)
                 self.assertNotIn("training", state.stages())
             finally:
                 state.close()

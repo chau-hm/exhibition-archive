@@ -342,6 +342,212 @@ function installButtons(handle) {
   languageSelect.addEventListener('change', () => applyLanguage(languageSelect.value, true));
 }
 
+async function installNavigationDiagnostics(handle, settings) {
+  if (new URLSearchParams(location.search).get('navigationDiagnostics') !== '1') return;
+  const panel = document.createElement('aside');
+  panel.className = 'navigation-diagnostic-panel';
+  panel.setAttribute('aria-label', 'Technical navigation overlay');
+  panel.innerHTML = `<h2>Navigation proposal overlay</h2>
+    <p data-diagnostic-status>Loading review-only lines…</p>
+    <div class="navigation-diagnostic-actions">
+      <button type="button" data-nav-frame="perspective">Frame boundary</button>
+      <button type="button" data-nav-frame="top-down">Top down</button>
+      <button type="button" data-nav-frame="reset">Reset opening view</button>
+    </div>
+    <p class="navigation-diagnostic-hint">Framing changes only this review camera. Reset restores the Visitor opening pose.</p>
+    <p data-diagnostic-view-status>Opening Visitor view.</p>
+    <label><input type="checkbox" data-nav-layer="cameras" checked> Camera poses and directions</label>
+    <label><input type="checkbox" data-nav-layer="path" checked> Ordered camera path</label>
+    <label><input type="checkbox" data-nav-layer="gaps" checked> Inferred bridge and open endpoints</label>
+    <label><input type="checkbox" data-nav-layer="v1" checked> Existing v1 boundary</label>
+    <label><input type="checkbox" data-nav-layer="v2" checked> Candidate v2 boundary</label>
+    <label><input type="checkbox" data-nav-layer="ground"> Photo-SfM lower candidate</label>
+    <p data-diagnostic-hover>Hover a camera marker for its image name and track count.</p>
+    <p data-diagnostic-projection>Overlay projection will be reported after the camera is ready.</p>
+    <p>Review only. This overlay does not enforce navigation. Visitor movement remains unbounded until a boundary is explicitly approved.</p>`;
+  host.append(panel);
+  try {
+    const overlayUrl = new URL('../diagnostics/navigation-overlay.json', location.href);
+    const response = await fetch(overlayUrl, { cache: 'no-cache' });
+    if (!response.ok) throw new Error(`Navigation overlay unavailable (${response.status}).`);
+    const data = await response.json();
+    if (data.schema_version !== 'exhibition-archive.navigation-model-overlay.v1') {
+      throw new Error('Unsupported navigation overlay data.');
+    }
+    const status = panel.querySelector('[data-diagnostic-status]');
+    const viewStatus = panel.querySelector('[data-diagnostic-view-status]');
+    const projectionStatus = panel.querySelector('[data-diagnostic-projection]');
+    const summary = data.summary ?? {};
+    status.textContent = `${data.proposal_status} · ${summary.camera_used_count}/${summary.registered_camera_count} cameras · review required`;
+    const openingPose = settings?.cameras?.[0]?.initial
+      ? JSON.parse(JSON.stringify(settings.cameras[0].initial)) : null;
+    const navigationPoints = [
+      ...(data.candidate_v2 ?? []).flatMap((region) => region.lower_loop ?? []),
+      ...(data.cameras ?? []).map((cameraRow) => cameraRow.center)
+    ].filter((point) => Array.isArray(point) && point.length === 3 && point.every(Number.isFinite));
+    const frameNavigation = (preset) => {
+      if (!Array.isArray(handle.annotations) || (preset === 'reset' ? !openingPose : !navigationPoints.length)) {
+        viewStatus.textContent = 'Navigation camera framing is unavailable for this proposal.';
+        return;
+      }
+      let pose = openingPose;
+      if (preset !== 'reset') {
+        const min = [0, 1, 2].map((axis) => Math.min(...navigationPoints.map((point) => point[axis])));
+        const max = [0, 1, 2].map((axis) => Math.max(...navigationPoints.map((point) => point[axis])));
+        const target = min.map((value, axis) => (value + max[axis]) * 0.5);
+        const radius = Math.max(0.001, ...navigationPoints.map((point) =>
+          Math.hypot(point[0] - target[0], point[2] - target[2])));
+        const fov = 70;
+        const distance = Math.max(radius, (max[1] - min[1]) * 0.5) / Math.tan(fov * Math.PI / 360) * 1.2;
+        const position = preset === 'top-down'
+          ? [target[0] + distance * 0.06, target[1] + distance, target[2] + distance * 0.06]
+          : [target[0] + distance * 0.612, target[1] + distance * 0.5, target[2] + distance * 0.612];
+        pose = { position, target, fov };
+      }
+      const annotationIndex = handle.annotations.push({
+        position: pose.position,
+        title: preset === 'top-down' ? 'Navigation top-down review' : 'Navigation boundary review',
+        text: 'Temporary technical-review camera preset.',
+        camera: { initial: pose }
+      }) - 1;
+      flyLocked = false;
+      handle.selectAnnotation(annotationIndex);
+      viewStatus.textContent = preset === 'reset'
+        ? 'Restoring the Visitor opening view.'
+        : preset === 'top-down'
+        ? 'Top-down navigation review view · proposal only.'
+        : 'Framed navigation review view · proposal only.';
+      window.setTimeout(() => {
+        if (!handle.state.loaded) return;
+        handle.state.cameraMode = 'fly';
+        handle.selectAnnotation(null);
+        flyLocked = true;
+        handle.app.renderNextFrame = true;
+        if (preset === 'reset') viewStatus.textContent = 'Opening Visitor view restored.';
+      }, 1_350);
+    };
+    for (const button of panel.querySelectorAll('[data-nav-frame]')) {
+      button.addEventListener('click', () => frameNavigation(button.dataset.navFrame));
+    }
+    const canvas = document.createElement('canvas');
+    canvas.className = 'navigation-diagnostic-canvas';
+    canvas.setAttribute('aria-hidden', 'true');
+    host.append(canvas);
+    const context = canvas.getContext('2d');
+    const cameraComponent = handle.app.root.findComponents('camera')[0];
+    const camera = cameraComponent?.camera;
+    const Vector = cameraComponent?.entity?.getPosition()?.constructor;
+    if (!camera?.worldToScreen || !Vector) throw new Error('Viewer camera projection is unavailable.');
+    const visible = Object.fromEntries([...panel.querySelectorAll('[data-nav-layer]')]
+      .map((input) => [input.dataset.navLayer, input]));
+    let screenCameras = [];
+    const project = (position, width, height) => {
+      const world = new Vector(position[0], position[1], position[2]);
+      const screen = new Vector();
+      camera.worldToScreen(world, width, height, screen);
+      if (![screen.x, screen.y, screen.z].every(Number.isFinite)) return null;
+      return { x: screen.x, y: screen.y, depth: screen.z,
+        onscreen: screen.z >= camera.nearClip && screen.z <= camera.farClip &&
+          screen.x >= 0 && screen.x <= width && screen.y >= 0 && screen.y <= height };
+    };
+    const drawLine = (ctx, a, b, color, width, dashed, viewport) => {
+      const first = project(a, viewport.width, viewport.height);
+      const second = project(b, viewport.width, viewport.height);
+      if (!first || !second || first.depth < camera.nearClip || first.depth > camera.farClip ||
+          second.depth < camera.nearClip || second.depth > camera.farClip) return;
+      projectedLineCount++;
+      ctx.strokeStyle = color;
+      ctx.lineWidth = width;
+      ctx.setLineDash(dashed ? [7, 5] : []);
+      ctx.beginPath();
+      ctx.moveTo(first.x, first.y);
+      ctx.lineTo(second.x, second.y);
+      ctx.stroke();
+      ctx.setLineDash([]);
+    };
+    const drawLoop = (ctx, points, color, width, dashed, viewport) => {
+      for (let index = 0; index < points.length; index++) {
+        drawLine(ctx, points[index], points[(index + 1) % points.length], color, width, dashed, viewport);
+      }
+    };
+    let projectedLineCount = 0;
+    const drawOverlay = () => {
+      projectedLineCount = 0;
+      const rect = host.getBoundingClientRect();
+      const ratio = window.devicePixelRatio || 1;
+      canvas.width = Math.max(1, Math.round(rect.width * ratio));
+      canvas.height = Math.max(1, Math.round(rect.height * ratio));
+      canvas.style.width = `${rect.width}px`;
+      canvas.style.height = `${rect.height}px`;
+      context.setTransform(ratio, 0, 0, ratio, 0, 0);
+      context.clearRect(0, 0, rect.width, rect.height);
+      const viewport = { width: rect.width, height: rect.height };
+      if (visible.v1.checked) for (const region of data.baseline_v1 ?? []) {
+        drawLoop(context, region.loop ?? [], '#e4bd54', 2, true, viewport);
+      }
+      if (visible.ground.checked) for (const region of data.candidate_v2 ?? []) {
+        drawLoop(context, region.ground_loop ?? [], '#6fe28a', 2, false, viewport);
+      }
+      if (visible.v2.checked) for (const region of data.candidate_v2 ?? []) {
+        if (region.boundary_segments?.length) {
+          for (const edge of region.boundary_segments) {
+            const supported = edge.classification === 'CAMERA_POSITION_SUPPORTED_ENVELOPE';
+            drawLine(context, edge.start, edge.end, supported ? '#58ded2' : '#ed62cc',
+              2.5, !supported, viewport);
+          }
+        } else {
+          drawLoop(context, region.lower_loop ?? [], '#ed62cc', 2.5, false, viewport);
+        }
+        drawLoop(context, region.upper_loop ?? [], '#b96bd4', 1, false, viewport);
+      }
+      if (visible.path.checked) for (const segment of data.observed_path_segments ?? []) {
+        drawLine(context, segment.from, segment.to, segment.inferred ? '#ffe06b' : '#b6c3cc',
+          segment.inferred ? 3 : 1.5, segment.inferred, viewport);
+      }
+      if (visible.gaps.checked && data.inferred_endpoint_gap) {
+        const gap = data.inferred_endpoint_gap;
+        drawLine(context, gap.from, gap.to, '#fa806d', 2, true, viewport);
+      }
+      screenCameras = [];
+      const projectedCameraSamples = [];
+      if (visible.cameras.checked) for (const item of data.cameras ?? []) {
+        const oldExcluded = item.baseline_coverage_status === 'EXCLUDED_INSUFFICIENT_GEOMETRY';
+        const color = oldExcluded ? '#ff9d62' : '#73caff';
+        drawLine(context, item.center, item.forward_end, color, 1, false, viewport);
+        const point = project(item.center, viewport.width, viewport.height);
+        if (point) projectedCameraSamples.push(point);
+        if (!point || !point.onscreen) continue;
+        context.fillStyle = color;
+        context.beginPath();
+        context.arc(point.x, point.y, 4, 0, Math.PI * 2);
+        context.fill();
+        screenCameras.push({ ...point, item });
+      }
+      const extent = (axis) => projectedCameraSamples.length
+        ? `${Math.min(...projectedCameraSamples.map((point) => point[axis])).toFixed(1)}…${Math.max(...projectedCameraSamples.map((point) => point[axis])).toFixed(1)}`
+        : 'n/a';
+      projectionStatus.textContent = `Overlay projection: ${screenCameras.length}/${data.cameras?.length ?? 0} cameras in view · ${projectedLineCount} segments · screen x ${extent('x')}, y ${extent('y')}, depth ${extent('depth')}.`;
+    };
+    for (const input of Object.values(visible)) input.addEventListener('change', drawOverlay);
+    host.addEventListener('pointermove', (event) => {
+      const rect = host.getBoundingClientRect();
+      const x = event.clientX - rect.left, y = event.clientY - rect.top;
+      const closest = screenCameras.map((item) => ({ item, distance: Math.hypot(item.x - x, item.y - y) }))
+        .filter((row) => row.distance < 12).sort((a, b) => a.distance - b.distance)[0];
+      const hover = panel.querySelector('[data-diagnostic-hover]');
+      hover.textContent = closest
+        ? `${closest.item.item.image_name} · ${closest.item.item.triangulated_observation_count ?? 'n/a'} triangulated observations · v1 ${closest.item.item.baseline_coverage_status ?? 'not classified'}`
+        : 'Hover a camera marker for its image name and track count.';
+    });
+    handle.app.on('frameend', drawOverlay);
+    new ResizeObserver(drawOverlay).observe(host);
+    drawOverlay();
+  } catch (error) {
+    panel.querySelector('[data-diagnostic-status]').textContent = `Overlay error: ${error.message}`;
+    console.error(error);
+  }
+}
+
 function exposeAcceptance(handle) {
   if (!__EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__ || new URLSearchParams(location.search).get('acceptance') !== '1') return;
   let acceptanceUpdates = 0;
@@ -445,6 +651,7 @@ async function start() {
     if (!viewer) throw lastError ?? new Error('The exhibition model could not be opened.');
     await enterFlyAtOpeningPose(viewer);
     installButtons(viewer);
+    await installNavigationDiagnostics(viewer, settings);
     loading.hidden = true;
     focusViewer();
     exposeAcceptance(viewer);

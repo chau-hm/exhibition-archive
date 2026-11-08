@@ -11,6 +11,7 @@ import math
 import struct
 import copy
 from collections import Counter, defaultdict, deque
+from datetime import datetime
 from pathlib import Path
 from statistics import median
 from typing import Any, Iterable
@@ -159,12 +160,22 @@ def read_colmap_reconstruction(directory: str | Path, trust: dict[str, Any] | No
             camera_id = struct.unpack("<I", stream.read(4))[0]
             name = _read_c_string(stream)
             point_count = struct.unpack("<Q", stream.read(8))[0]
-            stream.seek(point_count * 24, 1)
+            observation_data = stream.read(point_count * 24)
+            if len(observation_data) != point_count * 24:
+                raise ValueError(f"COLMAP image {image_id} has truncated 2D observations")
+            triangulated_observations = sum(
+                struct.unpack_from("<Q", observation_data, index * 24 + 16)[0] != (2**64 - 1)
+                for index in range(point_count)
+            )
             if camera_id not in camera_models:
                 raise ValueError(f"COLMAP image {image_id} refers to missing camera {camera_id}")
             images.append({"image_id": image_id, "image_name": name, "camera_id": camera_id,
                            "qvec_wxyz": qvec, "tvec": tvec,
-                           "camera_center": colmap_camera_center(qvec, tvec), "registered": True})
+                           "camera_center": colmap_camera_center(qvec, tvec), "registered": True,
+                           "point2d_observation_count": int(point_count),
+                           "triangulated_observation_count": int(triangulated_observations),
+                           "triangulated_observation_fraction": (triangulated_observations / point_count
+                                                                  if point_count else 0.0)})
     sparse_points: list[list[float]] = []
     sparse_point_tracks: list[int] = []
     sparse_point_errors: list[float] = []
@@ -672,6 +683,293 @@ def _point_segment_distance(p: list[float], a: list[float], b: list[float]) -> f
     return math.hypot(p[0] - a[0] - t * dx, p[1] - a[1] - t * dy)
 
 
+def _capture_order_value(row: dict[str, Any]) -> float | None:
+    """Read an explicit capture time/order; never infer order from COLMAP ids or names."""
+    value = row.get("capture_timestamp")
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        return float(value)
+    if isinstance(value, str) and value.strip():
+        try:
+            parsed = datetime.fromisoformat(value.strip().replace("Z", "+00:00"))
+            return parsed.timestamp()
+        except (ValueError, OverflowError, OSError):
+            pass
+    order = row.get("capture_order_index")
+    if isinstance(order, (int, float)) and not isinstance(order, bool) and math.isfinite(float(order)):
+        return float(order)
+    return None
+
+
+def _trajectory_corridor_area(points: list[list[float]], radius: float) -> dict[str, Any]:
+    """Estimate the area within a scale-relative buffer around an ordered path."""
+    if len(points) < 2 or radius <= EPS:
+        return {"status": "INSUFFICIENT", "area_units2": None, "radius_units": radius,
+                "reason": "A non-degenerate ordered path and positive buffer are required."}
+    cell = radius / 3.0
+    minimum = [min(point[axis] for point in points) - radius for axis in (0, 1)]
+    maximum = [max(point[axis] for point in points) + radius for axis in (0, 1)]
+    nx = max(1, math.ceil((maximum[0] - minimum[0]) / cell))
+    ny = max(1, math.ceil((maximum[1] - minimum[1]) / cell))
+    # Keep the diagnostic bounded for very large and/or very densely sampled scenes.
+    stride = max(1, math.ceil(math.sqrt((nx * ny) / 1_000_000)))
+    occupied = 0
+    tested = 0
+    for ix in range(0, nx, stride):
+        x = minimum[0] + (ix + 0.5 * stride) * cell
+        for iy in range(0, ny, stride):
+            y = minimum[1] + (iy + 0.5 * stride) * cell
+            tested += 1
+            point = [x, y]
+            if any(_point_segment_distance(point, first[:2], second[:2]) <= radius
+                   for first, second in zip(points, points[1:])):
+                occupied += 1
+    sample_cell_area = (cell * stride) ** 2
+    return {"status": "ESTIMATED", "area_units2": occupied * sample_cell_area,
+            "radius_units": radius, "radius_basis": "half median nearest-neighbor camera spacing",
+            "grid_cell_units": cell * stride, "grid_stride": stride, "grid_samples": tested,
+            "method": "bounded grid estimate of the planar camera-path corridor; not an interior or traversability estimate"}
+
+
+def _reconcile_camera_trajectory(points: list[dict[str, Any]],
+                                 spatial_components: list[list[dict[str, Any]]],
+                                 connection_radius: float,
+                                 config: dict[str, Any]) -> tuple[list[list[dict[str, Any]]], dict[str, Any]]:
+    """Reconcile spatial camera components with explicit capture-order evidence.
+
+    Spatial components remain the baseline. A cross-component sequence edge can
+    join proposal groups only as an inferred link when its distance, time, and
+    pose turn stay within configurable multiples of measured trajectory p95s.
+    Such a link is always review-only and creates no synthetic camera station.
+    """
+    component_index = {row["station_id"]: index
+                       for index, component in enumerate(spatial_components)
+                       for row in component}
+    by_station = {row["station_id"]: row for row in points}
+    def q(values: list[float], fraction: float) -> float | None:
+        return _quantile(values, fraction) if values else None
+    keyed = [(value, index, row) for index, row in enumerate(points)
+             if (value := _capture_order_value(row)) is not None]
+    order_complete = len(keyed) == len(points) and len({item[0] for item in keyed}) == len(keyed)
+    ordered = [row for _, _, row in sorted(keyed)] if order_complete else []
+    step_rows: list[dict[str, Any]] = []
+    for index, (first, second) in enumerate(zip(ordered, ordered[1:])):
+        a, b = first["uvh"], second["uvh"]
+        distance_uv = math.hypot(b[0] - a[0], b[1] - a[1])
+        distance_3d = math.sqrt(sum((b[axis] - a[axis]) ** 2 for axis in range(3)))
+        first_forward, second_forward = first["forward_viewer"], second["forward_viewer"]
+        turn = math.degrees(math.acos(max(-1.0, min(1.0, _dot(first_forward, second_forward)))))
+        first_order, second_order = _capture_order_value(first), _capture_order_value(second)
+        step_rows.append({"sequence_index": index,
+                          "from_station_id": first["station_id"], "to_station_id": second["station_id"],
+                          "from_image_name": first.get("image_name"), "to_image_name": second.get("image_name"),
+                          "from_component_id": f"camera-component-{component_index.get(first['station_id'], 0) + 1:02d}",
+                          "to_component_id": f"camera-component-{component_index.get(second['station_id'], 0) + 1:02d}",
+                          "horizontal_distance_units": distance_uv, "spatial_distance_units": distance_3d,
+                          "vertical_delta_units": b[2] - a[2], "view_direction_change_degrees": turn,
+                          "capture_interval_units": (second_order - first_order) if first_order is not None and second_order is not None else None,
+                          "crosses_spatial_component": component_index.get(first["station_id"]) != component_index.get(second["station_id"]),
+                          "from_triangulated_observations": first.get("triangulated_observation_count"),
+                          "to_triangulated_observations": second.get("triangulated_observation_count")})
+    horizontal_steps = [row["horizontal_distance_units"] for row in step_rows]
+    # Candidate component bridges must not inflate the statistics used to
+    # decide whether the same bridge is plausible. Calibrate from local steps
+    # supported by the existing spatial components.
+    local_step_rows = [row for row in step_rows
+                       if not row["crosses_spatial_component"] and
+                       row["horizontal_distance_units"] <= connection_radius + EPS]
+    baseline_step_rows = local_step_rows
+    baseline_steps = [row["horizontal_distance_units"] for row in baseline_step_rows]
+    baseline_intervals = [row["capture_interval_units"] for row in baseline_step_rows
+                 if row["capture_interval_units"] is not None and row["capture_interval_units"] >= 0]
+    baseline_turns = [row["view_direction_change_degrees"] for row in baseline_step_rows]
+    intervals = [row["capture_interval_units"] for row in step_rows
+                 if row["capture_interval_units"] is not None and row["capture_interval_units"] >= 0]
+    turns = [row["view_direction_change_degrees"] for row in step_rows]
+    p95_step = _quantile(baseline_steps, 0.95) if baseline_steps else 0.0
+    p95_interval = _quantile(baseline_intervals, 0.95) if baseline_intervals else 0.0
+    p95_turn = _quantile(baseline_turns, 0.95) if baseline_turns else 0.0
+    distance_factor = float(config.get("capture_gap_p95_multiple", 2.0))
+    interval_factor = float(config.get("capture_interval_p95_multiple", 2.0))
+    turn_factor = float(config.get("capture_turn_p95_multiple", 2.0))
+    if any(not math.isfinite(value) or value <= 0 for value in (distance_factor, interval_factor, turn_factor)):
+        raise ValueError("capture gap p95 multiples must be finite and greater than zero")
+    bridge_distance_limit = max(connection_radius, p95_step * distance_factor)
+    bridge_interval_limit = p95_interval * interval_factor
+    bridge_turn_limit = p95_turn * turn_factor
+    bridge_edges = []
+    suspected_gap_edges = []
+    for row in step_rows:
+        spatial_ok = row["horizontal_distance_units"] <= bridge_distance_limit + EPS
+        interval_ok = row["capture_interval_units"] is None or row["capture_interval_units"] <= bridge_interval_limit + EPS
+        turn_ok = row["view_direction_change_degrees"] <= bridge_turn_limit + EPS
+        if row["crosses_spatial_component"]:
+            first = by_station[row["from_station_id"]]
+            second = by_station[row["to_station_id"]]
+            registration_valid = all(item.get("registered", True) is True and
+                                     item.get("triangulated_observation_count", 1) > 0
+                                     for item in (first, second))
+            measured_continuity = spatial_ok and interval_ok and turn_ok and registration_valid
+            row["bridge_assessment"] = ("INFERRED_VIRTUAL_CAPTURE_GAP_REQUIRES_REVIEW" if measured_continuity
+                                        else "SPATIAL_COMPONENTS_REMAIN_SEPARATE")
+            row["gap_assessment"] = row["bridge_assessment"]
+            row["registration_support_valid"] = registration_valid
+            row["bridge_limit_units"] = bridge_distance_limit
+            bridge_edges.append(row)
+            suspected_gap_edges.append(row)
+        elif not spatial_ok or not interval_ok or not turn_ok:
+            row["gap_assessment"] = "SEQUENCE_STEP_OUTLIER_REQUIRES_REVIEW"
+            suspected_gap_edges.append(row)
+        else:
+            row["gap_assessment"] = "OBSERVED_CONSECUTIVE_CAMERA_STEP"
+        row["distance_to_median_sequence_step_ratio"] = (row["horizontal_distance_units"] /
+                                                         (q(horizontal_steps, 0.5) or 1.0))
+
+    parent = list(range(len(spatial_components)))
+    def find(index: int) -> int:
+        while parent[index] != index:
+            parent[index] = parent[parent[index]]
+            index = parent[index]
+        return index
+    for edge in bridge_edges:
+        if edge.get("bridge_assessment") != "INFERRED_VIRTUAL_CAPTURE_GAP_REQUIRES_REVIEW":
+            continue
+        left = component_index[edge["from_station_id"]]
+        right = component_index[edge["to_station_id"]]
+        left_root, right_root = find(left), find(right)
+        if left_root != right_root:
+            parent[right_root] = left_root
+    grouped: dict[int, list[dict[str, Any]]] = defaultdict(list)
+    for index, component in enumerate(spatial_components):
+        grouped[find(index)].extend(component)
+    if order_complete:
+        order_for_station = {row["station_id"]: index for index, row in enumerate(ordered)}
+        reconciled_components = sorted(grouped.values(), key=lambda group: min(order_for_station.get(row["station_id"], math.inf) for row in group))
+    else:
+        reconciled_components = [grouped[key] for key in sorted(grouped)]
+
+    endpoint_gap = None
+    if order_complete and len(ordered) > 2:
+        first, last = ordered[0], ordered[-1]
+        endpoint_distance = _distance(first["uvh"], last["uvh"])
+        if endpoint_distance > connection_radius:
+            endpoint_gap = {"from_image_name": last.get("image_name"), "to_image_name": first.get("image_name"),
+                            "from_station_id": last["station_id"], "to_station_id": first["station_id"],
+                            "horizontal_distance_units": endpoint_distance,
+                            "distance_to_median_sequence_step_ratio": endpoint_distance / (q(horizontal_steps, 0.5) or 1.0),
+                            "classification": "OPEN_CAPTURE_ROUTE_ENDPOINTS; NOT_CONNECTED"}
+
+    ordered_uv = [row["uvh"][:2] for row in ordered]
+    angular_coverage = largest_angular_gap = None
+    signed_turn_total = None
+    turn_positive_count = turn_negative_count = self_intersections = 0
+    pca_eigenvalues = None
+    if len(ordered_uv) >= 3:
+        center_u = sum(point[0] for point in ordered_uv) / len(ordered_uv)
+        center_v = sum(point[1] for point in ordered_uv) / len(ordered_uv)
+        angles = sorted(math.atan2(point[1] - center_v, point[0] - center_u) % (2 * math.pi)
+                        for point in ordered_uv)
+        angular_gaps = [(angles[(index + 1) % len(angles)] - angles[index]) % (2 * math.pi)
+                        for index in range(len(angles))]
+        largest_angular_gap = math.degrees(max(angular_gaps))
+        angular_coverage = 360.0 - largest_angular_gap
+        sequence_angles = [math.atan2(point[1] - center_v, point[0] - center_u) for point in ordered_uv]
+        signed_deltas = [((sequence_angles[index + 1] - sequence_angles[index] + math.pi) % (2 * math.pi)) - math.pi
+                         for index in range(len(sequence_angles) - 1)]
+        signed_turn_total = math.degrees(sum(signed_deltas))
+        turn_positive_count = sum(delta > 1e-9 for delta in signed_deltas)
+        turn_negative_count = sum(delta < -1e-9 for delta in signed_deltas)
+        mean_u, mean_v = center_u, center_v
+        cov_uu = sum((point[0] - mean_u) ** 2 for point in ordered_uv) / len(ordered_uv)
+        cov_vv = sum((point[1] - mean_v) ** 2 for point in ordered_uv) / len(ordered_uv)
+        cov_uv = sum((point[0] - mean_u) * (point[1] - mean_v) for point in ordered_uv) / len(ordered_uv)
+        trace = cov_uu + cov_vv
+        root = math.sqrt(max(0.0, (cov_uu - cov_vv) ** 2 + 4.0 * cov_uv ** 2))
+        pca_eigenvalues = [(trace + root) / 2.0, (trace - root) / 2.0]
+        route_scale = max((abs(value) for point in ordered_uv for value in point), default=1.0)
+        explicitly_closed = (_distance(ordered_uv[0], ordered_uv[-1]) <= max(EPS * 10.0, route_scale * 1e-10))
+        for left_index in range(len(ordered_uv) - 1):
+            for right_index in range(left_index + 2, len(ordered_uv) - 1):
+                # A capture route whose final observed camera returns to the
+                # first position has adjacent first/last path segments. Their
+                # shared endpoint is not a self-intersection.
+                if explicitly_closed and left_index == 0 and right_index == len(ordered_uv) - 2:
+                    continue
+                if _segments_intersect(ordered_uv[left_index], ordered_uv[left_index + 1],
+                                       ordered_uv[right_index], ordered_uv[right_index + 1]):
+                    self_intersections += 1
+    route_length = sum(horizontal_steps)
+    distinct_positions = len({(round(point[0], 10), round(point[1], 10)) for point in ordered_uv})
+    nearest_spacing = _median_spacing(ordered_uv)
+    obs = [int(row["triangulated_observation_count"]) for row in points
+           if isinstance(row.get("triangulated_observation_count"), int)]
+    registration = {"registered_pose_count": sum(row.get("registered", True) is True for row in points),
+                    "pose_input_count": len(points),
+                    "triangulated_observation_count": {"minimum": min(obs), "median": _quantile(obs, 0.5),
+                                                        "p90": _quantile(obs, 0.9), "maximum": max(obs)} if obs else None,
+                    "evidence_source": "COLMAP registered image records and per-image 2D observations with valid point3D tracks",
+                    "per_image_reprojection_error": "NOT_AVAILABLE; only the global SfM validation summary is available"}
+    report = {"capture_order_status": "VERIFIED_EXPLICIT_ORDER" if order_complete else "UNAVAILABLE_OR_AMBIGUOUS",
+              "capture_order_source": "unique capture_timestamp/capture_order_index fields; no filename or COLMAP-id fallback",
+              "ordered_station_ids": [row["station_id"] for row in ordered],
+              "ordered_image_names": [row.get("image_name") for row in ordered],
+              "spatial_component_count_before_reconciliation": len(spatial_components),
+              "spatial_component_connection_radius_units": connection_radius,
+              "reconciled_component_count": len(reconciled_components),
+              "camera_registration_confidence": registration,
+              "local_ground_confidence": "ASSESSED_PER_CANDIDATE_REGION; DOES_NOT_CONTROL_CAMERA_POSE_ELIGIBILITY",
+              "sequence": {"consecutive_pair_count": len(step_rows),
+                           "horizontal_distance_units": {"median": q(horizontal_steps, 0.5),
+                                                          "p90": q(horizontal_steps, 0.9),
+                                                          "p95": q(horizontal_steps, 0.95), "maximum": max(horizontal_steps) if horizontal_steps else None},
+                           "full_distance_units": {"median": q([row["spatial_distance_units"] for row in step_rows], 0.5),
+                                                   "p90": q([row["spatial_distance_units"] for row in step_rows], 0.9),
+                                                   "maximum": max((row["spatial_distance_units"] for row in step_rows), default=None)},
+                           "absolute_vertical_delta_units": {"median": q([abs(row["vertical_delta_units"]) for row in step_rows], 0.5),
+                                                             "p90": q([abs(row["vertical_delta_units"]) for row in step_rows], 0.9),
+                                                             "maximum": max((abs(row["vertical_delta_units"]) for row in step_rows), default=None)},
+                           "view_direction_change_degrees": {"median": q(turns, 0.5), "p90": q(turns, 0.9),
+                                                              "p95": q(turns, 0.95), "maximum": max(turns) if turns else None},
+                           "capture_interval_seconds_or_order_units": {"median": q(intervals, 0.5), "p90": q(intervals, 0.9),
+                                                                       "p95": q(intervals, 0.95),
+                                                                       "maximum": max(intervals) if intervals else None},
+                           "path_length_units": route_length,
+                           "start_end_separation_units": _distance(ordered[0]["uvh"], ordered[-1]["uvh"]) if len(ordered) > 1 else None,
+                           "median_nearest_neighbor_spacing_units": nearest_spacing,
+                           "distinct_camera_positions": distinct_positions,
+                           "duplicate_or_near_duplicate_positions": len(ordered) - distinct_positions,
+                           "pca_horizontal_eigenvalues_units2": pca_eigenvalues,
+                           "pca_minor_to_major_ratio": (pca_eigenvalues[1] / pca_eigenvalues[0]
+                                                         if pca_eigenvalues and pca_eigenvalues[0] > EPS else None),
+                           "polar_angular_coverage_degrees_about_camera_centroid": angular_coverage,
+                           "largest_polar_gap_degrees": largest_angular_gap,
+                           "signed_polar_turn_total_degrees": signed_turn_total,
+                           "positive_polar_turn_steps": turn_positive_count,
+                           "negative_polar_turn_steps": turn_negative_count,
+                           "nonadjacent_path_self_intersections": self_intersections,
+                           "component_transition_edges": bridge_edges,
+                           "suspected_gap_edges": suspected_gap_edges,
+                           "route_endpoint_gap": endpoint_gap,
+                           "consecutive_pairs": step_rows},
+              "bridge_rule": {"status": "PROPOSED_ONLY",
+                              "distance_limit_units": bridge_distance_limit,
+                              "distance_limit_basis": f"max(spatial-component radius, {distance_factor:g} × p95 local step within existing components)",
+                              "capture_interval_limit": bridge_interval_limit,
+                              "capture_interval_limit_basis": f"{interval_factor:g} × p95 capture interval within existing components",
+                              "view_direction_limit_degrees": bridge_turn_limit,
+                              "view_direction_limit_basis": f"{turn_factor:g} × p95 adjacent pose turn within existing components",
+                              "baseline_step_count": len(baseline_step_rows),
+                              "baseline_p95_step_units": p95_step,
+                              "baseline_p95_capture_interval": p95_interval,
+                              "baseline_p95_view_turn_degrees": p95_turn,
+                              "baseline_scope": "within-component sequential pairs no longer than the current spatial-component radius; candidate cross-component bridges do not set their own acceptance threshold",
+                              "no_intermediate_camera_stations_created": True,
+                              "all_accepted_bridge_edges_require_human_review": True},
+              "corridor_strategy": _trajectory_corridor_area(ordered_uv, nearest_spacing * 0.5) if order_complete else
+                                   {"status": "UNAVAILABLE", "area_units2": None,
+                                    "reason": "Reliable capture order is unavailable; no trajectory corridor was fabricated."}}
+    return reconciled_components, report
+
+
 def _line_intersection_t(a, b, c, d) -> float | None:
     values = _segment_intersection_parameters(a, b, c, d)
     return values[0] if values else None
@@ -1057,6 +1355,56 @@ def _validate_initial_camera(artifact: dict[str, Any]) -> dict[str, Any]:
             "allowed_height_units": [low, high]}
 
 
+def _compatible_baseline_navigation(source: dict[str, Any],
+                                    transform_matrix: list[list[float]]) -> tuple[dict[str, Any] | None, dict[str, Any]]:
+    baseline = source.get("baseline_navigation")
+    provenance = source.get("baseline_navigation_provenance", {})
+    if not isinstance(baseline, dict) or baseline.get("schema_version") != "exhibition-archive.navigation.v1":
+        return None, {"status": "NOT_AVAILABLE"}
+    current_identity = source.get("source_reconstruction", {}).get("identity", {})
+    previous_identity = baseline.get("source_reconstruction", {}).get("identity", {})
+    current_ids = {str(current_identity[key]) for key in ("reconstruction_id", "directory_name")
+                   if current_identity.get(key) is not None}
+    previous_ids = {str(previous_identity[key]) for key in ("reconstruction_id", "directory_name")
+                    if previous_identity.get(key) is not None}
+    previous_matrix = baseline.get("coordinate_frame", {}).get("source_to_viewer_matrix_row_major")
+    if not current_ids.intersection(previous_ids):
+        return None, {"status": "REJECTED_DIFFERENT_RECONSTRUCTION", **provenance}
+    if (not isinstance(previous_matrix, list) or len(previous_matrix) != 4 or
+            any(not isinstance(row, list) or len(row) != 4 for row in previous_matrix)):
+        return None, {"status": "REJECTED_MISSING_COORDINATE_TRANSFORM", **provenance}
+    try:
+        same_transform = all(abs(float(previous_matrix[row][column]) - transform_matrix[row][column]) <= 1e-6
+                             for row in range(4) for column in range(4))
+    except (TypeError, ValueError, OverflowError):
+        same_transform = False
+    if not same_transform:
+        return None, {"status": "REJECTED_DIFFERENT_COORDINATE_TRANSFORM", **provenance}
+    return baseline, {"status": "MATCHED_RECONSTRUCTION_AND_TRANSFORM", **provenance,
+                      "proposal_id": baseline.get("id"),
+                      "proposal_sha256": provenance.get("sha256")}
+
+
+def _boundary_edge_is_camera_supported(a: list[float], b: list[float],
+                                       points: list[list[float]], spacing: float) -> bool:
+    """Check whether a proposed footprint edge stays near observed camera positions."""
+    if len(points) < 2 or spacing <= EPS:
+        return False
+    length = _distance(a, b)
+    sample_count = max(2, math.ceil(length / max(spacing * 0.5, EPS)))
+    for index in range(sample_count + 1):
+        t = index / sample_count
+        sample = [a[axis] + (b[axis] - a[axis]) * t for axis in range(2)]
+        if min(_distance(sample, point[:2]) for point in points) > spacing:
+            return False
+    return True
+
+
+def _polygon_perimeter(polygon: list[list[float]]) -> float:
+    return sum(_distance(polygon[index], polygon[(index + 1) % len(polygon)])
+               for index in range(len(polygon))) if polygon else 0.0
+
+
 def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = None) -> dict[str, Any]:
     """Generate an explicitly unapproved navigation proposal from normalized SfM evidence."""
     config = config or {}
@@ -1065,6 +1413,24 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
         raise ValueError("scene_type must be one of auto, indoor, or outdoor")
     frame = dict(source.get("coordinate_frame", {}))
     scale, rotation, translation, transform_verified = _transform_spec(frame)
+    transform_matrix = [[scale * rotation[i][j] for j in range(3)] + [translation[i]] for i in range(3)] + [[0, 0, 0, 1]]
+    baseline_navigation, baseline_provenance = _compatible_baseline_navigation(source, transform_matrix)
+    baseline_limits = None
+    if baseline_navigation:
+        baseline_regions = baseline_navigation.get("regions", [])
+        baseline_region = max(baseline_regions,
+                              key=lambda item: item.get("evidence", {}).get("candidate_station_count", 0),
+                              default=None)
+        baseline_exploration = (baseline_region or {}).get("exploration_limits") or {}
+        baseline_minimum = baseline_exploration.get("minimum_height") or {}
+        baseline_maximum = baseline_exploration.get("maximum_height") or {}
+        if (baseline_minimum.get("value") is not None and baseline_maximum.get("value") is not None and
+                float(baseline_maximum["value"]) > float(baseline_minimum["value"])):
+            baseline_limits = {"minimum": float(baseline_minimum["value"]),
+                               "maximum": float(baseline_maximum["value"]),
+                               "source_region_id": baseline_region["id"],
+                               "minimum_evidence": baseline_minimum.get("evidence", {}),
+                               "maximum_evidence": baseline_maximum.get("evidence", {})}
     plane = source.get("floor_plane") or source.get("geometry", {}).get("floor_plane") or config.get("floor_plane")
     warnings: list[dict[str, str]] = []
     if plane:
@@ -1128,6 +1494,16 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
         projected.append({"camera_id": row.get("camera_id"), "image_id": image_id,
                           "image_name": row.get("image_name"), "station_id": station_id,
                           "image_keys": row.get("imageKeys", row.get("image_keys", [])),
+                          "capture_timestamp": row.get("capture_timestamp"),
+                          "capture_order_index": row.get("capture_order_index"),
+                          "capture_metadata_status": row.get("capture_metadata_status"),
+                          "prepared_image_orientation": row.get("prepared_image_orientation"),
+                          "prepared_image_width": row.get("prepared_image_width"),
+                          "prepared_image_height": row.get("prepared_image_height"),
+                          "registered": row.get("registered", True),
+                          "point2d_observation_count": row.get("point2d_observation_count"),
+                          "triangulated_observation_count": row.get("triangulated_observation_count"),
+                          "triangulated_observation_fraction": row.get("triangulated_observation_fraction"),
                           "center_viewer": center, "forward_viewer": forward,
                           "trust_explicit": explicit_trust, "trust_reason": trust_reason,
                           "region_hint": row.get("region_id", row.get("region_hint")),
@@ -1165,7 +1541,17 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     if not math.isfinite(connection_scale) or connection_scale <= 0:
         raise ValueError("region_connection_scale must be finite and greater than zero")
     connection_radius = max(spacing * connection_scale, EPS)
-    components = _components(retained, connection_radius)
+    spatial_components = _components(retained, connection_radius)
+    spatial_component_for_station = {
+        row["station_id"]: f"camera-component-{index:02d}"
+        for index, component in enumerate(spatial_components, 1) for row in component
+    }
+    components, trajectory_reconciliation = _reconcile_camera_trajectory(
+        retained, spatial_components, connection_radius, config)
+    reconciled_component_for_station = {
+        row["station_id"]: f"reconciled-camera-component-{index:02d}"
+        for index, component in enumerate(components, 1) for row in component
+    }
     alpha_scale = float(config.get("alpha_scale", 1.6))
     if not math.isfinite(alpha_scale) or alpha_scale <= 0:
         raise ValueError("alpha_scale must be finite and greater than zero")
@@ -1199,9 +1585,6 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     region_station_assignments: dict[str, list[dict[str, Any]]] = {}
     unresolved_components: list[dict[str, Any]] = []
     excluded_components: list[dict[str, Any]] = []
-    component_for_station = {row["station_id"]: f"camera-component-{component_index:02d}"
-                             for component_index, component in enumerate(components, 1)
-                             for row in component}
     for index, component in enumerate(components, 1):
         component_id = f"camera-component-{index:02d}"
         component_points = [row["uvh"] for row in component]
@@ -1216,6 +1599,14 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
         if len(polygon) < 3 or not _simple_polygon(polygon):
             polygon = _convex_hull(component_points); algorithm = "CONVEX_HULL_REVIEW_FALLBACK"
             warnings.append({"code": "CONCAVE_FOOTPRINT_UNSUPPORTED", "severity": "REVIEW", "message": "Alpha-shape topology was incomplete; convex fallback is a review proposal and is never auto-approved."})
+        hull = _convex_hull(component_points)
+        if (trajectory_reconciliation["capture_order_status"] == "VERIFIED_EXPLICIT_ORDER" and
+                len(spatial_components) > len(components) and len(polygon) >= 3 and
+                len(polygon) == len(hull) and
+                abs(abs(_signed_area(polygon)) - abs(_signed_area(hull))) <= max(1e-5, abs(_signed_area(hull)) * 1e-6)):
+            algorithm = "CAMERA_TRAJECTORY_CONVEX_ENVELOPE_REVIEW"
+            warnings.append({"code": "RECONCILED_ENVELOPE_USES_CONVEX_FALLBACK", "severity": "REVIEW",
+                             "message": "The merged trajectory points did not produce a stable concave boundary; a convex camera envelope is proposed for review and may include unsupported interior or corner area."})
         if _signed_area(polygon) < 0:
             polygon.reverse()
         if len(polygon) < 3 or not _simple_polygon(polygon):
@@ -1249,6 +1640,22 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                                             "physical_surface": False},
                                       "source": "operator-configured local navigation heights",
                                       "physical_ceiling_inferred": False}
+        elif baseline_limits and len(components) == 1:
+            exploration_limits = {
+                "minimum_height": {"value": baseline_limits["minimum"],
+                                   "classification": "PRESERVED_PRIOR_REVIEW_PROPOSAL",
+                                   "physical_surface": False,
+                                   "evidence": baseline_limits["minimum_evidence"]},
+                "maximum_height": {"value": baseline_limits["maximum"],
+                                   "classification": "PRESERVED_PRIOR_REVIEW_PROPOSAL",
+                                   "physical_surface": False,
+                                   "evidence": baseline_limits["maximum_evidence"]},
+                "source": "vertical exploration values retained from a proposal for the same reconstruction and viewer transform; broader v2 footprint requires review",
+                "baseline_proposal_id": baseline_provenance.get("proposal_id"),
+                "baseline_region_id": baseline_limits["source_region_id"],
+                "physical_ceiling_inferred": False}
+            warnings.append({"code": "VERTICAL_LIMITS_PRESERVED_FROM_PRIOR_PROPOSAL", "severity": "REVIEW",
+                             "message": "Previous non-metric exploration limits were retained for comparison; the expanded camera envelope has weaker ground support in some areas and needs operator review."})
         local_supported = [row["uvh"][2] for row in sparse_geometry
                            if row["track_length"] >= int(config.get("minimum_ground_track_length", 3)) and
                            _point_in_polygon(row["uvh"][:2], polygon)]
@@ -1294,13 +1701,8 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                         "polygon_uv": polygon, "reason": reason,
                                         "ground_plane_candidate": ground_candidate,
                                         "candidate_station_count": len(component)})
-            for row in component:
-                pose_exclusions.append({"camera_id": row.get("camera_id"), "image_id": row.get("image_id"),
-                                        "image_name": row.get("image_name"), "station_id": row.get("station_id"),
-                                        "navigation_local_uvh": row["uvh"],
-                                        "reason": "camera_component_excluded_insufficient_vertical_or_ground_geometry"})
             warnings.append({"code": "CAMERA_COMPONENT_EXCLUDED_INSUFFICIENT_GEOMETRY", "severity": "REVIEW",
-                             "message": f"{len(component)} camera position(s) in {component_id} are excluded because the available geometry does not support a bounded free-XYZ exploration volume."})
+                             "message": f"{len(component)} registered camera position(s) in {component_id} remain pose evidence, but their region is not included in a bounded free-XYZ proposal because lower/vertical geometry support is insufficient."})
             if scene_type == "outdoor":
                 warnings.append({"code": "OPEN_AIR_VERTICAL_LIMIT_UNVERIFIED", "severity": "REVIEW",
                                  "message": f"No reviewed lower and upper exploration limits are available for {component_id}; no physical ceiling was inferred."})
@@ -1343,8 +1745,18 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                "boundary_margin_units": margin_units_used,
                                "ground_plane_candidate": ground_candidate,
                                "camera_occupied_footprint": "Camera locations are spatial evidence only; the footprint interior is not presumed traversable without review."},
-                  "boundary_segments": [{"classification": "CAMERA_DERIVED", "inferred_margin_units": margin_units_used,
-                                         "geometry_supported": False} for _ in polygon],
+                  "boundary_segments": [
+                      {"start_uv": polygon[edge_index],
+                       "end_uv": polygon[(edge_index + 1) % len(polygon)],
+                       "length_units": _distance(polygon[edge_index], polygon[(edge_index + 1) % len(polygon)]),
+                       "classification": ("CAMERA_POSITION_SUPPORTED_ENVELOPE" if
+                                          _boundary_edge_is_camera_supported(
+                                              polygon[edge_index], polygon[(edge_index + 1) % len(polygon)],
+                                              component_points, component_spacing)
+                                          else "INFERRED_ENVELOPE_EDGE_REQUIRES_REVIEW"),
+                       "inferred_margin_units": margin_units_used,
+                       "geometry_supported": False}
+                      for edge_index in range(len(polygon))],
                   "vertical_bounds": {"floor": {"value": floor_value, "classification": floor_class, "clearance": default_floor_clearance, "evidence": floor_evidence},
                                        "ceiling": None if ceiling_value is None else {"value": ceiling_value, "classification": ceiling_class, "clearance": default_ceiling_clearance, "evidence": ceiling_evidence}},
                   "exploration_limits": exploration_limits,
@@ -1411,11 +1823,18 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                          "regionId": next((rid for rid, members in region_station_assignments.items() if row in members), None),
                          "imageKeys": row["image_keys"]})
     camera_trajectory = []
+    capture_order_by_station = {station_id: index for index, station_id in
+                                enumerate(trajectory_reconciliation.get("ordered_station_ids", []))}
+    baseline_camera_status_by_image = {
+        row.get("image_name"): row.get("coverage_status")
+        for row in (baseline_navigation or {}).get("coverage_diagnostics", {}).get("camera_trajectory", [])
+        if row.get("image_name")
+    }
     for row in projected:
         if row["station_id"] in candidate_station_ids:
             coverage_status = "INCLUDED_PROPOSAL"
         elif row["station_id"] in insufficient_station_ids:
-            coverage_status = "EXCLUDED_INSUFFICIENT_GEOMETRY"
+            coverage_status = "POSE_RETAINED_GROUND_SUPPORT_INSUFFICIENT"
         elif row["station_id"] in unresolved_station_ids:
             coverage_status = "UNRESOLVED_FOOTPRINT"
         else:
@@ -1423,9 +1842,140 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
         camera_trajectory.append({"station_id": row["station_id"], "image_id": row["image_id"],
                                   "image_name": row["image_name"], "viewer_center": row["center_viewer"],
                                   "viewer_forward": row["forward_viewer"], "navigation_local_uvh": row["uvh"],
-                                  "component_id": component_for_station.get(row["station_id"]),
+                                  "component_id": reconciled_component_for_station.get(row["station_id"]),
+                                  "spatial_component_id": spatial_component_for_station.get(row["station_id"]),
+                                  "capture_sequence_index": capture_order_by_station.get(row["station_id"]),
+                                  "capture_timestamp": row.get("capture_timestamp"),
+                                  "capture_metadata_status": row.get("capture_metadata_status"),
+                                  "prepared_image_orientation": row.get("prepared_image_orientation"),
+                                  "prepared_image_dimensions": ([row.get("prepared_image_width"),
+                                                                  row.get("prepared_image_height")]
+                                                                 if row.get("prepared_image_width") is not None else None),
+                                  "registered": row.get("registered", True),
+                                  "point2d_observation_count": row.get("point2d_observation_count"),
+                                  "triangulated_observation_count": row.get("triangulated_observation_count"),
+                                  "triangulated_observation_fraction": row.get("triangulated_observation_fraction"),
+                                  "baseline_coverage_status": baseline_camera_status_by_image.get(row.get("image_name")),
                                   "coverage_status": coverage_status,
                                   "pose_trust": "TRUSTED" if row["trust_explicit"] else "PROVISIONAL"})
+    def proposal_metrics(proposal: dict[str, Any] | None) -> dict[str, Any]:
+        if not proposal:
+            return {"status": "NOT_AVAILABLE"}
+        proposal_coverage = proposal.get("coverage_diagnostics", {})
+        pose_evidence = proposal.get("pose_evidence", {})
+        proposal_regions = proposal.get("regions", [])
+        excluded_camera_components = proposal_coverage.get("excluded_camera_components", [])
+        polygons = [region.get("polygon_uv", []) for region in proposal_regions]
+        areas = [abs(_signed_area(polygon)) for polygon in polygons if len(polygon) >= 3]
+        vertices = sum(len(polygon) for polygon in polygons)
+        grounds = [region.get("geometry_candidates", {}).get("ground_plane", {})
+                   for region in proposal_regions]
+        limits = [region.get("exploration_limits", {}) for region in proposal_regions]
+        registered_count = int(pose_evidence.get("input_pose_count") or 0)
+        included_count = int(pose_evidence.get("used_camera_station_count") or 0)
+        return {"status": proposal.get("status"),
+                "registered_camera_count": registered_count,
+                "included_camera_positions": included_count,
+                "excluded_camera_positions": max(0, registered_count - included_count),
+                "pose_excluded_camera_positions": pose_evidence.get("excluded_pose_count", 0),
+                "geometry_unbounded_camera_positions": pose_evidence.get("geometry_unbounded_station_count",
+                                                                             max(0, registered_count - included_count)),
+                "connected_components": proposal_coverage.get("camera_component_count"),
+                "candidate_regions": len(proposal_regions),
+                "footprint_area_units2": sum(areas),
+                "boundary_vertices": vertices,
+                "boundary_perimeter_units": sum(_polygon_perimeter(polygon) for polygon in polygons if len(polygon) >= 3),
+                "ground_support": [{"status": ground.get("status"),
+                                    "candidate_points": ground.get("evidence", {}).get("candidate_point_count"),
+                                    "lower_points": ground.get("evidence", {}).get("lower_point_count"),
+                                    "inliers": ground.get("evidence", {}).get("inlier_count"),
+                                    "occupied_grid_fraction": ground.get("evidence", {}).get("footprint_grid_occupied_fraction")}
+                                   for ground in grounds],
+                "excluded_camera_components": [{"component_id": component.get("component_id"),
+                                                  "camera_count": component.get("candidate_station_count"),
+                                                  "reason": component.get("reason"),
+                                                  "ground_candidate": component.get("ground_plane_candidate", {})}
+                                                 for component in excluded_camera_components],
+                "vertical_limits_units": [[(limit.get("minimum_height") or {}).get("value"),
+                                            (limit.get("maximum_height") or {}).get("value")]
+                                           for limit in limits],
+                "region_polygons_uv": polygons}
+    baseline_metrics = proposal_metrics(baseline_navigation)
+    v2_areas = [abs(_signed_area(region["polygon_uv"])) for region in regions]
+    v2_perimeter = sum(_polygon_perimeter(region["polygon_uv"]) for region in regions)
+    v2_ground = [region.get("geometry_candidates", {}).get("ground_plane", {}) for region in regions]
+    v2_limits = [region.get("exploration_limits") or {} for region in regions]
+    sequence_metrics = trajectory_reconciliation.get("sequence", {})
+    v2_metrics = {"status": "NAVIGATION_NEEDS_REVIEW",
+                  "registered_camera_count": len(projected),
+                  "included_camera_positions": len(candidate_rows),
+                  "excluded_camera_positions": max(0, len(projected) - len(candidate_rows)),
+                  "pose_excluded_camera_positions": len(pose_exclusions),
+                  "geometry_unbounded_camera_positions": len(insufficient_station_ids),
+                  "connected_components": len(components),
+                  "candidate_regions": len(regions),
+                  "footprint_area_units2": sum(v2_areas),
+                  "boundary_vertices": sum(len(region["polygon_uv"]) for region in regions),
+                  "boundary_perimeter_units": v2_perimeter,
+                  "capture_gap_count": (len(sequence_metrics.get("suspected_gap_edges", [])) +
+                                        int(sequence_metrics.get("route_endpoint_gap") is not None)),
+                  "ground_support": [{"status": ground.get("status"),
+                                      "candidate_points": ground.get("evidence", {}).get("candidate_point_count"),
+                                      "lower_points": ground.get("evidence", {}).get("lower_point_count"),
+                                      "inliers": ground.get("evidence", {}).get("inlier_count"),
+                                      "occupied_grid_fraction": ground.get("evidence", {}).get("footprint_grid_occupied_fraction")}
+                                     for ground in v2_ground],
+                  "vertical_limits_units": [[(limit.get("minimum_height") or {}).get("value"),
+                                              (limit.get("maximum_height") or {}).get("value")]
+                                             for limit in v2_limits],
+                  "camera_support_confidence": "MEASURED_REGISTERED_POSES; per-camera track observations reported separately",
+                  "interior_confidence": ("INFERRED_INTERIOR_WITH_SPARSE_GEOMETRY_SUPPORT; DOES_NOT_PROVE_TRAVERSABILITY"
+                                          if (sequence_metrics.get("polar_angular_coverage_degrees_about_camera_centroid") or 0) >= 300 and
+                                          sum(region.get("evidence", {}).get("sparse_geometry_observation", {}).get(
+                                              "points_with_track_length_minimum_inside_candidate", 0) for region in regions) > 0
+                                          else "INTERIOR_SUPPORT_INSUFFICIENT_OR_UNCERTAIN")}
+    if baseline_navigation:
+        baseline_area = baseline_metrics.get("footprint_area_units2") or 0.0
+        v2_metrics["area_change_from_v1_percent"] = ((v2_metrics["footprint_area_units2"] - baseline_area) / baseline_area * 100.0
+                                                     if baseline_area > EPS else None)
+        v2_metrics["camera_positions_recovered_from_v1"] = max(
+            0, int(v2_metrics["included_camera_positions"] or 0) -
+            int(baseline_metrics.get("included_camera_positions") or 0))
+    trajectory_reconciliation["baseline_proposal"] = baseline_provenance
+    prior_exclusions = baseline_metrics.get("excluded_camera_components", [])
+    prior_exclusion_count = sum(int(row.get("camera_count") or 0) for row in prior_exclusions)
+    prior_ground_candidates = [row.get("ground_candidate", {}) for row in prior_exclusions]
+    prior_ground_detail = next((candidate for candidate in prior_ground_candidates
+                                if candidate.get("minimum_required_inliers") is not None), {})
+    baseline_explanation = (
+        f"The prior proposal split camera positions at its spatial-component radius ({connection_radius:.6g} scene units here). "
+        f"It then withheld a bounded region for {prior_exclusion_count} position(s) because local ground support did not meet its configured evidence checks"
+        + (f" ({prior_ground_detail.get('candidate_point_count', 0)} candidate points versus a {prior_ground_detail['minimum_required_inliers']} inlier minimum in the reported component). "
+           if prior_ground_detail else ". ")
+        + "That geometry gate withheld a navigation volume; it did not invalidate registered camera poses."
+        if prior_exclusions else
+        "No compatible prior proposal reported camera components withheld for geometry support."
+    )
+    trajectory_reconciliation["baseline_exclusion_explanation"] = {
+        "baseline_included_camera_positions": baseline_metrics.get("included_camera_positions"),
+        "baseline_excluded_camera_positions": baseline_metrics.get("excluded_camera_positions"),
+        "baseline_excluded_components": baseline_metrics.get("excluded_camera_components", []),
+        "spatial_connection_radius_units": connection_radius,
+        "component_transition_edges": sequence_metrics.get("component_transition_edges", []),
+        "interpretation": baseline_explanation,
+    }
+    trajectory_reconciliation["strategy_comparison"] = {
+        "strategy_a_existing_v1": baseline_metrics,
+        "strategy_b_reconciled_camera_envelope_v2": v2_metrics,
+        "strategy_c_ordered_trajectory_corridor": {
+            **trajectory_reconciliation.get("corridor_strategy", {}),
+            "region_count": None,
+            "boundary_perimeter_units": None,
+            "interpretation": "Shows the observed camera path with a scale-relative half-spacing buffer; it is too narrow to represent the whole playground interior and remains a comparison strategy only.",
+        },
+        "human_review_required": True,
+        "no_strategy_auto_approved": True,
+    }
     if not transform_verified:
         warnings.append({"code": "VIEWER_ALIGNMENT_UNVERIFIED", "severity": "BLOCKING", "message": "The SfM-to-viewer transform is mathematically valid but not marked verified against the selected model's transform."})
     if not basis:
@@ -1442,7 +1992,6 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
     source_rec.setdefault("identity", source.get("reconstruction_identity", {}))
     source_rec.setdefault("coordinate_frame", frame)
     source_rec["sparse_point_count"] = source.get("sparse_point_count", len(source.get("sparse_points", [])))
-    transform_matrix = [[scale * rotation[i][j] for j in range(3)] + [translation[i]] for i in range(3)] + [[0, 0, 0, 1]]
     frame_doc = {"source_frame": frame.get("name", frame.get("convention", "UNSPECIFIED_SFM_FRAME")),
                  "navigation_frame": ("floor-aligned local u/v/h from explicitly supplied geometric plane"
                                       if plane_viewer else
@@ -1464,7 +2013,20 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                 "navigation_local_uvh": row["uvh"], "viewer_center": row["center_viewer"],
                 "region_id": next((rid for rid, members in region_station_assignments.items() if row in members), None),
                 "pose_trust": "TRUSTED" if row["trust_explicit"] else "PROVISIONAL",
-                "trust_reason": row["trust_reason"]}
+                "trust_reason": row["trust_reason"],
+                "registered": row.get("registered", True),
+                "point2d_observation_count": row.get("point2d_observation_count"),
+                "triangulated_observation_count": row.get("triangulated_observation_count"),
+                "triangulated_observation_fraction": row.get("triangulated_observation_fraction"),
+                "capture_timestamp": row.get("capture_timestamp")}
+    registered_position_candidates = []
+    for row in projected:
+        record = center_record(row)
+        record["spatial_component_id"] = spatial_component_for_station.get(row["station_id"])
+        record["reconciled_component_id"] = reconciled_component_for_station.get(row["station_id"])
+        record["coverage_status"] = next((item["coverage_status"] for item in camera_trajectory
+                                           if item["station_id"] == row["station_id"]), "UNRESOLVED_FOOTPRINT")
+        registered_position_candidates.append(record)
     candidate_centers = [center_record(row) for row in candidate_rows]
     trusted_centers = [center for center in candidate_centers if center["pose_trust"] == "TRUSTED"]
     provisional_centers = [center for center in candidate_centers if center["pose_trust"] == "PROVISIONAL"]
@@ -1475,11 +2037,15 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                 "used_camera_station_count": len(candidate_rows), "excluded_pose_count": len(pose_exclusions), "excluded_poses": pose_exclusions,
                 "unresolved_components": unresolved_components,
                 "candidate_camera_centers": candidate_centers,
+                "registered_camera_position_candidates": registered_position_candidates,
                 "trusted_camera_centers": trusted_centers,
                 "provisional_camera_centers": provisional_centers,
                 "provisional_pose_reviewed": False,
+                "camera_registration_confidence": trajectory_reconciliation["camera_registration_confidence"],
                 "outlier_method": {"algorithm": "isolated nearest-neighbor screening", "factor": outlier_factor, "reference_spacing_units": spacing,
-                                   "note": "Isolated poses are retained for diagnosis; disconnected room clusters remain separate regions."},
+                                   "note": "Only explicit trust failures, invalid poses, and isolated spatial outliers are pose exclusions. Lack of ground or vertical support can withhold a navigation region while retaining registered camera positions as trajectory evidence."},
+                "geometry_unbounded_station_count": len(insufficient_station_ids),
+                "geometry_unbounded_station_ids": sorted(insufficient_station_ids),
                 "camera_intrinsics_available": bool(source.get("camera_models")), "sparse_point_count": source_rec.get("sparse_point_count", 0)}
     pose_doc["vertical_spread"] = {"height_range_units": vertical_spread, "review_threshold_units": vertical_limit,
                                     "possible_multi_level_or_slope": vertical_spread > vertical_limit if vertical_limit > 0 else False,
@@ -1498,7 +2064,7 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                      "multi_level_suspected": pose_doc["vertical_spread"]["possible_multi_level_or_slope"],
                                      "requires_review_when_suspected": True},
                 "coverage_assumptions": {"scene_type": scene_type,
-                                         "boundary": "CAMERA_TRAJECTORY_ALPHA_SHAPE_PROPOSAL",
+                                         "boundary": "RECONCILED_CAMERA_TRAJECTORY_ENVELOPE_REQUIRES_REVIEW",
                                          "coordinate_up_axis": frame.get("up_axis", "UNSPECIFIED"),
                                          "ground_plane": ("PHOTO_SFM_CANDIDATE_REQUIRES_REVIEW" if any(r.get("geometry_candidates", {}).get("ground_plane", {}).get("status") == "PROPOSED" for r in regions) else
                                                           "GEOMETRY_INPUT_REQUIRED" if not plane_viewer else
@@ -1519,6 +2085,7 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                                "Confirm the virtual upper exploration limit; it is not a ceiling",
                                                "Confirm any doorway transition", "Confirm the default camera and free-XYZ bounds"]},
                 "coverage_diagnostics": {"camera_component_count": len(components),
+                                         "spatial_camera_component_count": len(spatial_components),
                                          "supported_component_count": len(regions),
                                          "excluded_camera_components": excluded_components,
                                          "camera_candidate_count": len(projected),
@@ -1527,23 +2094,32 @@ def generate_navigation(source: dict[str, Any], config: dict[str, Any] | None = 
                                          "sparse_point_count": len(sparse_input),
                                          "sparse_point_track_length_metadata_available": len(sparse_tracks) == len(sparse_input),
                                          "camera_trajectory": camera_trajectory,
+                                         "trajectory_reconciliation": trajectory_reconciliation,
+                                         "image_orientation_evidence": source.get("image_orientation_evidence", {
+                                             "status": "NOT_AVAILABLE",
+                                             "interpretation": "Image metadata was not used to alter camera poses."}),
                                          "median_nearest_neighbor_spacing_units": spacing,
                                          "projected_camera_bounds_uvh": ({"minimum": [min(row["uvh"][axis] for row in projected) for axis in range(3)],
                                                                           "maximum": [max(row["uvh"][axis] for row in projected) for axis in range(3)]}
                                                                          if projected else None),
                                          "component_footprints": [{"component_id": f"camera-component-{index:02d}",
+                                                                    "reconciled_component_id": reconciled_component_for_station.get(component[0]["station_id"]),
                                                                     "camera_count": len(component),
                                                                     "median_nearest_neighbor_spacing_units": _median_spacing([row["uvh"] for row in component]),
                                                                     "convex_hull_area_square_units": abs(_signed_area(_convex_hull([row["uvh"] for row in component]))) if len(component) >= 3 else 0.0,
-                                                                    "proposal_status": ("INCLUDED_PROPOSAL" if any(row["station_id"] in candidate_station_ids for row in component) else
+                                                                    "previous_proposal_camera_status_counts": dict(Counter(
+                                                                        baseline_camera_status_by_image.get(row.get("image_name"), "NOT_IN_BASELINE")
+                                                                        for row in component)),
+                                                                    "proposal_status": ("REINSTATED_CAMERA_POSITION_EVIDENCE" if all(row["station_id"] in candidate_station_ids for row in component) else
                                                                                         "EXCLUDED_INSUFFICIENT_GEOMETRY" if any(row["station_id"] in insufficient_station_ids for row in component) else
                                                                                         "UNRESOLVED_FOOTPRINT")}
-                                                                   for index, component in enumerate(components, 1)],
+                                                                   for index, component in enumerate(spatial_components, 1)],
                                          "aligned_lidar_used": False},
                 "validation": {}, "provenance": {"generator": "exhibition_archive.navigation", "generator_version": "0.1.0",
-                                                  "algorithm": "camera-neighbor components + 2D alpha shape with convex review fallback", "configuration": config,
+                                                  "algorithm": "spatial camera components reconciled by explicit capture order and measured continuity; camera envelope remains a review proposal", "configuration": config,
                                                   "input_station_ids": [row["station_id"] for row in projected],
                                                   "source_files": source.get("source_files", []),
+                                                  "baseline_proposal": baseline_provenance,
                                                   "aligned_lidar_diagnostics": source.get("aligned_lidar_diagnostics", {"status": "NOT_AVAILABLE"}),
                                                   "derived_without_external_services": True}}
     result = validate_navigation_artifact(artifact)
@@ -1677,22 +2253,28 @@ def render_navigation_review_html(artifact: dict[str, Any]) -> str:
     warnings = artifact.get("review", {}).get("warnings", [])
     warning_items = "".join(f"<li><b>{html.escape(item.get('severity','INFO'))}</b> {html.escape(item.get('message',''))}</li>" for item in warnings)
     page = r'''<!doctype html><html lang="en"><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1"><title>Navigation proposal review</title>
-<style>body{font:15px system-ui;margin:0;background:#101827;color:#e7edf6;display:grid;grid-template-columns:minmax(500px,2fr) minmax(320px,1fr);height:100vh}main{padding:18px;min-height:0;display:flex;flex-direction:column}aside{padding:20px;background:#192538;overflow:auto}h1{font-size:20px;margin:0 0 12px}p,li{line-height:1.5;color:#c4d0df}svg{width:100%;height:100%;min-height:400px;background:#0b1220;border:1px solid #33445c;border-radius:8px;touch-action:none}.region{fill:#53a5b344;stroke:#6bc5da;stroke-width:2;vector-effect:non-scaling-stroke}.vertex{fill:#ffcc66;stroke:#231b0b;stroke-width:1;vector-effect:non-scaling-stroke;cursor:move}.camera{fill:#c9e8ff;opacity:.8;pointer-events:none}.cameraProvisional{fill:#ff9b65;opacity:.9;pointer-events:none}.cameraExcluded{fill:#808a98;opacity:.8;pointer-events:none}.region-label{fill:white;font-size:14px}button{background:#357a89;border:0;color:white;border-radius:6px;padding:10px 14px;font-size:14px;cursor:pointer;margin:8px 4px 8px 0}label{display:block;margin-top:12px;color:#ced9e8}input,textarea{box-sizing:border-box;width:100%;padding:7px;background:#101827;border:1px solid #52647d;border-radius:4px;color:white}.tag{color:#f0c86f}.tiny{font-size:12px;color:#94a8bf}</style>
-<body><main><h1>Top-down navigation proposal</h1><div class="tiny">Blue dots are explicitly trusted stations; orange dots are provisional and grey dots are excluded. Drag vertices, review exploration limits and save a versioned draft to the local Engine.</div><svg id="map" viewBox="0 0 1000 760" aria-label="Top-down navigation proposal"></svg></main><aside><h1 id="title"></h1><p id="summary"></p><ul>WARNINGS_PLACEHOLDER</ul><p id="frame"></p><label><input id="transformConfirmed" type="checkbox"> I verified this SfM-to-viewer transform against the selected model.</label><div id="bounds"></div><label id="groundReviewBlock"><input id="groundCandidateReviewed" type="checkbox"> I inspected and accept the photo-SfM lower-limit candidate as suitable for this exploration envelope.</label><h2>Room connection</h2><label>From region <select id="fromRegion"></select></label><label>To region <select id="toRegion"></select></label><button id="portalButton">Draw doorway portal</button><p id="portalStatus" class="tiny">No portal edit active.</p><h2>Initial camera</h2><label>Default camera station <select id="defaultCamera"></select></label><label><input id="acceptProvisionalPoses" type="checkbox"> I reviewed and accept every provisional camera pose as trusted evidence.</label><h2>Decision</h2><label>Reviewer identity <input id="reviewer" value="Local reviewer"></label><label>Rationale <textarea id="rationale" rows="3">Reviewed navigation boundary and exploration limits.</textarea></label><p id="reviewStatus" class="tag">Engine approval state: CURRENT_ARTIFACT_STATUS</p><button id="saveDraft">Save draft to Engine</button><button id="approveNavigation">Approve navigation</button><button id="rejectNavigation">Reject navigation</button><button id="download">Download corrected navigation JSON</button><p class="tiny">Drafts are versioned in the project. Approval runs Engine geometry checks and records the exact artifact hash, reviewer, rationale, timestamp and input fingerprint.</p></aside>
+<style>body{font:15px system-ui;margin:0;background:#101827;color:#e7edf6;display:grid;grid-template-columns:minmax(500px,2fr) minmax(320px,1fr);height:100vh}main{padding:18px;min-height:0;display:flex;flex-direction:column}aside{padding:20px;background:#192538;overflow:auto}h1{font-size:20px;margin:0 0 12px}p,li{line-height:1.5;color:#c4d0df}svg{width:100%;height:100%;min-height:400px;background:#0b1220;border:1px solid #33445c;border-radius:8px;touch-action:none}.region{fill:#53a5b344;stroke:#6bc5da;stroke-width:2;vector-effect:non-scaling-stroke}.regionV1{fill:none;stroke:#e2ba51;stroke-width:2;stroke-dasharray:8 5;vector-effect:non-scaling-stroke;pointer-events:none}.pathLine{stroke:#8296a6;stroke-width:1.5;vector-effect:non-scaling-stroke;pointer-events:none}.gapLine{stroke:#ffda63;stroke-width:3;stroke-dasharray:8 5;vector-effect:non-scaling-stroke;pointer-events:none}.endpointLine{stroke:#fa7d69;stroke-width:2;stroke-dasharray:4 5;vector-effect:non-scaling-stroke;pointer-events:none}.vertex{fill:#ffcc66;stroke:#231b0b;stroke-width:1;vector-effect:non-scaling-stroke;cursor:move}.camera{fill:#73caff;opacity:.85;pointer-events:all}.cameraProvisional{fill:#ffbd65;opacity:.92;pointer-events:all}.cameraPreviouslyExcluded{fill:#fb6e76;opacity:.92;pointer-events:all}.cameraExcluded{fill:#808a98;opacity:.8;pointer-events:all}.region-label{fill:white;font-size:14px}button{background:#357a89;border:0;color:white;border-radius:6px;padding:10px 14px;font-size:14px;cursor:pointer;margin:8px 4px 8px 0}label{display:block;margin-top:12px;color:#ced9e8}input,textarea{box-sizing:border-box;width:100%;padding:7px;background:#101827;border:1px solid #52647d;border-radius:4px;color:white}.tag{color:#f0c86f}.tiny{font-size:12px;color:#94a8bf}.comparison{width:100%;border-collapse:collapse;font-size:12px}.comparison td,.comparison th{border-bottom:1px solid #394b61;padding:5px;text-align:left}.review-note{padding:9px;background:#33291b;border:1px solid #755c34;border-radius:5px}</style>
+<body><main><h1>Top-down navigation proposal</h1><div class="tiny">All registered camera positions are shown by capture order. Blue dots are classified; amber dots are provisional; red dots were omitted from v1 for weak local ground support, not because their registered poses were invalid. Drag candidate v2 vertices to edit.</div><svg id="map" viewBox="0 0 1000 760" aria-label="Top-down navigation proposal and camera trajectory"></svg></main><aside><h1 id="title"></h1><p id="summary"></p><div id="trajectorySummary"></div><ul>WARNINGS_PLACEHOLDER</ul><p id="frame"></p><label><input id="transformConfirmed" type="checkbox"> I verified this SfM-to-viewer transform against the selected model.</label><div id="bounds"></div><label id="groundReviewBlock"><input id="groundCandidateReviewed" type="checkbox"> I inspected and accept the photo-SfM lower-limit candidate as suitable for this exploration envelope.</label><div id="roomControls"><h2>Room connection</h2><label>From region <select id="fromRegion"></select></label><label>To region <select id="toRegion"></select></label><button id="portalButton">Draw doorway portal</button><p id="portalStatus" class="tiny">No portal edit active.</p></div><h2>Initial camera</h2><label>Default camera station <select id="defaultCamera"></select></label><label><input id="acceptProvisionalPoses" type="checkbox"> I reviewed and accept every provisional camera pose as trusted evidence.</label><h2>Decision</h2><label>Reviewer identity <input id="reviewer" value="Local reviewer"></label><label>Rationale <textarea id="rationale" rows="3">Reviewed navigation boundary and exploration limits.</textarea></label><p id="reviewStatus" class="tag">Engine approval state: CURRENT_ARTIFACT_STATUS</p><button id="saveDraft">Save draft to Engine</button><button id="approveNavigation">Approve navigation</button><button id="rejectNavigation">Reject navigation</button><button id="download">Download corrected navigation JSON</button><p class="tiny">Drafts are versioned in the project. Approval runs Engine geometry checks and records the exact artifact hash, reviewer, rationale, timestamp and input fingerprint.</p></aside>
 <script>
 const doc=ARTIFACT_PLACEHOLDER, svg=document.querySelector('#map'), ns='http://www.w3.org/2000/svg';let expectedSha='CURRENT_ARTIFACT_SHA256',lastSavedEditorState=JSON.stringify(doc);
 document.querySelector('#title').textContent=doc.id;
-document.querySelector('#summary').textContent=`${doc.status} · ${doc.regions.length} proposed region(s) · ${doc.pose_evidence.used_camera_station_count} camera station(s) · frame scale ${doc.coordinate_frame.scale_status}`;
+document.querySelector('#summary').textContent=`${doc.status} · ${doc.regions.length} proposed region(s) · ${doc.pose_evidence.used_camera_station_count} camera positions included · frame scale ${doc.coordinate_frame.scale_status}`;
 document.querySelector('#frame').textContent=`Source frame: ${doc.coordinate_frame.source_frame} · Viewer frame: ${doc.coordinate_frame.viewer_frame} · uniform scale ${doc.coordinate_frame.uniform_scale} · transform verified: ${doc.coordinate_frame.viewer_transform_verified}`;
 document.querySelector('#transformConfirmed').checked=!!doc.coordinate_frame.viewer_transform_verified;
+const reconciliation=doc.coverage_diagnostics?.trajectory_reconciliation??{},sequence=reconciliation.sequence??{},comparison=reconciliation.strategy_comparison??{},v1=comparison.strategy_a_existing_v1??{},v2=comparison.strategy_b_reconciled_camera_envelope_v2??{},corridor=comparison.strategy_c_ordered_trajectory_corridor??{};
+const n=(value,digits=2)=>Number.isFinite(Number(value))?Number(value).toFixed(digits):'—',escHtml=value=>String(value??'').replace(/[&<>"']/g,char=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[char]));
+document.querySelector('#trajectorySummary').innerHTML=`<p class="review-note"><b>Why v1 omitted positions:</b> ${escHtml(reconciliation.baseline_exclusion_explanation?.interpretation??'No compatible v1 exclusion evidence was available.')}</p><p class="review-note"><b>Trajectory reconciliation:</b> ${reconciliation.capture_order_status??'order unavailable'} · ${sequence.distinct_camera_positions??'—'} distinct positions · ${sequence.path_length_units!=null?n(sequence.path_length_units)+' scene units walked':'path length unavailable'} · ${sequence.nonadjacent_path_self_intersections??'—'} path crossings.</p><table class="comparison"><thead><tr><th>Evidence</th><th>v1</th><th>v2</th><th>Path corridor</th></tr></thead><tbody><tr><td>Included cameras</td><td>${v1.included_camera_positions??'—'}</td><td>${v2.included_camera_positions??'—'}</td><td>${doc.pose_evidence.input_pose_count}</td></tr><tr><td>Components</td><td>${v1.connected_components??'—'}</td><td>${v2.connected_components??'—'}</td><td>—</td></tr><tr><td>Footprint area</td><td>${n(v1.footprint_area_units2)}</td><td>${n(v2.footprint_area_units2)}</td><td>${n(corridor.area_units2)}</td></tr><tr><td>Boundary perimeter</td><td>${n(v1.boundary_perimeter_units)}</td><td>${n(v2.boundary_perimeter_units)}</td><td>—</td></tr><tr><td>Ground inliers</td><td>${v1.ground_support?.[0]?.inliers??'—'}</td><td>${v2.ground_support?.[0]?.inliers??'—'}</td><td>—</td></tr><tr><td>Ground grid coverage</td><td>${n((v1.ground_support?.[0]?.occupied_grid_fraction??0)*100,1)}%</td><td>${n((v2.ground_support?.[0]?.occupied_grid_fraction??0)*100,1)}%</td><td>—</td></tr></tbody></table><p class="tiny">v2 area change ${n(v2.area_change_from_v1_percent,1)}%; the extra area is an inferred interior envelope, not verified walkable ground. Decision remains pending.</p>`;
+const cameraUseSummary=document.createElement('p');cameraUseSummary.className='review-note';cameraUseSummary.textContent=`Registered camera positions outside a bounded region: v1 ${v1.excluded_camera_positions??'—'}, v2 ${v2.excluded_camera_positions??'—'}. Pose-exclusion rows recorded by v1: ${v1.pose_excluded_camera_positions??'—'}. Ground support is evaluated separately from camera registration.`;document.querySelector('#trajectorySummary').append(cameraUseSummary);
+document.querySelector('#roomControls').hidden=doc.regions.length<2&&!(doc.transitions??[]).length;
 const candidates=doc.pose_evidence.candidate_camera_centers??doc.pose_evidence.trusted_camera_centers??[],excluded=doc.pose_evidence.excluded_poses??[];
 const proposedGround=(doc.regions??[]).some(r=>r.geometry_candidates?.ground_plane?.status==='PROPOSED');document.querySelector('#groundReviewBlock').hidden=!proposedGround;document.querySelector('#groundCandidateReviewed').checked=!!doc.review?.ground_plane_reviewed;
-let all=[...candidates.map(x=>x.navigation_local_uvh),...excluded.map(x=>x.navigation_local_uvh).filter(Array.isArray),...doc.regions.flatMap(r=>r.polygon_uv)];if(!all.length)all=[[-1,-1],[1,1]];
+const trajectoryRows=(doc.coverage_diagnostics?.camera_trajectory??[]).slice().sort((a,b)=>(a.capture_sequence_index??Infinity)-(b.capture_sequence_index??Infinity));const oldV1=comparison.strategy_a_existing_v1?.region_polygons_uv??[];
+let all=[...candidates.map(x=>x.navigation_local_uvh),...excluded.map(x=>x.navigation_local_uvh).filter(Array.isArray),...doc.regions.flatMap(r=>r.polygon_uv),...oldV1.flat()];if(!all.length)all=[[-1,-1],[1,1]];
 let xs=all.map(x=>x[0]),ys=all.map(x=>x[1]),minX=Math.min(...xs),maxX=Math.max(...xs),minY=Math.min(...ys),maxY=Math.max(...ys),pad=40;
 const sx=x=>pad+(x-minX)/(maxX-minX||1)*(1000-2*pad),sy=y=>760-pad-(y-minY)/(maxY-minY||1)*(760-2*pad),ux=x=>minX+(x-pad)/(1000-2*pad)*(maxX-minX||1),uy=y=>minY+(760-pad-y)/(760-2*pad)*(maxY-minY||1);
 let drag=null,portalMode=false,portalPoints=[];
 function el(name,attrs={}){const n=document.createElementNS(ns,name);for(const [k,v] of Object.entries(attrs))n.setAttribute(k,v);return n}
-function draw(){svg.replaceChildren();for(const r of doc.regions){let pts=r.polygon_uv.map(p=>`${sx(p[0])},${sy(p[1])}`).join(' ');svg.append(el('polygon',{points:pts,class:'region'}));r.polygon_uv.forEach((p,i)=>{const v=el('circle',{cx:sx(p[0]),cy:sy(p[1]),r:7,class:'vertex','data-region':r.id,'data-index':i});svg.append(v)});const t=el('text',{x:sx(r.polygon_uv[0][0])+8,y:sy(r.polygon_uv[0][1])-8,class:'region-label'});t.textContent=r.id;svg.append(t)}for(const tr of doc.transitions??[]){const s=tr.portal?.segment_uv;if(s)svg.append(el('line',{x1:sx(s[0][0]),y1:sy(s[0][1]),x2:sx(s[1][0]),y2:sy(s[1][1]),stroke:'#ff9b65','stroke-width':5,'vector-effect':'non-scaling-stroke'}))}for(const c of candidates){svg.append(el('circle',{cx:sx(c.navigation_local_uvh[0]),cy:sy(c.navigation_local_uvh[1]),r:2.6,class:c.pose_trust==='PROVISIONAL'?'cameraProvisional':'camera'}))}for(const c of excluded){if(c.navigation_local_uvh?.length===3)svg.append(el('circle',{cx:sx(c.navigation_local_uvh[0]),cy:sy(c.navigation_local_uvh[1]),r:2.6,class:'cameraExcluded'}))}}
+function draw(){svg.replaceChildren();for(const polygon of oldV1){let pts=polygon.map(p=>`${sx(p[0])},${sy(p[1])}`).join(' ');svg.append(el('polygon',{points:pts,class:'regionV1'}))}for(const pair of sequence.consecutive_pairs??[]){const first=trajectoryRows.find(row=>row.station_id===pair.from_station_id),second=trajectoryRows.find(row=>row.station_id===pair.to_station_id);if(!first||!second)continue;const inferred=pair.gap_assessment!=='OBSERVED_CONSECUTIVE_CAMERA_STEP';svg.append(el('line',{x1:sx(first.navigation_local_uvh[0]),y1:sy(first.navigation_local_uvh[1]),x2:sx(second.navigation_local_uvh[0]),y2:sy(second.navigation_local_uvh[1]),class:inferred?'gapLine':'pathLine'}))}const endpoint=sequence.route_endpoint_gap;if(endpoint){const first=trajectoryRows.find(row=>row.station_id===endpoint.from_station_id),second=trajectoryRows.find(row=>row.station_id===endpoint.to_station_id);if(first&&second)svg.append(el('line',{x1:sx(first.navigation_local_uvh[0]),y1:sy(first.navigation_local_uvh[1]),x2:sx(second.navigation_local_uvh[0]),y2:sy(second.navigation_local_uvh[1]),class:'endpointLine'}))}for(const r of doc.regions){let pts=r.polygon_uv.map(p=>`${sx(p[0])},${sy(p[1])}`).join(' ');svg.append(el('polygon',{points:pts,class:'region'}));r.polygon_uv.forEach((p,i)=>{const v=el('circle',{cx:sx(p[0]),cy:sy(p[1]),r:7,class:'vertex','data-region':r.id,'data-index':i});svg.append(v)});const t=el('text',{x:sx(r.polygon_uv[0][0])+8,y:sy(r.polygon_uv[0][1])-8,class:'region-label'});t.textContent=r.id;svg.append(t)}for(const tr of doc.transitions??[]){const s=tr.portal?.segment_uv;if(s)svg.append(el('line',{x1:sx(s[0][0]),y1:sy(s[0][1]),x2:sx(s[1][0]),y2:sy(s[1][1]),stroke:'#ff9b65','stroke-width':5,'vector-effect':'non-scaling-stroke'}))}for(const c of trajectoryRows){const className=c.baseline_coverage_status==='EXCLUDED_INSUFFICIENT_GEOMETRY'?'cameraPreviouslyExcluded':c.coverage_status==='INCLUDED_PROPOSAL'?(c.pose_trust==='PROVISIONAL'?'cameraProvisional':'camera'):'cameraExcluded',circle=el('circle',{cx:sx(c.navigation_local_uvh[0]),cy:sy(c.navigation_local_uvh[1]),r:2.8,class:className});const title=el('title');title.textContent=`${c.image_name??c.station_id} · ${c.triangulated_observation_count??'n/a'} triangulated observations · v1 ${c.baseline_coverage_status??'not classified'} · ${c.coverage_status}`;circle.append(title);svg.append(circle)}for(const c of excluded){if(c.navigation_local_uvh?.length===3)svg.append(el('circle',{cx:sx(c.navigation_local_uvh[0]),cy:sy(c.navigation_local_uvh[1]),r:2.6,class:'cameraExcluded'}))}}
 draw();
 svg.addEventListener('pointerdown',e=>{if(portalMode||!e.target.classList.contains('vertex'))return;drag={region:e.target.dataset.region,index:+e.target.dataset.index};svg.setPointerCapture(e.pointerId)});
 svg.addEventListener('pointermove',e=>{if(!drag)return;let p=svg.createSVGPoint();p.x=e.clientX;p.y=e.clientY;p=p.matrixTransform(svg.getScreenCTM().inverse());let r=doc.regions.find(x=>x.id===drag.region);r.polygon_uv[drag.index]=[ux(p.x),uy(p.y)];draw()});
