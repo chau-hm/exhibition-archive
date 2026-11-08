@@ -134,6 +134,35 @@ class VisitorCollisionTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "exploration envelope"):
             visitor_camera_settings(envelope, outside)
 
+    def test_camera_exactly_on_approved_polygon_edge_is_inclusive_and_shell_is_offset(self):
+        polygon = [[-2, -2], [2, -2], [2, 2], [-2, 2]]
+        limits = {"upNormal": [0, 1, 0], "originCommonViewer": [0, 0, 0],
+                  "minimumHeight": 0.3, "maximumHeight": 3.5,
+                  "classification": "REVIEWED_EXPLORATION_LIMIT", "physicalCeiling": False}
+        envelope = {"id": "edge-start", "floor": None, "ceiling": None,
+                    "explorationLimits": limits,
+                    "horizontalBoundary": {
+                        "vertices2d": polygon, "cameraClearanceUnits": 0,
+                        "planeBasis": {"normalUnit": [0, 1, 0], "offset": 0,
+                                       "pointOnPlaneCommonViewer": [0, 0, 0],
+                                       "basisU": [1, 0, 0], "basisV": [0, 0, -1]},
+                        "regions": [{"regionId": "region-01", "vertices2d": polygon,
+                                     "explorationLimits": limits}],
+                    }}
+        stations = {"defaultStationId": "edge-station", "stations": [
+            {"stationId": "edge-station", "regionId": "region-01",
+             "centerCommonViewer": [2, 1, 0], "representativeForwardCommonViewer": [0, 0, -1]}]}
+        settings, camera = visitor_camera_settings(envelope, stations)
+        self.assertEqual(settings["cameras"][0]["initial"]["position"], [2.0, 1.0, 0.0])
+        self.assertAlmostEqual(camera["enclosure_clearance"]["nearest_wall_distance_common_units"], 0.0)
+        self.assertAlmostEqual(camera["enclosure_clearance"]["minimum_wall_margin_common_units"], 0.0)
+        _glb, collision = enclosure_collision_glb(envelope)
+        self.assertAlmostEqual(collision["expanded_shell_outboard_common_units"], CAMERA_COLLISION_RADIUS)
+        self.assertAlmostEqual(collision["floor_collision_height_common_units"],
+                               limits["minimumHeight"] - CAMERA_COLLISION_RADIUS)
+        self.assertAlmostEqual(collision["ceiling_collision_height_common_units"],
+                               limits["maximumHeight"] + CAMERA_COLLISION_RADIUS)
+
     def test_concave_approved_boundary_uses_safe_inset_and_triangulated_caps(self):
         polygon = [[0, 0], [3, 0], [3, 1], [1, 1], [1, 3], [0, 3]]
         limits = {"upNormal": [0, 1, 0], "originCommonViewer": [0, 0, 0],

@@ -20,6 +20,9 @@ const settings = JSON.parse(await readFile(path.join(visitor, 'config', 'setting
 const initial = settings.cameras?.[0]?.initial;
 const orientation = metadata.initial_camera?.orientation ?? null;
 const sceneTransform = metadata.initial_camera?.model_scene_transform_supersplat;
+const navigation = metadata.navigation ?? {};
+const approvedNavigation = navigation.enforcement === 'APPROVED_COLLISION_ENVELOPE';
+const approvedEnvelope = navigation.envelope ?? null;
 if (!initial || !sceneTransform) throw new Error('Generated Visitor package has no initial camera or model transform');
 
 const targets = await (await fetch(cdpUrl + '/json/list')).json();
@@ -168,6 +171,95 @@ function resetCheck(state) {
   return { positionError: distance(state.position, initial.position),
     forwardDot: dot(normalize(state.forward), expectedForward), basis: basisCheck(state) };
 }
+function envelopeContainment(position, tolerance = 0.05) {
+  const envelope = approvedEnvelope;
+  const horizontal = envelope?.horizontalBoundary;
+  const basis = horizontal?.planeBasis;
+  if (!envelope || !basis || !Array.isArray(horizontal.regions)) return { inside: false, reason: 'approved envelope is unavailable' };
+  const delta = position.map((value, index) => value - basis.pointOnPlaneCommonViewer[index]);
+  const uv = [dot(delta, basis.basisU), dot(delta, basis.basisV)];
+  for (const region of horizontal.regions) {
+    const polygon = region.vertices2d ?? [];
+    if (polygon.length < 3) continue;
+    let area2 = 0;
+    for (let index = 0; index < polygon.length; index++) {
+      const a = polygon[index], b = polygon[(index + 1) % polygon.length];
+      area2 += a[0] * b[1] - b[0] * a[1];
+    }
+    const orientation = area2 >= 0 ? 1 : -1;
+    const edgeMargins = polygon.map((a, index) => {
+      const b = polygon[(index + 1) % polygon.length];
+      const dx = b[0] - a[0], dy = b[1] - a[1];
+      return orientation * (dx * (uv[1] - a[1]) - dy * (uv[0] - a[0])) / Math.hypot(dx, dy);
+    });
+    const horizontalMargin = Math.min(...edgeMargins);
+    if (horizontalMargin < -tolerance) continue;
+    const limits = { ...(envelope.explorationLimits ?? {}), ...(region.explorationLimits ?? {}) };
+    const up = limits.upNormal ?? basis.normalUnit;
+    const origin = limits.originCommonViewer ?? basis.pointOnPlaneCommonViewer;
+    const height = dot(position.map((value, index) => value - origin[index]), up);
+    const min = Number(limits.minimumHeight), max = Number(limits.maximumHeight);
+    const verticalInside = Number.isFinite(min) && Number.isFinite(max) &&
+      height >= min - tolerance && height <= max + tolerance;
+    return { inside: verticalInside, regionId: region.regionId, uv, height,
+      minimumHeight: min, maximumHeight: max, horizontalMargin };
+  }
+  return { inside: false, uv, reason: 'outside horizontal polygon' };
+}
+function nearestBoundaryFrame(position) {
+  const boundary = approvedEnvelope.horizontalBoundary;
+  const basis = boundary.planeBasis;
+  const region = boundary.regions[0];
+  const polygon = region.vertices2d;
+  const delta = position.map((value, index) => value - basis.pointOnPlaneCommonViewer[index]);
+  const uv = [dot(delta, basis.basisU), dot(delta, basis.basisV)];
+  let area2 = 0;
+  for (let index = 0; index < polygon.length; index++) {
+    const a = polygon[index], b = polygon[(index + 1) % polygon.length];
+    area2 += a[0] * b[1] - b[0] * a[1];
+  }
+  const orientation = area2 >= 0 ? 1 : -1;
+  let nearest = null;
+  polygon.forEach((a, index) => {
+    const b = polygon[(index + 1) % polygon.length];
+    const dx = b[0] - a[0], dy = b[1] - a[1], length = Math.hypot(dx, dy);
+    const margin = orientation * (dx * (uv[1] - a[1]) - dy * (uv[0] - a[0])) / length;
+    if (!nearest || margin < nearest.margin) {
+      const outward = [0, 1, 2].map(axis =>
+        orientation * (dy * basis.basisU[axis] - dx * basis.basisV[axis]) / length);
+      const tangent = [0, 1, 2].map(axis =>
+        (dx * basis.basisU[axis] + dy * basis.basisV[axis]) / length);
+      nearest = { margin, index, start: a, end: b, outward, tangent,
+        distanceToStart: Math.hypot(uv[0] - a[0], uv[1] - a[1]),
+        distanceToEnd: Math.hypot(uv[0] - b[0], uv[1] - b[1]) };
+    }
+  });
+  return nearest;
+}
+async function moveTowardWorldVector(vector, durationMs) {
+  const state = await currentState();
+  let x = dot(vector, state.right);
+  let z = dot(vector, state.forward);
+  const magnitude = Math.hypot(x, z);
+  if (magnitude < 1e-8) throw new Error('Requested movement direction is not reachable in the camera plane.');
+  x /= magnitude;
+  z /= magnitude;
+  await evaluate(`window.__phase4dAcceptance.move(${x}, ${z})`);
+  await sleep(durationMs);
+  await evaluate('window.__phase4dAcceptance.stop()');
+  await sleep(500);
+  return currentState();
+}
+async function holdKey(code, keyCode, durationMs) {
+  const key = code.slice(-1).toLowerCase();
+  await call('Input.dispatchKeyEvent', { type: 'keyDown', key, code,
+    windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode });
+  await sleep(durationMs);
+  await call('Input.dispatchKeyEvent', { type: 'keyUp', key, code,
+    windowsVirtualKeyCode: keyCode, nativeVirtualKeyCode: keyCode });
+  await sleep(500);
+  return currentState();
+}
 async function press(code, keyCode) {
   const key = code.slice(-1).toLowerCase();
   await call('Input.dispatchKeyEvent', { type: 'keyDown', key, code,
@@ -219,8 +311,28 @@ check('model and camera use the same orientation transform',
   { modelTransform: initialState.modelTransform, cameraTransform: sceneTransform });
 check('ordinary Visitor does not expose technical navigation diagnostics',
   await evaluate("!document.querySelector('.navigation-diagnostic-panel')"));
-check('ordinary Visitor states its free-flight boundary is unbounded until approval',
-  await evaluate("document.querySelector('.preview-status')?.textContent.includes('Free flight is unbounded until navigation approval')"));
+if (approvedNavigation) {
+  check('approved Visitor loads the navigation collision envelope', initialState.hasCollision &&
+    initialState.collision?.sha256 === metadata.collision?.sha256 &&
+    initialState.collision?.navigation_artifact_sha256 === navigation.artifact_sha256 &&
+    initialState.collision?.navigation_input_fingerprint === navigation.input_fingerprint &&
+    initialState.collision?.source_model_sha256 === metadata.master?.sha256 &&
+    initialState.collision?.url === './assets/enclosure-collision.glb',
+    { hasCollision: initialState.hasCollision, collision: initialState.collision,
+      navigationArtifactSha256: navigation.artifact_sha256 });
+  check('approved Visitor reports the bounded preview state without the unbounded warning',
+    navigation.status === 'NAVIGATION_APPROVED_BY_REVIEW' &&
+    navigation.constraint_mode === 'APPROVED_FREE_XYZ_ENVELOPE' &&
+    navigation.initial_camera_validation?.status === 'PASS' &&
+    await evaluate("document.querySelector('.preview-status')?.textContent.includes('Approved free-XYZ exploration boundary active') && !document.querySelector('.preview-status')?.textContent.includes('unbounded')"),
+    { status: navigation.status, boundaryId: navigation.boundary_id, mode: navigation.constraint_mode });
+  const initialContainment = envelopeContainment(initialState.position);
+  check('opening camera is inside the approved horizontal and vertical envelope', initialContainment.inside,
+    initialContainment);
+} else {
+  check('ordinary Visitor states its free-flight boundary is unbounded until approval',
+    await evaluate("document.querySelector('.preview-status')?.textContent.includes('Free flight is unbounded until navigation approval')"));
+}
 await screenshot('visitor-opening');
 
 for (let index = 1; index <= 2; index++) {
@@ -232,18 +344,32 @@ for (let index = 1; index <= 2; index++) {
 }
 
 const axes = basisCheck(await currentState());
-await moveCheck('KeyW', 87, normalize((await currentState()).forward), 1, 'W moves forward');
-await clickReset();
-await moveCheck('KeyS', 83, normalize((await currentState()).forward), -1, 'S moves backward');
-await clickReset();
-await moveCheck('KeyD', 68, normalize((await currentState()).right), 1, 'D moves laterally right');
-await clickReset();
-await moveCheck('KeyA', 65, normalize((await currentState()).right), -1, 'A moves laterally left');
-await clickReset();
-await moveCheck('KeyE', 69, [0, 1, 0], 1, 'E moves upward in viewer Y');
-await clickReset();
-await moveCheck('KeyQ', 81, [0, 1, 0], -1, 'Q moves downward in viewer Y');
-await clickReset();
+if (approvedNavigation) {
+  // The approved opening station is close to a polygon edge. Retreat before
+  // testing all six controls so an expected outward collision is not mistaken
+  // for a broken movement key.
+  await press('KeyW', 87);
+  await moveCheck('KeyW', 87, normalize((await currentState()).forward), 1, 'W moves forward inside the approved region');
+  await moveCheck('KeyS', 83, normalize((await currentState()).forward), -1, 'S moves backward inside the approved region');
+  await moveCheck('KeyD', 68, normalize((await currentState()).right), 1, 'D moves laterally right inside the approved region');
+  await moveCheck('KeyA', 65, normalize((await currentState()).right), -1, 'A moves laterally left inside the approved region');
+  await moveCheck('KeyE', 69, [0, 1, 0], 1, 'E moves upward inside the approved region');
+  await moveCheck('KeyQ', 81, [0, 1, 0], -1, 'Q moves downward inside the approved region');
+  await clickReset();
+} else {
+  await moveCheck('KeyW', 87, normalize((await currentState()).forward), 1, 'W moves forward');
+  await clickReset();
+  await moveCheck('KeyS', 83, normalize((await currentState()).forward), -1, 'S moves backward');
+  await clickReset();
+  await moveCheck('KeyD', 68, normalize((await currentState()).right), 1, 'D moves laterally right');
+  await clickReset();
+  await moveCheck('KeyA', 65, normalize((await currentState()).right), -1, 'A moves laterally left');
+  await clickReset();
+  await moveCheck('KeyE', 69, [0, 1, 0], 1, 'E moves upward in viewer Y');
+  await clickReset();
+  await moveCheck('KeyQ', 81, [0, 1, 0], -1, 'Q moves downward in viewer Y');
+  await clickReset();
+}
 check('movement and reset preserve the initial world-up frame', basisCheck(await currentState()).ok, axes);
 
 const rect = await evaluate(`(() => { const box=document.querySelector('#viewer canvas')?.getBoundingClientRect(); return box ? {x:box.x+box.width/2,y:box.y+box.height/2}:null; })()`);
@@ -265,6 +391,79 @@ check('Reset View clears mouse-look heading and roll', resetCheck(afterMouseRese
   resetCheck(afterMouseReset));
 await screenshot('visitor-after-controls-reset');
 
+if (approvedNavigation) {
+  const opening = await clickReset();
+  const openingEdge = nearestBoundaryFrame(opening.position);
+  const pressured = await moveTowardWorldVector(openingEdge.outward, 4_500);
+  const pressureCheck = envelopeContainment(pressured.position, 0.08);
+  const outwardProgress = dot(subtract(pressured.position, opening.position), openingEdge.outward);
+  check('diagonal boundary pressure cannot tunnel outside during sustained movement',
+    pressureCheck.inside && outwardProgress > 0.01,
+    { outwardProgress, position: pressured.position, containment: pressureCheck,
+      testedDurationMs: 4_500, nearestEdge: openingEdge.index });
+
+  const slideFrame = nearestBoundaryFrame(pressured.position);
+  const slid = await moveTowardWorldVector(slideFrame.tangent, 2_000);
+  const slideDistance = dot(subtract(slid.position, pressured.position), slideFrame.tangent);
+  const slideCheck = envelopeContainment(slid.position, 0.08);
+  check('movement slides along an approved boundary edge',
+    slideDistance > 0.025 && slideCheck.inside,
+    { slideDistance, position: slid.position, containment: slideCheck,
+      edge: slideFrame.index });
+
+  const cornerFrame = nearestBoundaryFrame(slid.position);
+  const toCorner = cornerFrame.distanceToStart < cornerFrame.distanceToEnd
+    ? cornerFrame.tangent.map(value => -value) : cornerFrame.tangent;
+  const cornerApproach = await moveTowardWorldVector(toCorner, 2_500);
+  const cornerContainment = envelopeContainment(cornerApproach.position, 0.08);
+  check('movement around a polygon corner remains inside the envelope', cornerContainment.inside,
+    { position: cornerApproach.position, containment: cornerContainment,
+      distanceToNearestVertex: Math.min(cornerFrame.distanceToStart, cornerFrame.distanceToEnd) });
+  const cornerExitFrame = nearestBoundaryFrame(cornerApproach.position);
+  const cornerExitStart = cornerApproach.position;
+  const cornerRelease = await moveTowardWorldVector(cornerExitFrame.outward.map(value => -value), 800);
+  const cornerReleaseDistance = distance(cornerRelease.position, cornerExitStart);
+  check('camera can move away after boundary and corner contact',
+    cornerReleaseDistance > 0.025 && envelopeContainment(cornerRelease.position, 0.08).inside,
+    { cornerReleaseDistance, position: cornerRelease.position,
+      containment: envelopeContainment(cornerRelease.position, 0.08) });
+
+  await clickReset();
+  const beforeUp = await currentState();
+  const limits = approvedEnvelope.explorationLimits;
+  const upper = await holdKey('KeyE', 69, 5_500);
+  const upperCheck = envelopeContainment(upper.position, 0.08);
+  check('E is clipped at the approved virtual upper exploration limit',
+    upperCheck.inside && upperCheck.height <= upperCheck.maximumHeight + 0.08 &&
+    upperCheck.height >= upperCheck.maximumHeight - 0.2,
+    { yBefore: beforeUp.position[1], yAfter: upper.position[1], limit: limits.maximumHeight,
+      containment: upperCheck });
+  const lower = await holdKey('KeyQ', 81, 7_000);
+  const lowerCheck = envelopeContainment(lower.position, 0.08);
+  check('Q is clipped at the approved lower exploration limit',
+    lowerCheck.inside && lowerCheck.height >= lowerCheck.minimumHeight - 0.08 &&
+    lowerCheck.height <= lowerCheck.minimumHeight + 0.2,
+    { yAfter: lower.position[1], limit: limits.minimumHeight, containment: lowerCheck });
+
+  const combinedStart = await clickReset();
+  const combinedEdge = nearestBoundaryFrame(combinedStart.position);
+  await call('Input.dispatchKeyEvent', { type: 'keyDown', key: 'e', code: 'KeyE',
+    windowsVirtualKeyCode: 69, nativeVirtualKeyCode: 69 });
+  const combined = await moveTowardWorldVector(combinedEdge.outward, 1_400);
+  await call('Input.dispatchKeyEvent', { type: 'keyUp', key: 'e', code: 'KeyE',
+    windowsVirtualKeyCode: 69, nativeVirtualKeyCode: 69 });
+  await sleep(500);
+  const combinedCheck = envelopeContainment(combined.position, 0.08);
+  check('combined horizontal and vertical input stays inside the approved envelope',
+    combinedCheck.inside && combined.position[1] > combinedStart.position[1] + 0.03,
+    { start: combinedStart.position, end: combined.position, containment: combinedCheck });
+  const resetAfterBoundary = await clickReset();
+  const resetBoundaryCheck = envelopeContainment(resetAfterBoundary.position);
+  check('Reset View restores a usable camera inside the approved region',
+    resetCheck(resetAfterBoundary).positionError < 0.04 && resetBoundaryCheck.inside,
+    { reset: resetCheck(resetAfterBoundary), containment: resetBoundaryCheck });
+}
+
 await call('Page.navigate', { url: `${siteUrl}/reviewer/index.html` });
 const deadline = Date.now() + timeoutMs;
 let reviewerState = null;
@@ -284,8 +483,12 @@ const reviewerCamera = reviewerState?.state;
 const reviewerPose = reviewerCamera ? resetCheck(reviewerCamera) : { positionError: Infinity, forwardDot: -1, basis: { ok: false } };
 check('Technical Reviewer embeds the same corrected Visitor pose',
   reviewerState?.title?.startsWith('Technical Reviewer') && reviewerState.src === '../visitor/index.html?acceptance=1' &&
-  reviewerPose.positionError < 0.04 && reviewerPose.forwardDot > 0.995 && reviewerPose.basis.ok,
-  { title: reviewerState?.title, frameSource: reviewerState?.src, pose: reviewerPose });
+  reviewerPose.positionError < 0.04 && reviewerPose.forwardDot > 0.995 && reviewerPose.basis.ok &&
+  (!approvedNavigation || (reviewerCamera?.hasCollision &&
+    reviewerCamera?.collision?.navigation_artifact_sha256 === navigation.artifact_sha256 &&
+    reviewerCamera?.collision?.sha256 === metadata.collision?.sha256)),
+  { title: reviewerState?.title, frameSource: reviewerState?.src, pose: reviewerPose,
+    hasCollision: reviewerCamera?.hasCollision, collision: reviewerCamera?.collision });
 await screenshot('reviewer-opening');
 
 await call('Page.navigate', { url: `${siteUrl}/visitor/index.html?acceptance=1&navigationDiagnostics=1` });
@@ -337,6 +540,7 @@ const overlayState = await evaluate(`(async () => {
     layerControlCount: panel?.querySelectorAll('[data-nav-layer]').length ?? 0,
     framingControlCount: panel?.querySelectorAll('[data-nav-frame]').length ?? 0,
     projection: panel?.querySelector('[data-diagnostic-projection]')?.textContent ?? '',
+    approvedEnforcementNotice: panel?.textContent?.includes('approved boundary is enforced') ?? false,
     unboundedWarning: panel?.textContent?.includes('remains unbounded') ?? false, coloredPixels };
 })()`);
 const panelLayout = await evaluate(`(() => {
@@ -360,9 +564,28 @@ check('model-relative navigation overlay loads against the Visitor scene',
   overlayState.panel && overlayState.overlayCanvas && overlayState.layerControlCount >= 5 &&
   overlayState.framingControlCount === 3 &&
   overlayState.status.includes('NAVIGATION_NEEDS_REVIEW') && overlayState.status.includes('77/77 cameras') &&
-  overlayState.unboundedWarning && overlayState.coloredPixels > 0 &&
+  (approvedNavigation ? overlayState.approvedEnforcementNotice && !overlayState.unboundedWarning
+    : overlayState.unboundedWarning) && overlayState.coloredPixels > 0 &&
   /Overlay projection: [1-9]\d*\/77 cameras in view · [1-9]\d* segments/.test(overlayState.projection), overlayState);
 await screenshot('navigation-model-overlay');
+
+if (approvedNavigation) {
+  await call('Page.navigate', { url: `${siteUrl}/visitor/index.html?acceptance=1&collision=off` });
+  const failClosedDeadline = Date.now() + 30_000;
+  let failClosedState = null;
+  while (Date.now() < failClosedDeadline) {
+    failClosedState = await evaluate(`(() => ({
+      loadError: document.querySelector('#loading')?.classList.contains('load-error') || false,
+      viewerLoaded: Boolean(window.__phase4dAcceptance?.state?.loaded),
+      message: document.querySelector('#loadingMessage')?.textContent ?? ''
+    }))()`);
+    if (failClosedState.loadError) break;
+    await sleep(200);
+  }
+  check('Visitor fails closed when the approved collision envelope is omitted',
+    failClosedState?.loadError && !failClosedState?.viewerLoaded,
+    failClosedState ?? {});
+}
 
 check('page has no uncaught browser exceptions', browserErrors.length === 0, { browserErrors });
 check('page has no failed network requests', networkErrors.length === 0, { networkErrors });

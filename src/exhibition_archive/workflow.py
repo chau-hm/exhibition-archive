@@ -2207,15 +2207,13 @@ def run_first_visual_preview_only(root: Path, config: dict, state: ProjectState)
             training.get("input_fingerprint") != training_fingerprint or
             not _stage_artifacts_valid(state, "training", output_path(root, config) / "work")):
         raise WorkflowError("Viewer-only regeneration requires a current validated training stage; no upstream stage was run.")
+    navigation_context = None
     if config.get("integrations", {}).get("navigation", {}).get("mode") == "generate_from_sfm":
-        navigation = state.stage("navigation") or {}
-        navigation_details = json.loads(navigation.get("details_json") or "{}")
-        navigation_fingerprint = stage_fingerprint(root, config, state, "navigation", full_hash=True)
-        proposal = Path(navigation_details.get("proposal_path", ""))
-        if (navigation.get("status") != "NEEDS_REVIEW" or
-                navigation.get("input_fingerprint") != navigation_fingerprint or
-                not proposal.is_file()):
-            raise WorkflowError("Viewer-only regeneration requires the current generated navigation proposal; no upstream stage was run.")
+        from .navigation_review import preview_navigation_context
+        try:
+            navigation_context = preview_navigation_context(root, config, state)
+        except (OSError, ValueError, TypeError) as exc:
+            raise WorkflowError(f"Viewer-only regeneration cannot use current navigation state: {exc}") from exc
 
     fingerprint = stage_fingerprint(root, config, state, "first_visual", full_hash=False)
     stage_root = output_path(root, config) / "work"
@@ -2231,7 +2229,8 @@ def run_first_visual_preview_only(root: Path, config: dict, state: ProjectState)
                     {"preview_only": True, "upstream_stages_executed": []})
     try:
         from .preview import build_first_visual_preview
-        result = build_first_visual_preview(root, config, state, stage_root, execution_id)
+        result = build_first_visual_preview(root, config, state, stage_root, execution_id,
+                                            navigation_context=navigation_context)
         artifacts = [Path(item).resolve() for item in result.get("artifacts", [])]
         if not artifacts or any(not path.is_file() for path in artifacts):
             raise WorkflowError("First-visual generation reported missing artifacts")

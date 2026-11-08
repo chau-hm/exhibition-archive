@@ -28,8 +28,115 @@ def _next_first_visual_revision(output_root: Path, execution_id: int) -> tuple[i
     return revision_id, version_dir
 
 
+def _quaternion_matrix_xyzw(quaternion: list[float]) -> list[list[float]]:
+    if not isinstance(quaternion, (list, tuple)) or len(quaternion) != 4:
+        raise ValueError("Viewer model rotation must be a four-component quaternion.")
+    x, y, z, w = (float(value) for value in quaternion)
+    if not all(math.isfinite(value) for value in (x, y, z, w)):
+        raise ValueError("Viewer model rotation contains non-finite values.")
+    norm = math.sqrt(x*x + y*y + z*z + w*w)
+    if norm < 1e-12:
+        raise ValueError("Viewer model rotation is degenerate.")
+    x, y, z, w = (value / norm for value in (x, y, z, w))
+    return [[1 - 2*(y*y + z*z), 2*(x*y - z*w), 2*(x*z + y*w)],
+            [2*(x*y + z*w), 1 - 2*(x*x + z*z), 2*(y*z - x*w)],
+            [2*(x*z - y*w), 2*(y*z + x*w), 1 - 2*(x*x + y*y)]]
+
+
+def _assert_navigation_orientation_matches_preview(initial_camera: dict, artifact: dict) -> None:
+    """Require the approved COLMAP-to-Viewer transform to match the model transform."""
+    coordinate_frame = artifact.get("coordinate_frame") or {}
+    matrix = coordinate_frame.get("source_to_viewer_matrix_row_major")
+    if (coordinate_frame.get("source_frame") != "COLMAP_WORLD" or
+            coordinate_frame.get("viewer_transform_verified") is not True or
+            not isinstance(matrix, list) or len(matrix) != 4 or
+            any(not isinstance(row, list) or len(row) != 4 for row in matrix)):
+        raise ValueError("Approved navigation does not contain a verified COLMAP-to-Viewer transform.")
+    try:
+        matrix = [[float(value) for value in row] for row in matrix]
+        model_node = initial_camera["model_scene_transform_supersplat"]
+        model_matrix = _quaternion_matrix_xyzw(model_node["rotationQuaternionXYZW"])
+        translation = model_node["translation"]
+        uniform_scale = float(model_node["uniformScale"])
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise ValueError("Approved navigation cannot be reconciled with the generated Viewer transform.") from exc
+    if not all(math.isfinite(value) for row in matrix for value in row):
+        raise ValueError("Approved navigation transform contains non-finite values.")
+    if (max(abs(matrix[row][column] - model_matrix[row][column])
+            for row in range(3) for column in range(3)) > 1e-5 or
+            max(abs(matrix[row][3]) for row in range(3)) > 1e-5 or
+            any(abs(float(value)) > 1e-5 for value in translation) or
+            abs(uniform_scale - 1.0) > 1e-5 or
+            abs(float(coordinate_frame.get("uniform_scale", 1.0)) - 1.0) > 1e-5):
+        raise ValueError("Approved navigation and the Viewer model use different coordinate transforms; boundary enforcement was stopped.")
+
+
+def _preview_navigation_metadata(context: dict) -> dict[str, Any]:
+    if context.get("approved"):
+        envelope = context["envelope"]
+        horizontal = envelope.get("horizontalBoundary") or {}
+        public_regions = []
+        for region in horizontal.get("regions", []):
+            public_regions.append({key: region[key] for key in
+                                   ("regionId", "vertices2d", "floor", "ceiling", "explorationLimits",
+                                    "status", "classification") if key in region})
+        runtime_envelope = {
+            key: envelope[key] for key in
+            ("id", "status", "classification", "coordinateFrame", "floor", "ceiling", "explorationLimits")
+            if key in envelope
+        }
+        runtime_envelope["horizontalBoundary"] = {
+            key: horizontal[key] for key in
+            ("algorithm", "candidateId", "classification", "closed", "cameraClearanceUnits",
+             "planeBasis", "regions", "vertices2d") if key in horizontal
+        }
+        runtime_envelope["horizontalBoundary"]["regions"] = public_regions
+        return {
+            "status": "NAVIGATION_APPROVED_BY_REVIEW",
+            "constraint_mode": "APPROVED_FREE_XYZ_ENVELOPE",
+            "enforcement": "APPROVED_COLLISION_ENVELOPE",
+            "approval_gate_status": "APPROVED",
+            "boundary_id": envelope.get("id"),
+            "artifact_sha256": context["artifact_sha256"],
+            "input_fingerprint": context["input_fingerprint"],
+            "initial_camera_validation": context.get("initial_camera_validation"),
+            "reason": "The current reviewed envelope is enforced for free XYZ flight. Its vertical limits are virtual exploration bounds, not a physical floor or ceiling.",
+            "envelope": runtime_envelope,
+        }
+    rejected = context.get("gate_status") == "REJECTED"
+    return {
+        "status": "REJECTED" if rejected else context.get("stage_status", "UNVERIFIED"),
+        "constraint_mode": "UNBOUNDED_FREE_XYZ_PREVIEW",
+        "enforcement": "NONE",
+        "approval_gate_status": context.get("gate_status", "NOT_REQUIRED"),
+        "reason": context.get("reason", "No current approved navigation boundary is available."),
+    }
+
+
+def _preview_collision_metadata(metadata: dict) -> dict[str, Any]:
+    """Bind the generated collision mesh to the approved artifact and model."""
+    binding = {
+        "navigation_artifact_sha256": metadata.get("navigation_artifact_sha256"),
+        "navigation_input_fingerprint": metadata.get("navigation_input_fingerprint"),
+        "source_model_sha256": metadata.get("source_model_sha256"),
+    }
+    if any(not isinstance(value, str) or len(value) != 64 or
+           any(char not in "0123456789abcdef" for char in value.lower())
+           for value in binding.values()):
+        raise ValueError("Generated collision envelope is missing its approved navigation or model identity.")
+    return {
+        "url": "./assets/enclosure-collision.glb",
+        "sha256": metadata["sha256"],
+        "size_bytes": metadata["size_bytes"],
+        "format": "glb",
+        "source": "approved navigation artifact",
+        **binding,
+    }
+
+
 def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path,
-                               execution_id: int, *, update_current_summary: bool = True) -> dict[str, Any]:
+                               execution_id: int, *, update_current_summary: bool = True,
+                               navigation_context: dict | None = None) -> dict[str, Any]:
     """Build private, versioned Reviewer and Visitor previews for the unreviewed first model."""
     training_stage = state.stage("training") or {}
     training_details = _details(training_stage)
@@ -40,6 +147,17 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     if not model.is_file():
         raise ValueError(f"The first-visual training candidate is missing: {model}")
     identity = validate_gaussian_ply(model)
+    if navigation_context is None and config.get("integrations", {}).get("navigation", {}).get("mode") == "generate_from_sfm":
+        from .navigation_review import preview_navigation_context
+        navigation_context = preview_navigation_context(root, config, state)
+    navigation_context = navigation_context or {
+        "approved": False, "stage_status": "NOT_CONFIGURED", "gate_status": "NOT_REQUIRED",
+        "reason": "No approved generated navigation boundary is available.",
+    }
+    if navigation_context.get("approved"):
+        approved_model_sha = (navigation_context.get("envelope") or {}).get("sourceModelSha256")
+        if approved_model_sha and approved_model_sha != identity["sha256"]:
+            raise ValueError("Approved navigation is bound to a different Gaussian model; boundary enforcement was stopped.")
     revision_id, version_dir = _next_first_visual_revision(output_path(root, config), execution_id)
     diagnostics = version_dir / "diagnostics"
     reviewer = version_dir / "reviewer"
@@ -63,8 +181,46 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
         shutil.copy2(model, model_asset)
 
     visitor_cfg, initial_camera = _build_visitor_config(root, config)
-    _write_visitor_assets(visitor, config, initial_camera)
+    collision_metadata = None
+    if navigation_context.get("approved"):
+        _assert_navigation_orientation_matches_preview(initial_camera, navigation_context["artifact"])
+        from .visitor import (_camera_enclosure_clearance, enclosure_collision_glb,
+                              viewer_transform_node, write_glb)
+        envelope = navigation_context["envelope"]
+        pose = visitor_cfg["cameras"][0]["initial"]
+        region_rows = (envelope.get("horizontalBoundary") or {}).get("regions") or []
+        camera_validation = None
+        for region in region_rows:
+            try:
+                camera_validation = _camera_enclosure_clearance(
+                    envelope, tuple(pose["position"]), region.get("regionId"))
+                camera_validation = {"status": "PASS", "region_id": region.get("regionId"), **camera_validation}
+                break
+            except ValueError:
+                continue
+        if camera_validation is None:
+            raise ValueError("The corrected opening camera is outside the approved navigation envelope; no Viewer was generated.")
+        model_node = initial_camera["model_scene_transform_supersplat"]
+        transform_node = {"viewerSceneNode": model_node}
+        collision_data, collision_metadata = enclosure_collision_glb(envelope, transform_node)
+        collision_path = assets / "enclosure-collision.glb"
+        write_glb(collision_path, collision_data)
+        collision_metadata.update({
+            "source_model_sha256": identity["sha256"],
+            "navigation_artifact_sha256": navigation_context["artifact_sha256"],
+            "navigation_input_fingerprint": navigation_context["input_fingerprint"],
+            "sha256": sha256_file(collision_path),
+            "size_bytes": collision_path.stat().st_size,
+        })
+        initial_camera["navigation_status"] = "NAVIGATION_APPROVED_BY_REVIEW"
+        initial_camera["navigation_boundary_id"] = envelope.get("id")
+        initial_camera["navigation_artifact_sha256"] = navigation_context["artifact_sha256"]
+        initial_camera["navigation_containment"] = camera_validation
+        navigation_context = {**navigation_context, "initial_camera_validation": camera_validation,
+                              "collision": collision_metadata, "collision_path": collision_path}
+    _write_visitor_assets(visitor, config, initial_camera, navigation_context)
     write_json(config_dir / "settings.json", visitor_cfg)
+    navigation_metadata = _preview_navigation_metadata(navigation_context)
     visitor_metadata = {
         "schema_version": "exhibition-archive.first-visual-preview.v1",
         "profile": "visitor_preview",
@@ -81,9 +237,10 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
                    "sha256": identity["sha256"], "gaussian_count": identity["gaussian_count"],
                    "selection": "unreviewed first-visual candidate"},
         "initial_camera": initial_camera,
-        "navigation": {"status": "UNVERIFIED", "constraint_mode": "UNBOUNDED_FREE_XYZ_PREVIEW",
-                       "reason": "No accepted floor-aligned enclosure was available when this first-visual preview was built. This private preview is not a public visitor release."},
+        "navigation": navigation_metadata,
     }
+    if collision_metadata:
+        visitor_metadata["collision"] = _preview_collision_metadata(collision_metadata)
     write_json(config_dir / "exhibition.json", visitor_metadata)
 
     sfm_details = _details(state.stage("sfm") or {})
@@ -118,6 +275,19 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
     if navigation_proposal is not None and navigation_proposal.is_file():
         shutil.copy2(navigation_proposal, diagnostics / "navigation-proposal.json")
         navigation_proposal_doc = read_json(navigation_proposal)
+    if navigation_context.get("approved"):
+        shutil.copy2(navigation_context["artifact_path"], diagnostics / "navigation-approved.json")
+        write_json(diagnostics / "navigation-approval-binding.json", {
+            "status": "VERIFIED",
+            "proposal_path": str(navigation_context["proposal_path"]),
+            "proposal_sha256": navigation_context["proposal_sha256"],
+            "candidate_path": str(navigation_context["candidate_path"]),
+            "candidate_sha256": navigation_context["candidate_sha256"],
+            "approved_artifact_sha256": navigation_context["artifact_sha256"],
+            "reviewed_artifact_path": str(navigation_context["reviewed_path"]),
+            "navigation_input_fingerprint": navigation_context["input_fingerprint"],
+            "geometry_validation": navigation_context["validation"],
+        })
     navigation_review = _optional_path(navigation_details.get("review_path"))
     if navigation_review is not None and navigation_review.is_file():
         shutil.copy2(navigation_review, diagnostics / "navigation-review.html")
@@ -217,14 +387,27 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
                      "model_sha256": identity["sha256"], "gaussian_count": identity["gaussian_count"],
                      "log_available": (diagnostics / "training.log").is_file(),
                      "checkpoint_directory": "../backend-runs/training/ (retained by Engine)"},
-        "navigation": {"status": navigation_details.get("status", "UNVERIFIED"),
-                       "review_required": True,
-                       "reason": navigation_details.get("reason", "Generated navigation remains a proposal until reviewed.")},
+        "navigation": {"status": ("NAVIGATION_APPROVED_BY_REVIEW" if navigation_context.get("approved")
+                                    else ("REJECTED" if navigation_context.get("gate_status") == "REJECTED"
+                                          else navigation_details.get("status", "UNVERIFIED"))),
+                       "review_required": not navigation_context.get("approved"),
+                       "runtime_enforcement_active": bool(navigation_context.get("approved")),
+                       "constraint_mode": navigation_metadata["constraint_mode"],
+                       "approval_gate_status": navigation_context.get("gate_status"),
+                       "boundary_id": navigation_metadata.get("boundary_id"),
+                       "artifact_sha256": navigation_context.get("artifact_sha256"),
+                       "input_fingerprint": navigation_context.get("input_fingerprint"),
+                       "initial_camera_validation": navigation_context.get("initial_camera_validation"),
+                       "reason": navigation_context.get("reason", "Generated navigation remains a proposal until reviewed.")},
         "navigation_coverage": navigation_coverage_summary,
         "viewer_orientation": initial_camera["orientation"],
         "pipeline_stages": {stage["id"]: (stage_states.get(stage["id"]) or {}).get("status", "PENDING")
                             for stage in STAGES},
-        "warnings": _preview_warnings(sfm_details, lidar_report, navigation_details,
+        "warnings": _preview_warnings(sfm_details, lidar_report,
+                                      {**navigation_details,
+                                       "status": "ADOPTED" if navigation_context.get("approved")
+                                       else ("REJECTED" if navigation_context.get("gate_status") == "REJECTED"
+                                             else navigation_context.get("stage_status", navigation_details.get("status")))},
                                       initial_camera["orientation"]),
         "reviewer_html": "reviewer/index.html", "visitor_html": "visitor/index.html",
         "release_authorization": "NEEDS_REVIEW", "first_visual_only": True,
@@ -272,6 +455,8 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
         raise ValueError("First-visual HTML/assets failed local validation: " + "; ".join(failures))
     artifacts = [reviewer_html, visitor / "index.html", version_dir / "manifest.json",
                  version_dir / "pipeline-status.json", report_path, assets / "exhibition.ply"]
+    if collision_metadata:
+        artifacts.append(assets / "enclosure-collision.glb")
     artifacts.extend(path for path in diagnostics.rglob("*") if path.is_file())
     return {"status": "COMPLETED", "artifacts": artifacts,
             "details": {"status": "AWAITING_VISUAL_REVIEW", "version_directory": str(version_dir),
@@ -279,6 +464,8 @@ def build_first_visual_preview(root: Path, config: dict, state, output_dir: Path
                         "reviewer_html": str(reviewer_html), "visitor_html": str(visitor / "index.html"),
                         "summary_path": str(report_path), "validation": {"status": "PASS", "failures": []},
                         "model_sha256": identity["sha256"], "navigation_status": pipeline_summary["navigation"]["status"],
+                        "navigation_enforcement_active": pipeline_summary["navigation"]["runtime_enforcement_active"],
+                        "navigation_artifact_sha256": pipeline_summary["navigation"]["artifact_sha256"],
                         "release_authorization": "NEEDS_REVIEW"}}
 
 
@@ -345,7 +532,8 @@ def _build_visitor_config(root: Path, config: dict) -> tuple[dict, dict]:
     return settings, initial_camera
 
 
-def _write_visitor_assets(visitor: Path, config: dict, initial_camera: dict) -> None:
+def _write_visitor_assets(visitor: Path, config: dict, initial_camera: dict,
+                          navigation_context: dict | None = None) -> None:
     template = Path(__file__).resolve().parents[2] / "templates" / "visitor"
     vendor_source = template / "vendor"
     required = ("supersplat-viewer.css", "supersplat-viewer.js", "SUPERSPLAT-VIEWER-LICENSE.txt",
@@ -358,7 +546,11 @@ def _write_visitor_assets(visitor: Path, config: dict, initial_camera: dict) -> 
     html_text = (template / "index.html").read_text(encoding="utf-8")
     title = html.escape(str(config.get("viewer", {}).get("title", config["project_id"])), quote=True)
     html_text = html_text.replace("__EXHIBITION_TITLE__", title)
-    banner = '<div class="preview-status" role="status">First visual preview · Free flight is unbounded until navigation approval · Not approved for public release</div>\n    '
+    approved = bool((navigation_context or {}).get("approved"))
+    status = ("Approved free-XYZ exploration boundary active · Not approved for public release"
+              if approved else
+              "Free flight is unbounded until navigation approval · Not approved for public release")
+    banner = (f'<div class="preview-status" role="status">First visual preview · {html.escape(status)}</div>\n    ')
     html_text = html_text.replace('<div id="viewer"', banner + '<div id="viewer"')
     (visitor / "index.html").write_text(html_text, encoding="utf-8")
     shutil.copy2(template / "style.css", visitor / "css" / "viewer.css")
@@ -868,6 +1060,8 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
               "lidar-alignment-report.json": "LiDAR alignment report",
               "lidar-inspection.json": "LiDAR inspection report",
               "navigation-proposal.json": "Navigation proposal",
+              "navigation-approved.json": "Approved navigation artifact",
+              "navigation-approval-binding.json": "Navigation approval binding and integrity checks",
               "navigation-review.html": "Navigation review page",
               "navigation-coverage.html": "Interactive 3D camera, geometry, and boundary overlay",
               "navigation-coverage.json": "Camera and geometry coverage measurements",
@@ -884,8 +1078,18 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
     training = summary["training"]
     viewer_orientation = summary.get("viewer_orientation", {})
     coverage = summary.get("navigation_coverage") or {}
-    coverage_panel = (f"<section><h2>Navigation coverage proposal</h2><p>{html.escape(str(coverage.get('status_summary', 'No coverage proposal is available.')))}</p><iframe title=\"Interactive navigation coverage overlay\" src=\"../diagnostics/navigation-coverage.html\"></iframe><p><a href=\"../visitor/index.html?navigationDiagnostics=1\" target=\"_blank\" rel=\"noopener\">Open camera and v1/v2 boundaries against the existing 3DGS model</a></p><p class=\"muted\">Camera-up sets the display frame only. The photo-SfM lower-plane candidate and upper exploration limit require review; the upper limit is not a ceiling. The preview remains unbounded until navigation is approved.</p></section>"
+    runtime_navigation_note = (
+        "The approved boundary is enforced for free-XYZ flight. The lower and upper values are reviewed virtual exploration limits, not a surveyed floor or physical ceiling."
+        if summary["navigation"].get("runtime_enforcement_active") else
+        "Camera-up sets the display frame only. The lower-plane candidate and upper exploration limit require review; the upper limit is not a ceiling. Visitor flight remains unbounded."
+    )
+    coverage_panel = (f"<section><h2>Navigation coverage and boundary</h2><p>{html.escape(str(coverage.get('status_summary', 'No coverage proposal is available.')))}</p><iframe title=\"Interactive navigation coverage overlay\" src=\"../diagnostics/navigation-coverage.html\"></iframe><p><a href=\"../visitor/index.html?navigationDiagnostics=1\" target=\"_blank\" rel=\"noopener\">Open camera and v1/v2 boundaries against the existing 3DGS model</a></p><p class=\"muted\">{html.escape(runtime_navigation_note)}</p></section>"
                       if coverage else "")
+    navigation_disclaimer = (
+        "The current approved free-XYZ boundary is active in this private Visitor. The Gaussian model and public release remain unreviewed."
+        if summary["navigation"].get("runtime_enforcement_active") else
+        "The Visitor is unbounded and is for technical review only; navigation and public release remain unapproved."
+    )
     orientation_status = viewer_orientation.get("status", "ORIENTATION_REVIEW_REQUIRED")
     orientation_label = {
         "CAMERA_UP_PROPOSAL_APPLIED_REVIEW_REQUIRED": "Proposal applied; review required",
@@ -899,7 +1103,7 @@ def _reviewer_html(summary: dict[str, Any]) -> str:
 *{{box-sizing:border-box}}body{{margin:0;background:#111512;color:#e7ebe3;font:15px/1.5 system-ui,sans-serif}}header{{padding:1rem 1.4rem;background:#1d241f;border-bottom:1px solid #38433a}}h1,h2{{margin:.2rem 0 .8rem}}header p,.muted{{color:#abb6aa}}main{{display:grid;grid-template-columns:minmax(0,1.7fr) minmax(300px,.8fr);gap:1rem;padding:1rem;max-width:1600px;margin:auto}}section{{background:#1a201b;border:1px solid #344037;border-radius:.7rem;padding:1rem;min-width:0}}iframe{{width:100%;height:min(72vh,850px);border:0;border-radius:.45rem;background:#080a08}}a{{color:#c4d5b6}}.links{{display:grid;gap:.45rem}}.metric{{display:grid;grid-template-columns:1fr auto;gap:.6rem;border-bottom:1px solid #344037;padding:.4rem 0}}.metric b{{min-width:0;text-align:right;overflow-wrap:anywhere}}.warning{{background:#33291b;border:1px solid #755c34;padding:.7rem;border-radius:.5rem}}@media(max-width:850px){{main{{grid-template-columns:1fr}}iframe{{height:65vh}}}}</style></head><body>
 <header><h1>Technical Reviewer · {html.escape(summary['project_id'])}</h1><p>First visual candidate · release authorization: NEEDS_REVIEW · no source photographs are included</p></header><main><section><h2>Candidate model preview</h2><iframe title="Unreviewed Visitor preview" src="../visitor/index.html"></iframe></section><aside>
 <section><h2>Evidence</h2><div class="metric"><span>Source photos</span><b>{sources['image_count']}</b></div><div class="metric"><span>Registered views</span><b>{sfm.get('registered_image_count','unknown')} / {sfm.get('source_image_count', sources['image_count'])}</b></div><div class="metric"><span>Sparse SfM points</span><b>{sfm.get('sparse_point_count',0)}</b></div><div class="metric"><span>Gaussian splats</span><b>{training.get('gaussian_count','unknown')}</b></div><div class="metric"><span>Model size</span><b>{training.get('model_size_bytes',0):,} bytes</b></div><div class="metric"><span>Training divisor</span><b>{html.escape(str(training.get('resolution_divisor','unknown')))}</b></div><div class="metric"><span>Backend image size</span><b>{html.escape(observed_size_text)}</b></div><div class="metric"><span>Resolution evidence</span><b>{html.escape(str(training_resolution.get('backend_report_status','NOT_AVAILABLE')))}</b></div><div class="metric"><span>LiDAR</span><b>{html.escape(str(lidar.get('inspection_status','NOT_DETECTED')))}</b></div><div class="metric"><span>LiDAR alignment</span><b>{html.escape(str(lidar.get('alignment_status','NOT_ATTEMPTED')))}</b></div><div class="metric"><span>Navigation</span><b>{html.escape(str(summary['navigation']['status']))}</b></div><div class="metric"><span>Viewer orientation</span><b>{html.escape(orientation_label)}</b></div></section>
-<section><h2>Warnings and limitations</h2><ul class="warning">{warning_items or '<li>No additional warning recorded.</li>'}</ul><p class="muted">SfM coordinates are arbitrary scale. The unbounded Visitor preview is for technical review only; navigation and public release remain unapproved.</p></section>
+<section><h2>Warnings and limitations</h2><ul class="warning">{warning_items or '<li>No additional warning recorded.</li>'}</ul><p class="muted">SfM coordinates are arbitrary scale. {html.escape(navigation_disclaimer)}</p></section>
 {coverage_panel}
 <section><h2>Diagnostics</h2><div class="links">{''.join(diagnostics)}</div></section></aside></main></body></html>"""
 
@@ -919,6 +1123,34 @@ def _validate_preview(root: Path, identity: dict) -> list[str]:
     model = visitor / "assets" / "exhibition.ply"
     if model.is_file() and (sha256_file(model) != identity["sha256"] or model.stat().st_size != identity["file_bytes"]):
         errors.append("visitor candidate model failed full-hash identity validation")
+    metadata_path = visitor / "config" / "exhibition.json"
+    if metadata_path.is_file():
+        try:
+            metadata = read_json(metadata_path)
+            navigation = metadata.get("navigation") or {}
+            collision = metadata.get("collision")
+            if navigation.get("enforcement") == "APPROVED_COLLISION_ENVELOPE":
+                collision_path = (visitor / collision.get("url", "")).resolve() if isinstance(collision, dict) else None
+                if (navigation.get("status") != "NAVIGATION_APPROVED_BY_REVIEW" or
+                        navigation.get("constraint_mode") != "APPROVED_FREE_XYZ_ENVELOPE" or
+                        collision_path is None or visitor.resolve() not in collision_path.parents or
+                        not collision_path.is_file()):
+                    errors.append("approved navigation metadata does not resolve to a packaged collision envelope")
+                elif (collision.get("sha256") != sha256_file(collision_path) or
+                      collision.get("size_bytes") != collision_path.stat().st_size):
+                    errors.append("approved navigation collision asset failed SHA-256 or size validation")
+                elif (collision.get("navigation_artifact_sha256") != navigation.get("artifact_sha256") or
+                      collision.get("navigation_input_fingerprint") != navigation.get("input_fingerprint") or
+                      collision.get("source_model_sha256") != metadata.get("master", {}).get("sha256")):
+                    errors.append("approved navigation collision asset is not bound to the current approval, inputs, and model")
+                if navigation.get("artifact_sha256") != metadata.get("initial_camera", {}).get("navigation_artifact_sha256"):
+                    errors.append("opening camera and runtime boundary do not share an approved navigation identity")
+                if (navigation.get("initial_camera_validation") or {}).get("status") != "PASS":
+                    errors.append("opening camera is not validated inside the approved navigation envelope")
+            elif collision is not None or (visitor / "assets" / "enclosure-collision.glb").exists():
+                errors.append("unapproved navigation must not package or activate a collision envelope")
+        except (OSError, ValueError, TypeError) as exc:
+            errors.append(f"Visitor navigation metadata is invalid: {exc}")
     import re
     for page in (reviewer / "index.html", visitor / "index.html"):
         if not page.is_file():
@@ -998,6 +1230,10 @@ def _preview_warnings(sfm: dict, lidar: dict, navigation: dict,
 
 
 def _summary_markdown(summary: dict) -> str:
+    navigation_status = summary["navigation"]["status"]
+    navigation_note = ("approved; runtime free-XYZ boundary enforcement active"
+                       if summary["navigation"].get("runtime_enforcement_active")
+                       else "review required; Visitor remains unbounded")
     return (f"# First visual summary — {summary['project_id']}\n\n"
             f"- Engine: {summary['engine_version']} ({summary['engine_git_commit']})\n"
             f"- Photos: {summary['source_images']['image_count']} across {summary['source_images']['formats']}\n"
@@ -1007,8 +1243,8 @@ def _summary_markdown(summary: dict) -> str:
             f"- Effective training settings: {summary['training'].get('effective_configuration_status', 'NOT_RECORDED')}; {summary['training'].get('effective_parameter_count', 0)} backend defaults/overrides (full record: Reviewer diagnostics/training-run.json)\n"
             f"- Training resolution observation: {summary['training'].get('training_resolution', {}).get('backend_report_status', 'NOT_AVAILABLE')}\n"
             f"- Model: {summary['training']['model_format']}, {summary['training']['gaussian_count']} Gaussians, {summary['training']['model_size_bytes']} bytes, SHA-256 `{summary['training']['model_sha256']}`\n"
-            f"- Navigation: {summary['navigation']['status']} (review required)\n"
-            f"- Viewer orientation: {summary['viewer_orientation']['status']} (camera-pose proposal; physical up and navigation remain unverified)\n"
+            f"- Navigation: {navigation_status} ({navigation_note})\n"
+            f"- Viewer orientation: {summary['viewer_orientation']['status']} (camera-pose evidence; physical gravity is not established)\n"
             f"- Reviewer: `{summary['reviewer_html']}`; Visitor preview: `{summary['visitor_html']}`\n"
             f"- Release authorization: {summary['release_authorization']}\n\n"
             "## Warnings\n\n" + "\n".join(f"- {item}" for item in summary["warnings"]) + "\n")

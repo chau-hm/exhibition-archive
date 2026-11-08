@@ -10,6 +10,8 @@ from exhibition_archive.preview import (
     _navigation_coverage_diagnostic,
     _navigation_model_overlay,
     _next_first_visual_revision,
+    _preview_collision_metadata,
+    _preview_navigation_metadata,
     _write_visitor_assets,
     render_navigation_coverage_html,
 )
@@ -28,6 +30,49 @@ class PreviewRevisionTests(unittest.TestCase):
 
         self.assertIn("Free flight is unbounded until navigation approval", page)
         self.assertIn("Not approved for public release", page)
+
+    def test_approved_preview_banner_does_not_claim_unbounded_flight(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            visitor = Path(temporary) / "visitor"
+            for name in ("config", "css", "js", "vendor"):
+                (visitor / name).mkdir(parents=True)
+            _write_visitor_assets(visitor, {"project_id": "fixture", "viewer": {"title": "Fixture"}}, {},
+                                  {"approved": True})
+            page = (visitor / "index.html").read_text(encoding="utf-8")
+        self.assertIn("Approved free-XYZ exploration boundary active", page)
+        self.assertNotIn("unbounded", page.lower())
+
+    def test_approved_visitor_metadata_contains_runtime_geometry_without_private_paths(self):
+        context = {"approved": True, "artifact_sha256": "a" * 64,
+                   "input_fingerprint": "b" * 64,
+                   "initial_camera_validation": {"status": "PASS"},
+                   "envelope": {"id": "region-envelope", "status": "NAVIGATION_APPROVED_BY_REVIEW",
+                                "sourceReconstruction": {"path": "/private/sfm"},
+                                "explorationLimits": {"minimumHeight": 0.3, "maximumHeight": 4.5},
+                                "horizontalBoundary": {"cameraClearanceUnits": 0,
+                                                       "vertices2d": [[0, 0], [1, 0], [1, 1]],
+                                                       "planeBasis": {"basisU": [1, 0, 0]},
+                                                       "regions": [{"regionId": "r1", "vertices2d": [[0, 0], [1, 0], [1, 1]],
+                                                                    "explorationLimits": {"minimumHeight": 0.3}}]}}}
+        metadata = _preview_navigation_metadata(context)
+        serialized = json.dumps(metadata)
+        self.assertEqual(metadata["enforcement"], "APPROVED_COLLISION_ENVELOPE")
+        self.assertIn("vertices2d", serialized)
+        self.assertNotIn("/private/sfm", serialized)
+
+    def test_collision_metadata_binds_mesh_to_approval_inputs_and_model(self):
+        collision = _preview_collision_metadata({
+            "sha256": "c" * 64,
+            "size_bytes": 2948,
+            "navigation_artifact_sha256": "a" * 64,
+            "navigation_input_fingerprint": "b" * 64,
+            "source_model_sha256": "d" * 64,
+        })
+        self.assertEqual(collision["navigation_artifact_sha256"], "a" * 64)
+        self.assertEqual(collision["navigation_input_fingerprint"], "b" * 64)
+        self.assertEqual(collision["source_model_sha256"], "d" * 64)
+        with self.assertRaises(ValueError):
+            _preview_collision_metadata({"sha256": "c" * 64, "size_bytes": 2948})
 
     def test_revision_allocator_skips_existing_manual_revisions(self):
         with tempfile.TemporaryDirectory() as temporary:
@@ -140,8 +185,8 @@ class PreviewOnlyWorkflowTests(unittest.TestCase):
             photos.mkdir(parents=True)
             model = root / "model.ply"
             model.write_bytes(b"fixture model")
-            proposal = root / "navigation-proposal.json"
-            proposal.write_text("{}", encoding="utf-8")
+            proposal = root / "output" / "navigation" / "proposals" / "navigation-proposal-v0001.json"
+            proposal.parent.mkdir(parents=True)
             config = {
                 "schema_version": "exhibition-archive.project.v1",
                 "project_id": "preview-only-fixture",
@@ -166,6 +211,9 @@ class PreviewOnlyWorkflowTests(unittest.TestCase):
                 state.end_run(training_run, "COMPLETED", {"status": "COMPLETED"})
 
                 navigation_fp = stage_fingerprint(root, config, state, "navigation", full_hash=True)
+                proposal.write_text(json.dumps({"status": "NAVIGATION_NEEDS_REVIEW",
+                                                "provenance": {"navigation_input_fingerprint": navigation_fp}}),
+                                    encoding="utf-8")
                 state.set_stage("navigation", "NEEDS_REVIEW", navigation_fp, "navigation-digest", None,
                                 {"proposal_path": str(proposal)})
                 generated = root / "generated-reviewer.html"

@@ -271,6 +271,36 @@ async function openModel(format, settings) {
     model = { available: true, filename: 'exhibition.ply', url: params.get('comparisonPlyUrl') };
   }
   if (!model?.available || typeof model.url !== 'string') throw new Error(`${format.toUpperCase()} is not included in this visitor package.`);
+  const navigationEnforced = metadata.navigation?.enforcement === 'APPROVED_COLLISION_ENVELOPE';
+  const collisionRecord = metadata.collision;
+  if (navigationEnforced && (!collisionRecord || collisionRecord.format !== 'glb' ||
+      typeof collisionRecord.url !== 'string' || !/^[a-f0-9]{64}$/i.test(collisionRecord.sha256) ||
+      collisionRecord.navigation_artifact_sha256 !== metadata.navigation.artifact_sha256 ||
+      collisionRecord.navigation_input_fingerprint !== metadata.navigation.input_fingerprint ||
+      collisionRecord.source_model_sha256 !== metadata.master?.sha256 ||
+      metadata.initial_camera?.navigation_artifact_sha256 !== metadata.navigation.artifact_sha256)) {
+    throw new Error('The approved navigation boundary is incomplete. The Visitor will not open without its reviewed collision envelope.');
+  }
+  if (!navigationEnforced && collisionRecord) {
+    throw new Error('A collision boundary is present without an approved navigation status. The Visitor was stopped.');
+  }
+  const collisionDisabled = __EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__ && params.get('collision') === 'off';
+  const collisionUrl = navigationEnforced && !collisionDisabled
+    ? new URL(collisionRecord.url, location.href).href : undefined;
+  if (navigationEnforced && !collisionUrl) {
+    throw new Error('The approved navigation boundary was not passed to the Viewer. The Visitor was stopped.');
+  }
+  if (navigationEnforced) {
+    const collisionResponse = await fetch(collisionUrl, { cache: 'no-cache' });
+    if (!collisionResponse.ok) throw new Error(`Approved navigation boundary asset could not be loaded (${collisionResponse.status}).`);
+    const collisionBytes = await collisionResponse.arrayBuffer();
+    const collisionDigest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', collisionBytes))]
+      .map((value) => value.toString(16).padStart(2, '0')).join('');
+    if (collisionDigest !== collisionRecord.sha256 ||
+        (collisionRecord.size_bytes != null && collisionBytes.byteLength !== collisionRecord.size_bytes)) {
+      throw new Error('Approved navigation boundary failed its SHA-256 or size check. The Visitor was stopped.');
+    }
+  }
   const response = await fetch(model.url, { cache: 'force-cache' });
   if (!response.ok) throw new Error(`${format.toUpperCase()} ${strings[currentLanguage].assetError} (${response.status}).`);
   const handle = await createViewer({
@@ -278,8 +308,7 @@ async function openModel(format, settings) {
     settings,
     contentUrl: model.url,
     contentFilename: model.filename,
-    collisionUrl: (__EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__ && new URLSearchParams(location.search).get('collision') === 'off')
-      ? undefined : metadata.collision?.url,
+    collisionUrl,
     contents: Promise.resolve(response),
     renderer: 'webgpu',
     ui: false,
@@ -288,6 +317,15 @@ async function openModel(format, settings) {
   });
   try {
     await waitForLoaded(handle, format === 'sog' ? 60_000 : 180_000);
+    if (navigationEnforced) {
+      const deadline = Date.now() + 20_000;
+      while (!handle.state.hasCollision && Date.now() < deadline) {
+        await new Promise((resolve) => setTimeout(resolve, 50));
+      }
+      if (!handle.state.hasCollision) {
+        throw new Error('The approved navigation collision envelope did not initialize. The Visitor will not allow unbounded movement.');
+      }
+    }
     applyModelTransform(handle);
     return handle;
   } catch (error) {
@@ -364,7 +402,9 @@ async function installNavigationDiagnostics(handle, settings) {
     <label><input type="checkbox" data-nav-layer="ground"> Photo-SfM lower candidate</label>
     <p data-diagnostic-hover>Hover a camera marker for its image name and track count.</p>
     <p data-diagnostic-projection>Overlay projection will be reported after the camera is ready.</p>
-    <p>Review only. This overlay does not enforce navigation. Visitor movement remains unbounded until a boundary is explicitly approved.</p>`;
+    <p>${metadata.navigation?.enforcement === 'APPROVED_COLLISION_ENVELOPE'
+      ? 'This overlay is visual only. The approved boundary is enforced by the Visitor movement controller.'
+      : 'Review only. The overlay does not enforce navigation. Visitor movement remains unbounded until a boundary is approved.'}</p>`;
   host.append(panel);
   try {
     const overlayUrl = new URL('../diagnostics/navigation-overlay.json', location.href);
