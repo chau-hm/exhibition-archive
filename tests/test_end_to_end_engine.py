@@ -352,6 +352,88 @@ def test_training_resolution_records_source_pixels_and_divisor_one(tmp_path):
     assert report["backend_report_status"] == "PENDING_TRAINING_LOG_INSPECTION"
 
 
+def _legacy_spirula_capabilities():
+    return {
+        "tool": {"name": "legacy fixture Spirula", "executable": "/tmp/spirula", "version": "legacy-test"},
+        "training": {
+            "presets": ["3dgs"],
+            "arguments": ["--quality", "--train-resolution-divisor", "--device", "--steps-per-save",
+                          "--save-only-latest-checkpoint", "--save-full-checkpoint", "--resume", "--scene-center"],
+            "checkpoint": {"latest_only_retention": "VERIFIED_BY_HELP",
+                            "latest_only_prunes_older": "VERIFIED_BY_HELP",
+                            "full_state": "VERIFIED_BY_HELP",
+                            "resume_cli_flag": "VERIFIED_BY_HELP"},
+        },
+    }
+
+
+def _folder_run_patches(capabilities):
+    return (
+        patch("exhibition_archive.backends.discover_environment", return_value=capabilities),
+        patch("exhibition_archive.backends.image_inventory", return_value={"image_count": 2, "formats": {".jpg": 2}, "duplicates": {}}),
+        patch("exhibition_archive.backends.build_sfm_command", return_value=["spirula", "sfm", "--quality", "high"]),
+        patch("exhibition_archive.backends.training_preset_configuration", return_value={"status": "CAPTURED", "effective_parameters": {"--quality": "high"}}),
+        patch("exhibition_archive.environment.inspect_python_environment", return_value={"status": "READY", "blockers": [], "warnings": []}),
+        patch("exhibition_archive.host_capabilities._probe_acceleration", return_value={"status": "unknown", "reason": "fixture"}),
+        patch("exhibition_archive.environment.repair_python_environment", side_effect=AssertionError("dry-run must not install")),
+    )
+
+
+def test_legacy_compatible_folder_run_works_without_new_optional_spirula_flags(tmp_path, capsys):
+    source = tmp_path / "input"
+    output = tmp_path / "legacy-output"
+    source.mkdir()
+    (source / "one.jpg").write_bytes(b"one")
+    (source / "two.jpg").write_bytes(b"two")
+    capabilities = _legacy_spirula_capabilities()
+    patches = _folder_run_patches(capabilities)
+    args = build_parser().parse_args(["run", "--input", str(source), "--output", str(output),
+                                      "--project-id", "legacy-compatible-fixture", "--dry-run", "--json",
+                                      "--host-preflight", "--legacy-compatible-training"])
+    with patches[0], patches[1], patches[2], \
+         patches[3], patches[4], patches[5], patches[6]:
+        code = cmd_run(args)
+    report = json.loads(capsys.readouterr().out)
+
+    assert code == 0
+    assert report["status"].startswith("READY")
+    assert report["configuration"]["training_profile"]["id"] == "indoor-exhibition-high-quality-legacy-compatible"
+    model = report["configuration"]["integrations"]["model"]
+    assert not {"view_sampling", "cache_images", "load_masks"} & model.keys()
+    command = report["backend"]["training_command_template"]
+    assert not {"--view-sampling", "--cache-images", "--load-masks"} & set(command)
+    assert report["host_capabilities"]["required_executables"]["spirula"]["status"] == "available"
+    assert not output.exists()
+
+
+def test_default_profile_stays_explicit_and_host_preflight_parses_backend_failure(tmp_path, capsys):
+    source = tmp_path / "input"
+    output = tmp_path / "default-output"
+    source.mkdir()
+    (source / "one.jpg").write_bytes(b"one")
+    (source / "two.jpg").write_bytes(b"two")
+    capabilities = _legacy_spirula_capabilities()
+    patches = list(_folder_run_patches(capabilities))
+    patches.append(patch("exhibition_archive.backends.build_training_command",
+                         side_effect=BackendError("Configured training.view_sampling is not supported by Spirula", failure_kind="INVALID_CONFIGURATION")))
+    args = build_parser().parse_args(["run", "--input", str(source), "--output", str(output),
+                                      "--project-id", "default-profile-legacy-backend", "--dry-run", "--json",
+                                      "--host-preflight"])
+    with patches[0], patches[1], patches[2], \
+         patches[3], patches[4], patches[5], patches[6], patches[7]:
+        code = cmd_run(args)
+    report = json.loads(capsys.readouterr().out)
+
+    assert code == 2
+    assert report["configuration"]["training_profile"]["id"] == "indoor-exhibition-high-quality"
+    assert report["configuration"]["integrations"]["model"]["view_sampling"] == "uniform"
+    assert report["backend"]["status"] == "UNAVAILABLE_OR_UNSUPPORTED"
+    host_backend = report["host_capabilities"]["required_executables"]["spirula"]
+    assert host_backend["status"] == "unavailable"
+    assert "view_sampling" in host_backend["detail"]
+    assert not output.exists()
+
+
 def test_dry_run_validates_and_does_not_create_output(tmp_path, capsys):
     source = tmp_path / "input"
     output = tmp_path / "new-output"

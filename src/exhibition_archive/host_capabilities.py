@@ -118,6 +118,7 @@ def collect_host_capabilities(output_location: str | Path, *,
                               training_required: bool,
                               backend_required: bool,
                               backend_status: str = "unknown",
+                              backend_reason: str | None = None,
                               python_environment: dict[str, Any] | None = None,
                               device: str | None = None,
                               runner: CommandRunner = subprocess.run,
@@ -152,7 +153,11 @@ def collect_host_capabilities(output_location: str | Path, *,
         else:
             executable_status = "unknown"
         executable = {"status": executable_status, "name": "spirula"}
-        if backend_status and normalized_backend not in {"available", "ready", "ready_backend_dry_run"}:
+        if backend_reason:
+            executable["detail"] = backend_reason
+        elif backend_status and normalized_backend not in {
+                "available", "ready", "ready_backend_dry_run", "unavailable",
+                "unavailable_or_unsupported", "unknown", "not-required"}:
             executable["detail"] = backend_status
     else:
         executable = {"status": "not-required", "name": "spirula"}

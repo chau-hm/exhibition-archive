@@ -52,6 +52,15 @@ class HostCapabilityTests(unittest.TestCase):
         self.assertEqual(report["acceleration"]["status"], "available")
         self.assertEqual(report["acceleration"]["probe"], "vulkaninfo --summary")
 
+    def test_backend_machine_status_and_reason_are_kept_separate(self):
+        report = collect_host_capabilities(
+            "/tmp/output", training_required=True, backend_required=True,
+            backend_status="UNAVAILABLE_OR_UNSUPPORTED",
+            backend_reason="Selected profile flag is unsupported by this Spirula version.")
+        self.assertEqual(report["required_executables"]["spirula"]["status"], "unavailable")
+        self.assertEqual(report["required_executables"]["spirula"]["detail"],
+                         "Selected profile flag is unsupported by this Spirula version.")
+
     def test_missing_selected_backend_is_reported_without_blocking_host_preflight(self):
         report = collect_host_capabilities("/tmp/output", training_required=True,
                                            backend_required=True, backend_status="unavailable")

@@ -9,9 +9,12 @@ from exhibition_archive.cli import _first_visual_config, _persist_project_config
 from exhibition_archive.state import ProjectState
 from exhibition_archive.training_profiles import (
     DEFAULT_TRAINING_PROFILE,
+    LEGACY_COMPATIBLE_TRAINING_PROFILE,
     apply_training_profile,
     apply_training_profile_defaults,
     load_training_profile,
+    record_explicit_training_configuration,
+    refresh_effective_training_configuration,
 )
 from exhibition_archive.workflow import stage_fingerprint
 
@@ -128,6 +131,63 @@ class TrainingProfileTests(unittest.TestCase):
             self.assertIs(resolved["integrations"]["model"]["load_masks"], False)
             self.assertEqual(resolved["integrations"]["model"]["view_sampling"], "uniform")
             self.assertEqual(resolved["training_profile"]["selection_source"], "operator")
+
+    def test_legacy_profile_releases_only_unmodified_optional_profile_values(self):
+        config = {"integrations": {"model": {}}}
+        apply_training_profile(config, DEFAULT_TRAINING_PROFILE)
+        model = config["integrations"]["model"]
+        model["cache_images"] = "cpu"
+        record_explicit_training_configuration(config, "integrations.model.cache_images")
+
+        metadata = apply_training_profile(config, LEGACY_COMPATIBLE_TRAINING_PROFILE)
+        refresh_effective_training_configuration(config)
+
+        model = config["integrations"]["model"]
+        self.assertNotIn("view_sampling", model)
+        self.assertNotIn("load_masks", model)
+        self.assertEqual(model["cache_images"], "cpu")
+        self.assertNotIn("integrations.model.view_sampling", metadata["profile_provided_fields"])
+        self.assertIn("integrations.model.cache_images", metadata["explicitly_configured_fields"])
+        self.assertEqual(config["training_profile"]["id"],
+                         "indoor-exhibition-high-quality-legacy-compatible")
+
+    def test_switching_to_legacy_profile_invalidates_training_but_reuses_sfm(self):
+        with tempfile.TemporaryDirectory() as temporary:
+            base = Path(temporary)
+            photos = base / "photos"
+            photos.mkdir()
+            root, previous = _first_visual_config(photos, base / "output", "legacy-invalidation-test")
+            root.mkdir(parents=True)
+            (root / "project.json").write_text(json.dumps(previous), encoding="utf-8")
+            state = ProjectState(root)
+            old_sfm_fingerprint = stage_fingerprint(root, previous, state, "sfm")
+            old_training_fingerprint = stage_fingerprint(root, previous, state, "training")
+            state.set_stage("sfm", "COMPLETED", old_sfm_fingerprint, "sfm-output", None, {})
+            state.set_stage("training", "COMPLETED", old_training_fingerprint, "training-output", None, {})
+            state.close()
+
+            changed = json.loads(json.dumps(previous))
+            apply_training_profile(changed, LEGACY_COMPATIBLE_TRAINING_PROFILE)
+            refresh_effective_training_configuration(changed)
+            state = ProjectState(root)
+            try:
+                new_sfm_fingerprint = stage_fingerprint(root, changed, state, "sfm")
+                new_training_fingerprint = stage_fingerprint(root, changed, state, "training")
+            finally:
+                state.close()
+            self.assertEqual(old_sfm_fingerprint, new_sfm_fingerprint)
+            self.assertNotEqual(old_training_fingerprint, new_training_fingerprint)
+            invalidated = _persist_project_configuration(root, previous, changed,
+                                                         "selected legacy-compatible training profile")
+
+            state = ProjectState(root)
+            try:
+                self.assertIn("training", invalidated)
+                self.assertNotIn("sfm", invalidated)
+                self.assertEqual(state.stage("sfm")["status"], "COMPLETED")
+                self.assertEqual(state.stage("training")["status"], "INVALIDATED")
+            finally:
+                state.close()
 
     def test_profile_metadata_does_not_change_training_fingerprint_but_effective_values_do(self):
         with tempfile.TemporaryDirectory() as temporary:

@@ -13,6 +13,19 @@ from typing import Any
 PROFILE_SCHEMA_VERSION = "exhibition-archive.training-profile.v1"
 PROVENANCE_SCHEMA_VERSION = "exhibition-archive.training-profile-provenance.v1"
 DEFAULT_TRAINING_PROFILE = "indoor-exhibition-high-quality@v1"
+LEGACY_COMPATIBLE_TRAINING_PROFILE = "indoor-exhibition-high-quality-legacy-compatible@v1"
+
+# Shared defaults are stable across the explicit full and legacy-compatible
+# revisions. The legacy revision leaves newer optional backend settings unset.
+_CORE_HIGH_QUALITY_DEFAULTS = {
+    "quality": "high",
+    "resolution_divisor": 1,
+    "iterations": 30000,
+    "steps_per_save": 5000,
+    "save_full_checkpoint": True,
+    "save_only_latest_checkpoint": True,
+    "device": "auto",
+}
 
 # A published revision is immutable. Behavior changes belong in a new revision.
 _PROFILES: dict[tuple[str, str], dict[str, Any]] = {
@@ -22,17 +35,21 @@ _PROFILES: dict[tuple[str, str], dict[str, Any]] = {
         "revision": "v1",
         "description": "Full-resolution, high-quality 3DGS candidate defaults for indoor exhibitions.",
         "training_defaults": {
-            "quality": "high",
-            "resolution_divisor": 1,
-            "iterations": 30000,
-            "steps_per_save": 5000,
-            "save_full_checkpoint": True,
-            "save_only_latest_checkpoint": True,
+            **_CORE_HIGH_QUALITY_DEFAULTS,
             "view_sampling": "uniform",
             "cache_images": "disk",
             "load_masks": False,
-            "device": "auto",
         },
+    },
+    ("indoor-exhibition-high-quality-legacy-compatible", "v1"): {
+        "schema_version": PROFILE_SCHEMA_VERSION,
+        "id": "indoor-exhibition-high-quality-legacy-compatible",
+        "revision": "v1",
+        "description": (
+            "High-quality defaults for older Spirula CLIs; leaves view sampling, image caching, "
+            "and mask loading to that backend's defaults."
+        ),
+        "training_defaults": dict(_CORE_HIGH_QUALITY_DEFAULTS),
     },
 }
 
@@ -171,6 +188,18 @@ def apply_training_profile_defaults(config: dict[str, Any], profile: dict[str, A
 
     supplied: dict[str, Any] = {}
     explicit: set[str] = set(explicit_fields)
+    for field, old_profile_value in previous_fields.items():
+        key = field.removeprefix("integrations.model.")
+        if key in defaults or field in explicit or key not in model:
+            continue
+        if _same_config_value(model[key], old_profile_value):
+            # A deliberate profile switch can release an unchanged old profile
+            # value back to the backend default when the new profile omits it.
+            del model[key]
+        else:
+            # An edited old profile value is an operator override, even if the
+            # profile field is absent from the newly selected revision.
+            explicit.add(field)
     for key, value in defaults.items():
         path = f"integrations.model.{key}"
         old_profile_value = previous_fields.get(path, _MISSING)

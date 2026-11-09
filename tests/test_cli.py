@@ -95,10 +95,12 @@ class CliSmokeTests(unittest.TestCase):
                                 text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
         self.assertIn("--profile {first-visual}", run.stdout)
         self.assertIn("--training-profile", run.stdout)
+        self.assertIn("--legacy-compatible-training", run.stdout)
         self.assertIn("id@revision", run.stdout)
         self.assertIn("--host-preflight", run.stdout)
         self.assertIn("--host-preflight", plan.stdout)
         self.assertIn("--host-preflight", resume.stdout)
+        self.assertIn("--legacy-compatible-training", resume.stdout)
 
 
 if __name__ == "__main__":

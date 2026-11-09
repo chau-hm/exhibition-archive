@@ -203,10 +203,11 @@ def _first_visual_preflight(input_directory: str | Path, output_directory: str |
     else:
         report["heif_converter"] = {"status": "NOT_REQUIRED"}
     if include_host_preflight:
+        backend_report = report.get("backend", {})
         report["host_capabilities"] = _collect_host_capabilities_safe(
             output, training_required=True, backend_required=True,
-            backend_status=(report.get("backend", {}).get("status", "unknown") +
-                            (": " + report["backend"]["reason"] if report.get("backend", {}).get("reason") else "")),
+            backend_status=backend_report.get("status", "unknown"),
+            backend_reason=backend_report.get("reason"),
             python_environment=python_environment,
             device=config.get("integrations", {}).get("model", {}).get("device"),
         )
@@ -696,6 +697,11 @@ def cmd_run(args) -> int:
     output_directory = getattr(args, "output", None)
     profile = getattr(args, "profile", None)
     training_profile = getattr(args, "training_profile", None)
+    if getattr(args, "legacy_compatible_training", False):
+        if training_profile is not None:
+            raise ValueError("--legacy-compatible-training cannot be combined with --training-profile")
+        from .training_profiles import LEGACY_COMPATIBLE_TRAINING_PROFILE
+        training_profile = LEGACY_COMPATIBLE_TRAINING_PROFILE
     until = getattr(args, "until", None)
     as_json = getattr(args, "json", False)
     environment_report = None
@@ -1517,7 +1523,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scene-type", choices=["auto", "indoor", "outdoor"], default="auto",
                    help="Navigation geometry assumption; auto keeps enclosure type unclassified until evidence is reviewed")
     p.add_argument("--profile", choices=["first-visual"], help="Initial SfM/3DGS and private Reviewer/Visitor preview workflow")
-    p.add_argument("--training-profile", help="Versioned training parameter preset as id@revision (fresh folder runs default to indoor-exhibition-high-quality@v1)")
+    training_profile_options = p.add_mutually_exclusive_group()
+    training_profile_options.add_argument("--training-profile", help="Versioned training parameter preset as id@revision (fresh folder runs default to indoor-exhibition-high-quality@v1)")
+    training_profile_options.add_argument("--legacy-compatible-training", action="store_true",
+        help="Select the distinct legacy-compatible high-quality preset, leaving newer optional Spirula flags to backend defaults")
     p.add_argument("--host-preflight", action="store_true", help="Add read-only, informational host capability observations")
     p.add_argument("--until", choices=["visitor"], help="Stop after the initial Visitor preview is generated")
     p.add_argument("--dry-run", action="store_true", help="Validate inputs and dependencies without creating workspace files or launching backends")
@@ -1548,7 +1557,10 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("resume", help="Resume failed/invalidated stages while reusing valid upstream results")
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true")
     p.add_argument("--profile", choices=["first-visual"], help="Continue through the initial private Reviewer/Visitor preview")
-    p.add_argument("--training-profile", help="Explicitly apply a versioned training parameter preset as id@revision")
+    training_profile_options = p.add_mutually_exclusive_group()
+    training_profile_options.add_argument("--training-profile", help="Explicitly apply a versioned training parameter preset as id@revision")
+    training_profile_options.add_argument("--legacy-compatible-training", action="store_true",
+        help="Select the distinct legacy-compatible high-quality preset, leaving newer optional Spirula flags to backend defaults")
     p.add_argument("--host-preflight", action="store_true", help="Add read-only, informational host capability observations")
     p.add_argument("--until", choices=["visitor"], help="Stop after the initial Visitor preview is generated")
     p.add_argument("--interactive-authorization", action="store_true", help="Explicitly opt into local TTY prompts for fresh SfM/training authorization and SfM component review")
