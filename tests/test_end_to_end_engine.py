@@ -362,6 +362,12 @@ def test_dry_run_validates_and_does_not_create_output(tmp_path, capsys):
 
     def training_command(_executable, _dataset, _attempt, cfg, _capabilities, _attempt_name):
         assert cfg["quality"] == "high"
+        assert cfg["iterations"] == 30000
+        assert cfg["resolution_divisor"] == 1
+        assert cfg["steps_per_save"] == 5000
+        assert cfg["save_full_checkpoint"] is True
+        assert cfg["save_only_latest_checkpoint"] is True
+        assert cfg["device"] == "auto"
         assert cfg["view_sampling"] == "uniform"
         assert cfg["cache_images"] == "disk"
         assert cfg["load_masks"] is False
