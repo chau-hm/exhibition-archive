@@ -63,6 +63,22 @@
       },
       "additionalProperties": true
     },
+    "training_profile": {
+      "type": "object",
+      "description": "Pinned training preset provenance. The effective training values remain authoritative in integrations.model.",
+      "required": ["schema_version", "id", "revision", "selection_source", "profile_defaults", "profile_provided_fields", "explicitly_configured_fields", "effective_training_configuration"],
+      "properties": {
+        "schema_version": {"const": "exhibition-archive.training-profile-provenance.v1"},
+        "id": {"type": "string", "minLength": 1},
+        "revision": {"type": "string", "minLength": 1},
+        "selection_source": {"enum": ["default", "operator"]},
+        "profile_defaults": {"type": "object"},
+        "profile_provided_fields": {"type": "object"},
+        "explicitly_configured_fields": {"type": "array", "items": {"type": "string"}},
+        "effective_training_configuration": {"type": "object"}
+      },
+      "additionalProperties": false
+    },
     "integrations": {
       "type": "object",
       "description": "Optional artifact adapters. Paths may be absolute or relative to the project workspace.",

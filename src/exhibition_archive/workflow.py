@@ -1669,13 +1669,14 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
         "dataset_links": {"images": str((training_dataset / "images").resolve()),
                           "sparse/0": str((training_dataset / "sparse/0").resolve())},
         "run_type": cfg["run_type"],
+        "training_profile_provenance": config.get("training_profile"),
         "source_photos_modified": False,
     }
     manifest_path = attempt / "training-input-manifest.json"
     write_json(manifest_path, training_manifest)
     input_validation_path = attempt / "training-input-validation.json"
     write_json(input_validation_path, input_validation)
-    command_record = {"stage": "training", "attempt_id": attempt.name, "engine_execution_id": execution_id, "backend_version": capabilities["tool"]["version"], "run_name": run_name, "run_type": cfg["run_type"], "configuration": {k:v for k,v in cfg.items() if k not in {"environment_overrides"}}, "effective_training_configuration": effective_training_configuration, "training_resolution": resolution_request, "command": command, "cwd": str(attempt.resolve()), "environment_override_keys": sorted(env_overrides), "resource_check": resources, "resource_limits": training_limits, "checkpoint_policy": checkpoint_policy, "resume_checkpoint_identity": resume_identity, "expected_output_prefix": str(backend_output_dir.resolve()), "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "started_at_utc": utc_now(), "artifact_discovery_status": "NOT_STARTED", "validation_result": {"status": "NOT_RUN"}}
+    command_record = {"stage": "training", "attempt_id": attempt.name, "engine_execution_id": execution_id, "backend_version": capabilities["tool"]["version"], "run_name": run_name, "run_type": cfg["run_type"], "configuration": {k:v for k,v in cfg.items() if k not in {"environment_overrides"}}, "training_profile_provenance": config.get("training_profile"), "effective_training_configuration": effective_training_configuration, "training_resolution": resolution_request, "command": command, "cwd": str(attempt.resolve()), "environment_override_keys": sorted(env_overrides), "resource_check": resources, "resource_limits": training_limits, "checkpoint_policy": checkpoint_policy, "resume_checkpoint_identity": resume_identity, "expected_output_prefix": str(backend_output_dir.resolve()), "checkpoint_resume_capability": capabilities["training"]["checkpoint"], "started_at_utc": utc_now(), "artifact_discovery_status": "NOT_STARTED", "validation_result": {"status": "NOT_RUN"}}
     write_json(attempt / "command.json", command_record)
     if not authorization_plan_id:
         raise AuthorizationRequired("training", "Fresh training execution requires an explicit one-time authorization. Run plan --full-hash, then authorize the displayed plan_id.")
@@ -1716,6 +1717,7 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
                   "public_selection_allowed": False, "backend": "spirula", "backend_version": capabilities["tool"]["version"],
                   "elapsed_seconds": execution["elapsed_seconds"], "exit_code": execution["exit_code"], "log_path": execution["log_path"],
                   "command": command, "configuration": command_record["configuration"],
+                  "training_profile_provenance": config.get("training_profile"),
                   "effective_training_configuration": effective_training_configuration, "resource_check": resources,
                   "resource_limits": training_limits, "checkpoint_policy": checkpoint_policy,
                   "resume_checkpoint_identity": resume_identity,
@@ -1739,7 +1741,7 @@ def execute_fresh_training(root: Path, config: dict, state: ProjectState, output
     artifacts = [model_path, validation_path, run_path, manifest_path, input_validation_path, attempt / "command.json", attempt / "spirula.log"]
     return {"status": "COMPLETED", "artifacts": artifacts,
             "artifact_types": {str(path): ("3dgs-ply" if path.suffix.casefold() == ".ply" else ("text" if path.suffix == ".log" else "json")) for path in artifacts},
-            "details": {"model_status": run_report["model_status"], "run_type": cfg["run_type"], "public_selection_allowed": False, "model_path": str(model_path.resolve()), "model_sha256": model_validation["sha256"], "gaussian_count": model_validation["gaussian_count"], "file_bytes": model_validation["file_bytes"], "validation_path": str(validation_path.resolve()), "training_run_path": str(run_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "backend_version": capabilities["tool"]["version"], "training_iterations_requested": cfg["iterations"], "training_effective_configuration_status": effective_training_configuration["status"], "training_effective_configuration_sha256": json_digest(effective_training_configuration), "training_resolution": training_resolution, "training_progress": "FINAL_EXIT_ONLY; intermediate progress is available only in the log", "checkpoint_resume_execution_status": "NOT_TESTED", "discovered_checkpoints": checkpoints, "sfm_component_id": sfm_scope["component_id"], "sfm_component_acceptance_audit_identity": (sfm_scope["acceptance"] or {}).get("audit_identity"), "training_registered_image_count": len(selected_source_rows), "training_source_directory_image_count": dataset_images["image_count"]}}
+            "details": {"model_status": run_report["model_status"], "run_type": cfg["run_type"], "public_selection_allowed": False, "model_path": str(model_path.resolve()), "model_sha256": model_validation["sha256"], "gaussian_count": model_validation["gaussian_count"], "file_bytes": model_validation["file_bytes"], "validation_path": str(validation_path.resolve()), "training_run_path": str(run_path.resolve()), "attempt_directory": str(attempt.resolve()), "log_path": execution["log_path"], "backend_version": capabilities["tool"]["version"], "training_iterations_requested": cfg["iterations"], "training_profile_provenance": config.get("training_profile"), "training_effective_configuration_status": effective_training_configuration["status"], "training_effective_configuration_sha256": json_digest(effective_training_configuration), "training_resolution": training_resolution, "training_progress": "FINAL_EXIT_ONLY; intermediate progress is available only in the log", "checkpoint_resume_execution_status": "NOT_TESTED", "discovered_checkpoints": checkpoints, "sfm_component_id": sfm_scope["component_id"], "sfm_component_acceptance_audit_identity": (sfm_scope["acceptance"] or {}).get("audit_identity"), "training_registered_image_count": len(selected_source_rows), "training_source_directory_image_count": dataset_images["image_count"]}}
 
 
 def fresh_evaluation_stage(root: Path, config: dict, state: ProjectState, output_dir: Path) -> dict:
@@ -2005,11 +2007,20 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
             has_cfg = bool(group_cfg)
             configured_mode = group_cfg.get("mode", "adopt_existing") if group in {"sfm", "model", "navigation"} else "adopt_existing"
             mode = configured_mode.upper() if has_cfg else ("IMAGE_ONLY_ADAPTER" if sid == "capture_preflight" else "INTERFACE_ONLY")
+            backend_probe_status = "unknown" if configured_mode == "spirula_fresh" else "not-required"
             readiness = "READY" if has_cfg else ("READY_WITH_IMAGE_ONLY" if sid == "capture_preflight" else "BLOCKED_NO_CONFIGURED_ARTIFACT")
             planned_command = None
             if has_cfg and sid in {"sfm", "training"} and configured_mode == "spirula_fresh":
                 try:
-                    backend = discover_environment(group_cfg.get("executable")) if discover_backends else None
+                    backend = None
+                    if discover_backends:
+                        backend_probe_status = "unknown"
+                        try:
+                            backend = discover_environment(group_cfg.get("executable"))
+                            backend_probe_status = "available"
+                        except (BackendError, OSError, KeyError, TypeError, ValueError):
+                            backend_probe_status = "unavailable"
+                            raise
                     executable = Path(backend["tool"]["executable"]) if backend else Path(group_cfg.get("executable") or "spirula")
                     attempt_id = "<next-unique-attempt>"
                     attempt = output_path(root, config) / "backend-runs" / sid / attempt_id
@@ -2079,6 +2090,8 @@ def plan(root: Path, config: dict, state: ProjectState, discover_backends: bool 
             readiness = ("READY_EXPERIMENTAL_TRAINING_WITH_SCOPED_ACCEPTANCE"
                          if training_scope["acceptance_required"] else "READY_BACKEND_DRY_RUN")
         row = {**stage, "deps": deps, "execution_mode": mode, "readiness": readiness, "current_status": stages.get(sid, {}).get("status", "PENDING")}
+        if sid in {"sfm", "training"} and configured_mode == "spirula_fresh":
+            row["backend_probe_status"] = backend_probe_status
         if planned_command is not None: row["planned_command"] = planned_command
         result.append(row)
     return result

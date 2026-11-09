@@ -86,6 +86,17 @@ class CliSmokeTests(unittest.TestCase):
         self.assertIn("--evidence", result.stdout)
         self.assertIn("--confirm-no-active-processes", result.stdout)
 
+    def test_training_parameter_profile_and_host_preflight_have_distinct_cli_flags(self):
+        run = subprocess.run([str(LAUNCHER), "run", "--help"], cwd="/private/tmp",
+                             text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
+        plan = subprocess.run([str(LAUNCHER), "plan", "--help"], cwd="/private/tmp",
+                              text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, check=True)
+        self.assertIn("--profile {first-visual}", run.stdout)
+        self.assertIn("--training-profile", run.stdout)
+        self.assertIn("id@revision", run.stdout)
+        self.assertIn("--host-preflight", run.stdout)
+        self.assertIn("--host-preflight", plan.stdout)
+
 
 if __name__ == "__main__":
     unittest.main()

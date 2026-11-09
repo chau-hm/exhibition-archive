@@ -359,21 +359,34 @@ def test_dry_run_validates_and_does_not_create_output(tmp_path, capsys):
     (source / "one.jpg").write_bytes(b"one")
     (source / "two.jpg").write_bytes(b"two")
     capabilities = {"tool": {"name": "fixture Spirula", "executable": "/tmp/spirula", "version": "test"}}
+
+    def training_command(_executable, _dataset, _attempt, cfg, _capabilities, _attempt_name):
+        assert cfg["quality"] == "high"
+        assert cfg["view_sampling"] == "uniform"
+        assert cfg["cache_images"] == "disk"
+        assert cfg["load_masks"] is False
+        return ["spirula", "train", "3dgs", "--train-resolution-divisor", "1"]
+
     with patch("exhibition_archive.backends.discover_environment", return_value=capabilities), \
          patch("exhibition_archive.backends.image_inventory", return_value={"image_count": 2, "formats": {".jpg": 2}, "duplicates": {}}), \
          patch("exhibition_archive.backends.build_sfm_command", return_value=["spirula", "sfm", "--quality", "high"]), \
-         patch("exhibition_archive.backends.build_training_command", return_value=["spirula", "train", "3dgs", "--train-resolution-divisor", "1"]), \
+         patch("exhibition_archive.backends.build_training_command", side_effect=training_command), \
          patch("exhibition_archive.backends.training_preset_configuration", return_value={"status": "CAPTURED", "effective_parameters": {"--train-resolution-divisor": "1"}}), \
          patch("exhibition_archive.environment.inspect_python_environment", return_value={"status": "READY", "blockers": [], "warnings": []}), \
+         patch("exhibition_archive.host_capabilities._probe_acceleration", return_value={"status": "unknown", "reason": "fixture"}), \
          patch("exhibition_archive.environment.repair_python_environment", side_effect=AssertionError("dry-run must not install")):
         args = build_parser().parse_args(["run", "--input", str(source), "--output", str(output),
-                                          "--project-id", "playground-fixture", "--dry-run", "--json"])
+                                          "--project-id", "playground-fixture", "--dry-run", "--json",
+                                          "--host-preflight"])
         code = cmd_run(args)
     result = json.loads(capsys.readouterr().out)
     assert code == 0
     assert result["status"].startswith("READY")
     assert result["backend"]["training_process_launched"] is False
     assert result["backend"]["training_effective_configuration"]["status"] == "CAPTURED"
+    assert result["configuration"]["training_profile"]["revision"] == "v1"
+    assert result["host_capabilities"]["acceleration"]["status"] == "unknown"
+    assert result["host_capabilities"]["execution_blocked_by_this_report"] is False
     assert not output.exists()
 
 
