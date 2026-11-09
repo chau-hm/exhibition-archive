@@ -27,7 +27,8 @@ PRODUCT_ROOT = Path(__file__).resolve().parents[2]
 
 def _first_visual_config(input_directory: str | Path, output_directory: str | Path,
                          project_id: str, lidar_mode: str = "auto",
-                         scene_type: str = "auto") -> tuple[Path, dict]:
+                         scene_type: str = "auto",
+                         training_profile: str | None = None) -> tuple[Path, dict]:
     source = Path(input_directory).expanduser().resolve()
     output = Path(output_directory).expanduser().resolve()
     if not source.is_dir():
@@ -54,9 +55,7 @@ def _first_visual_config(input_directory: str | Path, output_directory: str | Pa
                             "allow_training_with_warnings": False}}
     model = {"mode": "spirula_fresh", "run_type": "candidate", "preset": "3dgs",
              "data_format": "colmap", "image_directory": image_directory,
-             "iterations": 30000, "resolution_divisor": 1, "quality": "high",
-             "scene_center": "none", "device": "auto", "steps_per_save": 5000,
-             "save_only_latest_checkpoint": True, "save_full_checkpoint": True}
+             "scene_center": "none"}
     if derived_manifest:
         sfm["derived_image_manifest"] = derived_manifest
         sfm["image_directory"] = "derived/input-images"
@@ -104,22 +103,43 @@ def _first_visual_config(input_directory: str | Path, output_directory: str | Pa
             raise ValueError("The existing project uses a different LiDAR policy; change it explicitly in project.json before resuming")
         if existing.get("integrations", {}).get("navigation", {}).get("scene_type", "auto") != scene_type:
             raise ValueError("The existing project uses a different scene_type; change it explicitly in project.json before resuming")
+        if training_profile is not None:
+            from .training_profiles import apply_training_profile, refresh_effective_training_configuration
+            apply_training_profile(existing, training_profile, selection_source="operator")
+            refresh_effective_training_configuration(existing)
         return existing_root, existing
+    from .training_profiles import (DEFAULT_TRAINING_PROFILE, apply_training_profile,
+                                    refresh_effective_training_configuration)
+    selected_training_profile = DEFAULT_TRAINING_PROFILE if training_profile is None else training_profile
+    apply_training_profile(config, selected_training_profile,
+                           selection_source="operator" if training_profile else "default")
+    # Preserve the Engine's existing defaults for fields the selected profile
+    # does not define. Profile values resolve first, so they take precedence.
+    model_defaults = {"iterations": 30000, "resolution_divisor": 1, "quality": "high",
+                      "device": "auto", "steps_per_save": 5000,
+                      "save_only_latest_checkpoint": True, "save_full_checkpoint": True}
+    for key, value in model_defaults.items():
+        config["integrations"]["model"].setdefault(key, value)
+    refresh_effective_training_configuration(config)
     return workspace, config
 
 
 def _first_visual_preflight(input_directory: str | Path, output_directory: str | Path,
                             project_id: str, lidar_mode: str = "auto",
-                            scene_type: str = "auto") -> dict:
+                            scene_type: str = "auto",
+                            training_profile: str | None = None,
+                            include_host_preflight: bool = False) -> dict:
     from .lidar import discover_input_files
     from .backends import (BackendError, build_sfm_command, build_training_command,
                            discover_environment, image_inventory, training_preset_configuration)
-    root, config = _first_visual_config(input_directory, output_directory, project_id, lidar_mode, scene_type)
+    root, config = _first_visual_config(input_directory, output_directory, project_id, lidar_mode,
+                                        scene_type, training_profile)
     source = Path(config["source"]["photo_directory"])
     output = output_path(root, config)
     discovery = discover_input_files(source, hash_images=False, hash_ply=False)
     report = {"status": "READY_TO_PLAN", "project_id": project_id, "input_directory": str(source),
               "output_directory": str(output), "workspace": str(root), "photo_count": discovery["image_count"],
+              "existing_project": (root / "project.json").is_file(),
               "image_formats": discovery["image_formats"], "ply_candidates": discovery["ply_files"],
               "unsupported_raw_images": discovery["unsupported_raw_images"],
               "ignored_file_count": discovery["ignored_file_count"],
@@ -182,6 +202,15 @@ def _first_visual_preflight(input_directory: str | Path, output_directory: str |
             report["blockers"].append(f"HEIC/HEIF input requires the existing libheif preparation pathway: {exc}")
     else:
         report["heif_converter"] = {"status": "NOT_REQUIRED"}
+    if include_host_preflight:
+        backend_report = report.get("backend", {})
+        report["host_capabilities"] = _collect_host_capabilities_safe(
+            output, training_required=True, backend_required=True,
+            backend_status=backend_report.get("status", "unknown"),
+            backend_reason=backend_report.get("reason"),
+            python_environment=python_environment,
+            device=config.get("integrations", {}).get("model", {}).get("device"),
+        )
     visitor_vendor = PRODUCT_ROOT / "templates" / "visitor" / "vendor"
     required_viewer_files = [visitor_vendor / name for name in ("supersplat-viewer.css", "supersplat-viewer.js",
         "SUPERSPLAT-VIEWER-LICENSE.txt", "PLAYCANVAS-LICENSE.txt", "THIRD_PARTY-NOTICES.md", "runtime.json", "visitor-app.js")]
@@ -222,7 +251,66 @@ def _first_visual_preflight(input_directory: str | Path, output_directory: str |
     return report
 
 
-def _report_preflight(report: dict, *, as_json: bool = False, file=None) -> None:
+def _report_host_capabilities(host: dict, *, file=None, verbose: bool = False,
+                              include_python_status: bool = True,
+                              include_executable_status: bool = True,
+                              include_optional_capabilities: bool = True) -> None:
+    stream = file or sys.stdout
+    platform_info = host.get("platform", {})
+    executable = host.get("required_executables", {}).get("spirula", {})
+    acceleration = host.get("acceleration", {})
+    disk = host.get("disk_capacity", {})
+    free_bytes = disk.get("free_bytes")
+    total_bytes = disk.get("total_bytes")
+    disk_detail = (f"{free_bytes / 1024**3:.1f} GiB free / {total_bytes / 1024**3:.1f} GiB total"
+                   if isinstance(free_bytes, int) and isinstance(total_bytes, int) else disk.get("reason", "not measured"))
+    print("Host capability preflight (informational)", file=stream)
+    print(f"  Platform: {platform_info.get('system', 'unknown')} {platform_info.get('release', '')} · {platform_info.get('architecture', 'unknown')}", file=stream)
+    if include_python_status:
+        print(f"  Python environment: {host.get('python_environment', {}).get('status', 'unknown')}", file=stream)
+    if include_executable_status:
+        print(f"  Spirula executable: {executable.get('status', 'unknown')}", file=stream)
+    print(f"  Host acceleration: {acceleration.get('status', 'unknown')}", file=stream)
+    print(f"  Disk capacity: {disk.get('status', 'unknown')} · {disk_detail}", file=stream)
+    print(f"  Selected backend device: {host.get('selected_backend_device', {}).get('status', 'unknown')}", file=stream)
+    optional = host.get("optional_capabilities", {}).get("lidar_registration", "unknown")
+    if include_optional_capabilities and optional != "unknown":
+        print(f"  Optional LiDAR registration: {optional}", file=stream)
+    if verbose:
+        for key, row in (("Spirula", executable), ("Acceleration", acceleration), ("Disk", disk),
+                         ("Backend device", host.get("selected_backend_device", {}))):
+            detail = row.get("detail") or row.get("reason") or row.get("evidence")
+            if detail:
+                print(f"  {key} detail: {detail}", file=stream)
+
+
+def _unknown_host_capabilities(reason: str) -> dict:
+    """Keep an optional host probe failure informational and non-blocking."""
+    return {
+        "schema_version": "exhibition-archive.host-capabilities.v1",
+        "informational": True,
+        "platform": {"system": "unknown", "release": "unknown", "architecture": "unknown"},
+        "python_environment": {"status": "unknown", "engine_report_status": "UNKNOWN"},
+        "required_executables": {"spirula": {"status": "unknown", "name": "spirula"}},
+        "acceleration": {"status": "unknown", "reason": reason},
+        "selected_backend_device": {"status": "unknown", "reason": reason},
+        "optional_capabilities": {"lidar_registration": "unknown"},
+        "disk_capacity": {"status": "unknown", "reason": reason},
+        "preflight_error": reason,
+        "execution_blocked_by_this_report": False,
+    }
+
+
+def _collect_host_capabilities_safe(output_location: str | Path, **kwargs) -> dict:
+    from .host_capabilities import collect_host_capabilities
+    try:
+        return collect_host_capabilities(output_location, **kwargs)
+    except Exception as exc:
+        return _unknown_host_capabilities(f"Host capability preflight failed: {type(exc).__name__}: {exc}")
+
+
+def _report_preflight(report: dict, *, as_json: bool = False, file=None,
+                      verbose: bool = False) -> None:
     stream = file or sys.stdout
     if as_json:
         print(json.dumps(report, indent=2, ensure_ascii=False), file=stream)
@@ -251,6 +339,17 @@ def _report_preflight(report: dict, *, as_json: bool = False, file=None) -> None
         training = backend.get("training_effective_configuration", {})
         if training:
             print(f"Training preset: {training.get('preset')} / {training.get('quality')} · effective settings: {training.get('effective_parameter_count', 'unknown')}", file=stream)
+    profile = report.get("training_profile") or report.get("configuration", {}).get("training_profile")
+    if profile:
+        reference = f"{profile.get('id', 'unknown')}@{profile.get('revision', 'unknown')}"
+        print(f"Training parameter profile: {reference} · {len(profile.get('profile_provided_fields', {}))} defaults supplied · {len(profile.get('explicitly_configured_fields', []))} explicit fields preserved", file=stream)
+    if report.get("host_capabilities"):
+        _report_host_capabilities(
+            report["host_capabilities"], file=stream, verbose=verbose,
+            include_python_status=not bool(report.get("python_environment")),
+            include_executable_status=not bool(report.get("backend")),
+            include_optional_capabilities=not bool(report.get("optional_lidar_registration")),
+        )
     if report.get("optional_lidar_registration"):
         print(f"LiDAR registration dependency: {report['optional_lidar_registration'].get('status')}", file=stream)
     for warning in report.get("warnings", []):
@@ -532,9 +631,37 @@ def cmd_plan(args) -> int:
                         print("  fresh backend authorization plan: " + json.dumps(execution_plan, ensure_ascii=False))
                     except Exception as exc:
                         print(f"  fresh backend authorization unavailable: {exc}")
+        if getattr(args, "host_preflight", False):
+            try:
+                python_environment = _project_environment(root, config)
+                host = _host_capabilities_for_plan(root, config, result, python_environment)
+            except Exception as exc:
+                host = _unknown_host_capabilities(
+                    f"Host capability preflight failed: {type(exc).__name__}: {exc}")
+            _report_host_capabilities(host, verbose=getattr(args, "verbose", False))
         return 0
     finally:
         state.close()
+
+
+def _host_capabilities_for_plan(root: Path, config: dict, plan_rows: list[dict],
+                                python_environment: dict | None = None) -> dict:
+    pending_fresh = [row for row in plan_rows
+                     if row.get("execution_mode", "").casefold() == "spirula_fresh"
+                     and row.get("current_status") not in {"COMPLETED", "ADOPTED"}]
+    backend_required = bool(pending_fresh)
+    training_required = any(row.get("id") == "training" for row in pending_fresh)
+    backend_status = "not-required"
+    if backend_required:
+        observations = {row.get("backend_probe_status", "unknown") for row in pending_fresh}
+        backend_status = ("unavailable" if "unavailable" in observations else
+                          "available" if observations == {"available"} else "unknown")
+    return _collect_host_capabilities_safe(
+        output_path(root, config), training_required=training_required,
+        backend_required=backend_required, backend_status=backend_status,
+        python_environment=python_environment,
+        device=config.get("integrations", {}).get("model", {}).get("device"),
+    )
 
 
 def cmd_authorize(args) -> int:
@@ -569,6 +696,12 @@ def cmd_run(args) -> int:
     input_directory = getattr(args, "input", None)
     output_directory = getattr(args, "output", None)
     profile = getattr(args, "profile", None)
+    training_profile = getattr(args, "training_profile", None)
+    if getattr(args, "legacy_compatible_training", False):
+        if training_profile is not None:
+            raise ValueError("--legacy-compatible-training cannot be combined with --training-profile")
+        from .training_profiles import LEGACY_COMPATIBLE_TRAINING_PROFILE
+        training_profile = LEGACY_COMPATIBLE_TRAINING_PROFILE
     until = getattr(args, "until", None)
     as_json = getattr(args, "json", False)
     environment_report = None
@@ -588,17 +721,28 @@ def cmd_run(args) -> int:
         until = until or "visitor"
         if getattr(args, "dry_run", False):
             preflight = _first_visual_preflight(input_directory, output_directory, args.project_id,
-                                                getattr(args, "lidar", "auto"), getattr(args, "scene_type", "auto"))
-            _report_preflight(preflight, as_json=as_json)
+                                                getattr(args, "lidar", "auto"), getattr(args, "scene_type", "auto"),
+                                                training_profile, getattr(args, "host_preflight", False))
+            _report_preflight(preflight, as_json=as_json, verbose=getattr(args, "verbose", False))
             return 0 if preflight["status"].startswith("READY") else 2
         preflight = _first_visual_preflight(input_directory, output_directory, args.project_id,
-                                            getattr(args, "lidar", "auto"), getattr(args, "scene_type", "auto"))
-        _report_preflight(preflight, as_json=as_json, file=sys.stderr)
+                                            getattr(args, "lidar", "auto"), getattr(args, "scene_type", "auto"),
+                                            training_profile, getattr(args, "host_preflight", False))
+        _report_preflight(preflight, as_json=as_json, file=sys.stderr,
+                          verbose=getattr(args, "verbose", False))
         if preflight["blockers"]:
             return 2
         root = Path(preflight["workspace"])
         config = preflight["configuration"]
         project_file = root / "project.json"
+        if preflight.get("existing_project") and training_profile:
+            previous_config = read_json(project_file)
+            if previous_config != config:
+                invalidated = _persist_project_configuration(
+                    root, previous_config, config,
+                    f"selected training profile {training_profile}")
+                print("Training profile configuration updated; invalidated stages: " +
+                      (", ".join(invalidated) or "none"), file=sys.stderr)
         if not project_file.is_file():
             output = Path(output_directory).expanduser().resolve()
             if output.exists() and any(output.iterdir()):
@@ -610,12 +754,38 @@ def cmd_run(args) -> int:
         if not getattr(args, "project", None):
             raise ValueError("run/resume requires a project workspace or --input/--output/--project-id")
         root, config = load_project(args.project)
+        if training_profile:
+            previous_config = json.loads(json.dumps(config))
+            from .training_profiles import apply_training_profile, refresh_effective_training_configuration
+            apply_training_profile(config, training_profile, selection_source="operator")
+            refresh_effective_training_configuration(config)
+            if previous_config != config:
+                invalidated = _persist_project_configuration(
+                    root, previous_config, config,
+                    f"selected training profile {training_profile}")
+                print("Training profile configuration updated; invalidated stages: " +
+                      (", ".join(invalidated) or "none"), file=sys.stderr)
         environment_report = _project_environment(root, config)
-        _report_preflight({"status": environment_report.get("status"), "project_id": config["project_id"],
-                           "python_environment": environment_report,
-                           "blockers": environment_report.get("blockers", []),
-                           "warnings": environment_report.get("warnings", [])},
-                          as_json=as_json, file=sys.stderr)
+        project_preflight = {"status": environment_report.get("status"), "project_id": config["project_id"],
+                             "python_environment": environment_report,
+                             "blockers": environment_report.get("blockers", []),
+                             "warnings": environment_report.get("warnings", [])}
+        if config.get("training_profile"):
+            project_preflight["training_profile"] = config["training_profile"]
+        if getattr(args, "host_preflight", False):
+            try:
+                state_for_plan = ProjectState(root)
+                try:
+                    rows = plan(root, config, state_for_plan, discover_backends=True)
+                finally:
+                    state_for_plan.close()
+                project_preflight["host_capabilities"] = _host_capabilities_for_plan(
+                    root, config, rows, environment_report)
+            except Exception as exc:
+                project_preflight["host_capabilities"] = _unknown_host_capabilities(
+                    f"Host capability preflight failed: {type(exc).__name__}: {exc}")
+        _report_preflight(project_preflight, as_json=as_json, file=sys.stderr,
+                          verbose=getattr(args, "verbose", False))
     if environment_report.get("bootstrap", {}).get("command") and environment_report.get("status") != "READY":
         print("\nEnvironment preparation is being checked before reconstruction. No SfM or training is authorized by this step.", file=sys.stderr)
     if profile and profile != "first-visual":
@@ -1068,8 +1238,7 @@ def cmd_preview(args) -> int:
 
 def cmd_config_set(args) -> int:
     root, config = load_project(args.project)
-    state = ProjectState(root)
-    before = {stage["id"]: stage_fingerprint(root, config, state, stage["id"]) for stage in STAGES}
+    previous_config = json.loads(json.dumps(config))
     keys = args.key.split(".")
     cursor = config
     for key in keys[:-1]:
@@ -1078,25 +1247,48 @@ def cmd_config_set(args) -> int:
     try: value = json.loads(args.value)
     except json.JSONDecodeError: value = args.value
     cursor[keys[-1]] = value
-    write_json(root / "project.json", config)
-    invalidated = []
+    from .training_profiles import record_explicit_training_configuration
+    record_explicit_training_configuration(config, args.key)
+    invalidated = _persist_project_configuration(root, previous_config, config,
+                                                  f"configuration changed at {args.key}",
+                                                  navigation_reason=f"Navigation inputs changed at {args.key}")
+    print(json.dumps({"updated": args.key, "value": value, "invalidated": invalidated}, indent=2))
+    return 0
+
+
+def _persist_project_configuration(root: Path, previous_config: dict, config: dict,
+                                    reason: str, *, navigation_reason: str | None = None) -> list[str]:
+    """Persist one config update through the existing selective invalidation path."""
+    state = ProjectState(root)
     try:
-        for stage in STAGES:
-            sid = stage["id"]
-            after = stage_fingerprint(root, config, state, sid)
-            prior = state.stage(sid)
-            if prior and before[sid] != after and prior["status"] in {"COMPLETED", "ADOPTED", "NEEDS_REVIEW"}:
-                state.set_stage(sid, "INVALIDATED", prior["input_fingerprint"], prior["output_digest"], prior["last_execution_id"], {"reason": f"configuration changed at {args.key}", "previous_details": json.loads(prior["details_json"] or "{}")})
-                invalidated.append(sid)
-            elif prior and prior["status"] == "INVALIDATED" and prior.get("input_fingerprint") == after:
-                previous = state.db.execute("SELECT status,details_json FROM stage_executions WHERE execution_id=?", (prior.get("last_execution_id"),)).fetchone()
-                if previous and previous["status"] in {"COMPLETED", "ADOPTED"}:
-                    state.set_stage(sid, previous["status"], after, prior.get("output_digest"), prior.get("last_execution_id"), json.loads(previous["details_json"] or "{}"))
-        if "navigation" in invalidated:
-            from .navigation_review import invalidate_navigation_approval
-            invalidate_navigation_approval(state, f"Navigation inputs changed at {args.key}", stage_fingerprint(root, config, state, "navigation"))
-        print(json.dumps({"updated": args.key, "value": value, "invalidated": invalidated}, indent=2))
-        return 0
+        invalidated: list[str] = []
+        with state.lock():
+            before = {stage["id"]: stage_fingerprint(root, previous_config, state, stage["id"])
+                      for stage in STAGES}
+            write_json(root / "project.json", config)
+            for stage in STAGES:
+                sid = stage["id"]
+                after = stage_fingerprint(root, config, state, sid)
+                prior = state.stage(sid)
+                if prior and before[sid] != after and prior["status"] in {"COMPLETED", "ADOPTED", "NEEDS_REVIEW"}:
+                    state.set_stage(sid, "INVALIDATED", prior["input_fingerprint"], prior["output_digest"],
+                                    prior["last_execution_id"], {"reason": reason,
+                                    "previous_details": json.loads(prior["details_json"] or "{}")})
+                    invalidated.append(sid)
+                elif prior and prior["status"] == "INVALIDATED" and prior.get("input_fingerprint") == after:
+                    previous = state.db.execute(
+                        "SELECT status,details_json FROM stage_executions WHERE execution_id=?",
+                        (prior.get("last_execution_id"),)).fetchone()
+                    if previous and previous["status"] in {"COMPLETED", "ADOPTED"}:
+                        state.set_stage(sid, previous["status"], after, prior.get("output_digest"),
+                                        prior.get("last_execution_id"),
+                                        json.loads(previous["details_json"] or "{}"))
+            if "navigation" in invalidated:
+                from .navigation_review import invalidate_navigation_approval
+                invalidate_navigation_approval(
+                    state, navigation_reason or f"{reason}; navigation inputs changed",
+                    stage_fingerprint(root, config, state, "navigation"))
+        return invalidated
     finally:
         state.close()
 
@@ -1314,7 +1506,10 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--config", help="Complete generic project manifest JSON")
     p.set_defaults(func=cmd_init)
     p = sub.add_parser("plan", help="Show workflow stages, dependencies, readiness, and configured adapters")
-    p.add_argument("project"); p.add_argument("--full-hash", action="store_true", help="Force-hash inputs and show the exact plan identity required for fresh SfM/training authorization"); p.set_defaults(func=cmd_plan)
+    p.add_argument("project"); p.add_argument("--full-hash", action="store_true", help="Force-hash inputs and show the exact plan identity required for fresh SfM/training authorization")
+    p.add_argument("--host-preflight", action="store_true", help="Add read-only, informational host capability observations")
+    p.add_argument("--verbose", action="store_true", help="Show host probe details")
+    p.set_defaults(func=cmd_plan)
     p = sub.add_parser("authorize", help="Record a one-time operator approval for the current fresh SfM or training plan")
     p.add_argument("project"); p.add_argument("--stage", choices=["sfm", "training"], required=True)
     p.add_argument("--plan-id", required=True); p.add_argument("--reviewer", required=True); p.add_argument("--rationale", required=True)
@@ -1328,6 +1523,11 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--scene-type", choices=["auto", "indoor", "outdoor"], default="auto",
                    help="Navigation geometry assumption; auto keeps enclosure type unclassified until evidence is reviewed")
     p.add_argument("--profile", choices=["first-visual"], help="Initial SfM/3DGS and private Reviewer/Visitor preview workflow")
+    training_profile_options = p.add_mutually_exclusive_group()
+    training_profile_options.add_argument("--training-profile", help="Versioned training parameter preset as id@revision (fresh folder runs default to indoor-exhibition-high-quality@v1)")
+    training_profile_options.add_argument("--legacy-compatible-training", action="store_true",
+        help="Select the distinct legacy-compatible high-quality preset, leaving newer optional Spirula flags to backend defaults")
+    p.add_argument("--host-preflight", action="store_true", help="Add read-only, informational host capability observations")
     p.add_argument("--until", choices=["visitor"], help="Stop after the initial Visitor preview is generated")
     p.add_argument("--dry-run", action="store_true", help="Validate inputs and dependencies without creating workspace files or launching backends")
     p.add_argument("--interactive-authorization", action="store_true", help="Explicitly opt into local TTY prompts for fresh SfM/training authorization and SfM component review")
@@ -1357,6 +1557,11 @@ def build_parser() -> argparse.ArgumentParser:
     p = sub.add_parser("resume", help="Resume failed/invalidated stages while reusing valid upstream results")
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true")
     p.add_argument("--profile", choices=["first-visual"], help="Continue through the initial private Reviewer/Visitor preview")
+    training_profile_options = p.add_mutually_exclusive_group()
+    training_profile_options.add_argument("--training-profile", help="Explicitly apply a versioned training parameter preset as id@revision")
+    training_profile_options.add_argument("--legacy-compatible-training", action="store_true",
+        help="Select the distinct legacy-compatible high-quality preset, leaving newer optional Spirula flags to backend defaults")
+    p.add_argument("--host-preflight", action="store_true", help="Add read-only, informational host capability observations")
     p.add_argument("--until", choices=["visitor"], help="Stop after the initial Visitor preview is generated")
     p.add_argument("--interactive-authorization", action="store_true", help="Explicitly opt into local TTY prompts for fresh SfM/training authorization and SfM component review")
     p.add_argument("--no-auto-install", action="store_true", help="Do not repair declared Python dependencies with uv during this run")

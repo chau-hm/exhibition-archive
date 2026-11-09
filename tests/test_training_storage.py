@@ -72,6 +72,24 @@ class TrainingCheckpointTests(unittest.TestCase):
             self.assertIn(str(resume_dir.parent.resolve()), command)
             self.assertIn(resume_dir.name, command)
 
+    def test_profile_optional_training_flags_require_backend_support(self):
+        cfg = {"preset": "3dgs", "iterations": 30000, "resolution_divisor": 1,
+               "quality": "high", "steps_per_save": 5000, "device": "auto",
+               "save_only_latest_checkpoint": True, "save_full_checkpoint": True,
+               "view_sampling": "uniform", "cache_images": "disk", "load_masks": False}
+        expected = {
+            "--view-sampling": "view_sampling must be supported",
+            "--cache-images": "cache_images must be supported",
+            "--load-masks": "load_masks value is not supported",
+        }
+        for flag, message in expected.items():
+            with self.subTest(flag=flag):
+                capabilities = json.loads(json.dumps(TRAINING_CAPABILITIES))
+                capabilities["training"]["arguments"].remove(flag)
+                with self.assertRaisesRegex(BackendError, message):
+                    build_training_command(Path("spirula"), Path("dataset"), Path("attempt"),
+                                           cfg, capabilities, "run")
+
     def test_latest_only_requires_full_checkpoints_and_backend_flags(self):
         cfg = {"preset": "3dgs", "iterations": 100, "resolution_divisor": 1,
                "save_only_latest_checkpoint": True, "save_full_checkpoint": False}
