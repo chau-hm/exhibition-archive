@@ -5,6 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
   <meta name="color-scheme" content="dark">
   <meta name="theme-color" content="#151714">
+  <meta name="visitor-build-id" content="__VISITOR_BUILD_ID__">
   <link rel="icon" href="data:,">
   <title>__EXHIBITION_TITLE__</title>
   <link rel="stylesheet" href="./vendor/supersplat-viewer.css">
@@ -23,9 +24,11 @@
           <option value="zh-Hant">繁體中文</option>
           <option value="en">English</option>
         </select>
+        <button id="enterVR" type="button" hidden>Enter VR</button>
         <button id="resetView" type="button" title="Return to the opening view">Reset view</button>
       </div>
     </header>
+    <p id="xrStatus" role="status" aria-live="polite" hidden></p>
     <div class="bottom-controls">
       <button id="helpToggle" type="button" aria-expanded="true" aria-controls="helpPanel" title="Navigation help">Help</button>
       <section id="helpPanel" aria-label="Navigation help">

@@ -121,6 +121,7 @@ async function loadPage(prefix, format, noCollision = false) {
   const deadline = Date.now() + 180_000;
   let state = null;
   let ui = null;
+  let lastSample = null;
   while (Date.now() < deadline) {
     try {
       const sample = await evaluate(`(() => {
@@ -130,6 +131,7 @@ async function loadPage(prefix, format, noCollision = false) {
         return { state: api?.state ?? null, canvas: Boolean(canvas && canvas.width && canvas.height),
           loadingHidden: Boolean(loading?.hidden), error: document.querySelector('#loading')?.classList.contains('load-error') || false };
       })()`);
+      lastSample = sample;
       state = sample?.state ?? null;
       if (state?.loaded && sample.canvas && sample.loadingHidden) break;
       if (sample?.error) throw new Error('Visitor page displayed a loading error');
@@ -138,7 +140,33 @@ async function loadPage(prefix, format, noCollision = false) {
     }
     await sleep(250);
   }
-  if (!state?.loaded) throw new Error('Visitor viewer failed to load at ' + url);
+  if (!state?.loaded) {
+    let pageState = null;
+    try {
+      pageState = await evaluate(`(() => ({
+        title: document.title,
+        loadingText: document.querySelector('#loadingMessage')?.textContent ?? null,
+        loadingError: document.querySelector('#loading')?.classList.contains('load-error') ?? false,
+        visibleButtons: [...document.querySelectorAll('button')]
+          .filter(button => !button.closest('[hidden]')).map(button => button.id),
+        canvasCount: document.querySelectorAll('#viewer canvas').length,
+        xrDebug: window.__visitorXRDebug?.snapshot?.() ?? null,
+        consoleDiagnostics: window.__phase4dDiagnostics ?? null,
+        resources: performance.getEntriesByType('resource')
+          .filter(entry => /(?:supersplat-viewer|exhibition\\.(?:sog|ply)|enclosure-collision)/.test(entry.name))
+          .map(entry => ({name: entry.name, durationMs: entry.duration, transferSize: entry.transferSize}))
+      }))()`);
+    } catch (error) {
+      pageState = { diagnosticReadError: String(error) };
+    }
+    throw new Error('Visitor viewer failed to load at ' + url + '\n' + JSON.stringify({
+      lastSample,
+      pageState,
+      browserErrors,
+      consoleErrors,
+      networkErrors
+    }, null, 2));
+  }
   console.error('acceptance: loaded ' + (prefix || 'root') + ' ' + format);
   await sleep(900);
   const final = await evaluate(`(() => {

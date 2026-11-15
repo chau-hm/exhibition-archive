@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import html
+import hashlib
 import json
 import math
 import os
@@ -16,6 +17,7 @@ from zipfile import BadZipFile, ZipFile, is_zipfile
 
 from .adapters import public_json, read_json, sha256_file, write_json
 from .workflow import output_path, project_path
+from .visitor_xr import visitor_xr_configuration
 
 
 PRODUCT_ROOT = Path(__file__).resolve().parents[2]
@@ -205,6 +207,202 @@ def _visitor_transform(root: Path, config: dict) -> dict:
         return {}
     path = _path(root, config, "navigation", "transform")
     return read_json(path)
+
+
+def _visitor_navigation_binding(root: Path, config: dict, model_sha256: str,
+                                camera: dict) -> dict[str, Any]:
+    """Bind the Engine-generated enclosure, selected model, and opening camera."""
+    navigation = config.get("integrations", {}).get("navigation", {})
+    if navigation.get("mode") == "generate_from_sfm":
+        approved_path = output_path(root, config) / "work" / "navigation-approved.json"
+        if not approved_path.is_file():
+            raise ValueError("Visitor packaging requires the current approved navigation artifact")
+        artifact = read_json(approved_path)
+        if artifact.get("status") != "NAVIGATION_APPROVED_BY_REVIEW":
+            raise ValueError("Visitor packaging requires navigation approved by review")
+        artifact_sha256 = sha256_file(approved_path)
+        input_fingerprint = artifact.get("provenance", {}).get("navigation_input_fingerprint")
+        if not isinstance(input_fingerprint, str) or len(input_fingerprint) != 64:
+            raise ValueError("Approved navigation artifact has no valid input fingerprint")
+        navigation_status = "NAVIGATION_APPROVED_BY_REVIEW"
+        approval_status = "APPROVED"
+    else:
+        envelope_path = _path(root, config, "navigation", "envelope")
+        policy_path = _path(root, config, "navigation", "runtime_policy")
+        from .adapters import validate_navigation
+        validation = validate_navigation(envelope_path, policy_path, model_sha256)
+        artifact_sha256 = sha256_file(envelope_path)
+        binding_input = {
+            "model_sha256": model_sha256,
+            "envelope_sha256": artifact_sha256,
+            "runtime_policy_sha256": sha256_file(policy_path),
+        }
+        input_fingerprint = hashlib.sha256(json.dumps(
+            binding_input, sort_keys=True, separators=(",", ":")
+        ).encode("utf-8")).hexdigest()
+        navigation_status = validation["status"]
+        approval_status = "CONFIGURED_ADOPTED_INPUT"
+
+    clearance = camera.get("enclosure_clearance")
+    if not isinstance(clearance, dict):
+        raise ValueError("Visitor opening camera could not be validated inside the configured enclosure")
+    camera_validation = {"status": "PASS", **clearance}
+    return {
+        "status": navigation_status,
+        "constraint_mode": "ENGINE_GENERATED_FREE_XYZ_ENCLOSURE",
+        "enforcement": "ENGINE_GENERATED_COLLISION_ENVELOPE",
+        "approval_gate_status": approval_status,
+        "artifact_sha256": artifact_sha256,
+        "input_fingerprint": input_fingerprint,
+        "initial_camera_validation": camera_validation,
+        "reason": "The Visitor collision shell is generated from the configured Engine enclosure and bound to the accepted model and opening camera.",
+    }
+
+
+def _visitor_xr_build_id(staging: Path, source_template: Path, config: dict,
+                         xr_profile: dict, model_sha256: str,
+                         collision_sha256: str, camera: dict) -> str:
+    xr_source = source_template / "xr"
+    source_hashes = {
+        path.name: sha256_file(path)
+        for path in sorted(xr_source.iterdir()) if path.is_file()
+    }
+    source_hashes["visitor-index.html"] = sha256_file(source_template / "index.html")
+    resource_paths = (
+        staging / "js" / "viewer.js",
+        staging / "vendor" / "supersplat-viewer.js",
+        staging / "vendor" / "runtime.json",
+        staging / "vendor" / "supersplat-viewer.css",
+        staging / "css" / "viewer.css",
+        staging / "config" / "locales.json",
+        staging / "config" / "settings.json",
+    )
+    resource_hashes = {path.relative_to(staging).as_posix(): sha256_file(path) for path in resource_paths}
+    identity = {
+        "schema": "exhibition-archive.visitor-xr-build.v1",
+        "project_id": config["project_id"],
+        "title": str(config.get("viewer", {}).get("title", config["project_id"])),
+        "xr": xr_profile,
+        "model_sha256": model_sha256,
+        "collision_sha256": collision_sha256,
+        "initial_camera": camera,
+        "source_modules": source_hashes,
+        "resources": resource_hashes,
+    }
+    digest = hashlib.sha256(json.dumps(identity, sort_keys=True, ensure_ascii=False,
+                                       separators=(",", ":")).encode("utf-8")).hexdigest()
+    return "ea-xr-" + digest[:24]
+
+
+def _write_visitor_xr_files(staging: Path, source_template: Path, metadata: dict,
+                            build_id: str) -> None:
+    xr_target = staging / "js" / "xr"
+    xr_target.mkdir(parents=True, exist_ok=True)
+    for name in ("camera-readiness.mjs", "collision-geometry.mjs", "xr-boundary.mjs", "xr-navigation-guard.mjs"):
+        shutil.copy2(source_template / "xr" / name, xr_target / name)
+    controls = (source_template / "xr" / "xr-controls.js").read_text(encoding="utf-8")
+    if "__VISITOR_BUILD_ID__" not in controls:
+        raise ValueError("Visitor XR module import version marker is missing")
+    controls = controls.replace("__VISITOR_BUILD_ID__", build_id)
+    (xr_target / "xr-controls.js").write_text(controls, encoding="utf-8")
+    build_manifest_resources = (
+        "index.html", "config/exhibition.json", "config/settings.json", "config/locales.json",
+        "js/viewer.js", "js/xr/xr-controls.js", "js/xr/camera-readiness.mjs",
+        "js/xr/xr-boundary.mjs", "js/xr/xr-navigation-guard.mjs",
+        "js/xr/collision-geometry.mjs", "vendor/supersplat-viewer.js",
+        "vendor/supersplat-viewer.css", "css/viewer.css", "vendor/runtime.json",
+    )
+    resources = {}
+    for relative in build_manifest_resources:
+        path = staging / relative
+        if not path.is_file():
+            raise ValueError(f"Visitor XR package is missing required resource: {relative}")
+        resources[relative] = sha256_file(path)
+    write_json(staging / "config" / "build.json", {
+        "schema_version": "exhibition-archive.visitor-build.v1",
+        "buildId": build_id,
+        "viewer_version": metadata["viewer_runtime"]["viewer"]["version"],
+        "playcanvas_version": metadata["viewer_runtime"]["engine"]["version"],
+        "xr_patch": metadata["viewer_runtime"].get("xrPatch"),
+        "resources": resources,
+    })
+
+
+def visitor_xr_preflight(root: Path, config: dict) -> dict[str, Any]:
+    """Read-only XR readiness check for the existing Visitor package workflow."""
+    profile = visitor_xr_configuration(config)
+    if not profile["enabled"]:
+        return {"status": "NOT_REQUESTED", "enabled": False,
+                "message": "Standard Visitor publication remains unchanged; immersive XR is disabled."}
+
+    blockers: list[str] = []
+    vendor = PRODUCT_ROOT / "templates" / "visitor" / "vendor"
+    required = ("supersplat-viewer-xr.js", "runtime-xr.json", "supersplat-viewer.css",
+                "SUPERSPLAT-VIEWER-LICENSE.txt", "PLAYCANVAS-LICENSE.txt",
+                "THIRD_PARTY-NOTICES.md", "visitor-app.js")
+    missing = [name for name in required if not (vendor / name).is_file()]
+    if missing:
+        blockers.append("XR Visitor runtime is incomplete: " + ", ".join(missing))
+    runtime = None
+    bundle_hash = None
+    if not missing:
+        runtime = read_json(vendor / "runtime-xr.json")
+        bundle_hash = sha256_file(vendor / "supersplat-viewer-xr.js")
+        patch = runtime.get("xrPatch", {})
+        if (runtime.get("viewer", {}).get("version") != "1.42.0" or
+                runtime.get("engine", {}).get("version") != "2.23.3" or
+                patch.get("name") != "exhibition-archive-xr-v1" or
+                patch.get("outputSha256") != bundle_hash):
+            blockers.append("XR Viewer patch does not match the pinned Viewer 1.42.0 / PlayCanvas 2.23.3 manifest")
+
+    navigation = config.get("integrations", {}).get("navigation", {})
+    model_cfg = config.get("integrations", {}).get("model", {})
+    model_sha256 = model_cfg.get("expected_sha256")
+    model_path = model_cfg.get("path")
+    if model_path:
+        resolved_model = _path(root, config, "model", "path")
+        if resolved_model.is_file():
+            actual_model_hash = sha256_file(resolved_model)
+            if model_sha256 and actual_model_hash != model_sha256:
+                blockers.append("Configured model SHA-256 does not match the current accepted model")
+            model_sha256 = actual_model_hash
+        else:
+            blockers.append("Configured accepted model file is missing")
+    if navigation.get("mode") == "generate_from_sfm":
+        approved_path = output_path(root, config) / "work" / "navigation-approved.json"
+        if not approved_path.is_file():
+            blockers.append("XR requires the current reviewed navigation approval artifact")
+        else:
+            artifact = read_json(approved_path)
+            if artifact.get("status") != "NAVIGATION_APPROVED_BY_REVIEW":
+                blockers.append("XR navigation approval artifact is not approved")
+    else:
+        try:
+            envelope_path = _path(root, config, "navigation", "envelope")
+            policy_path = _path(root, config, "navigation", "runtime_policy")
+            if not envelope_path.is_file() or not policy_path.is_file():
+                blockers.append("XR requires the configured enclosure and runtime policy files")
+            elif model_sha256:
+                from .adapters import validate_navigation
+                validate_navigation(envelope_path, policy_path, model_sha256)
+            else:
+                blockers.append("XR preflight needs the selected model hash before it can verify the enclosure binding")
+        except (KeyError, OSError, ValueError) as exc:
+            blockers.append(f"XR enclosure validation failed: {exc}")
+
+    return {
+        "status": "READY" if not blockers else "BLOCKED",
+        "enabled": True,
+        "renderer": profile["renderer"],
+        "viewer_version": runtime.get("viewer", {}).get("version") if runtime else None,
+        "playcanvas_version": runtime.get("engine", {}).get("version") if runtime else None,
+        "patch_version": runtime.get("xrPatch", {}).get("name") if runtime else None,
+        "patch_sha256": bundle_hash,
+        "navigation_mode": navigation.get("mode", "adopt_existing"),
+        "model_sha256": model_sha256,
+        "blockers": blockers,
+        "side_effects": "NONE; reads configuration, runtime artifacts, and configured input hashes only",
+    }
 
 
 def _splat_transform_binary() -> str | None:
@@ -553,6 +751,7 @@ def _convert_sog(model: Path, target: Path) -> dict[str, Any]:
 def _build_visitor_website(root: Path, config: dict, model_record: dict, review_website: Path) -> dict[str, Any]:
     from .visitor import enclosure_collision_glb, visitor_camera_settings, viewer_transform_node, write_glb
 
+    xr_profile = visitor_xr_configuration(config)
     website = output_path(root, config) / "website-visitor"
     staging = website.with_name("website-visitor.staging")
     if staging.exists():
@@ -563,6 +762,7 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
     source_template = PRODUCT_ROOT / "templates" / "visitor"
     html_template = (source_template / "index.html").read_text(encoding="utf-8")
     public_html = html_template.replace("__EXHIBITION_TITLE__", html.escape(title, quote=True))
+    public_html = public_html.replace("__VISITOR_BUILD_ID__", "__VISITOR_BUILD_ID__" if xr_profile["enabled"] else "")
     if "__EXHIBITION_TITLE__" in public_html:
         raise ValueError("Visitor viewer title was not rendered")
     (staging / "index.html").write_text(public_html, encoding="utf-8")
@@ -573,6 +773,10 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
     missing_vendor = [name for name in required_vendor if not (visitor_vendor / name).is_file()]
     if not (visitor_vendor / "visitor-app.js").is_file():
         missing_vendor.append("visitor-app.js")
+    if xr_profile["enabled"]:
+        for name in ("supersplat-viewer-xr.js", "runtime-xr.json"):
+            if not (visitor_vendor / name).is_file():
+                missing_vendor.append(name)
     if missing_vendor:
         raise ValueError(f"Visitor viewer runtime has not been built; missing: {missing_vendor}. Run npm run build:visitor-viewer.")
     for name in required_vendor:
@@ -586,7 +790,18 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
         (staging / "js" / "viewer.js").write_text(visitor_js, encoding="utf-8")
     else:
         shutil.copy2(visitor_vendor / "visitor-app.js", staging / "js" / "viewer.js")
-    shutil.copy2(visitor_vendor / "supersplat-viewer.js", staging / "vendor" / "supersplat-viewer.js")
+    selected_bundle = visitor_vendor / ("supersplat-viewer-xr.js" if xr_profile["enabled"] else "supersplat-viewer.js")
+    selected_runtime = visitor_vendor / ("runtime-xr.json" if xr_profile["enabled"] else "runtime.json")
+    if xr_profile["enabled"]:
+        runtime_xr = read_json(selected_runtime)
+        expected_xr_hash = runtime_xr.get("xrPatch", {}).get("outputSha256")
+        if (runtime_xr.get("viewer", {}).get("version") != "1.42.0" or
+                runtime_xr.get("engine", {}).get("version") != "2.23.3" or
+                runtime_xr.get("xrPatch", {}).get("name") != "exhibition-archive-xr-v1" or
+                not isinstance(expected_xr_hash, str) or sha256_file(selected_bundle) != expected_xr_hash):
+            raise ValueError("The XR Viewer bundle does not match the pinned 1.42.0 / 2.23.3 patch manifest; run npm run build:visitor-viewer.")
+    shutil.copy2(selected_bundle, staging / "vendor" / "supersplat-viewer.js")
+    shutil.copy2(selected_runtime, staging / "vendor" / "runtime.json")
 
     model = Path(model_record["path"])
     review_api = review_website / "api"
@@ -601,6 +816,13 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
     write_glb(collision_path, collision_data)
     collision_metadata.update({"source_model_sha256": model_record["sha256"],
                                "sha256": sha256_file(collision_path), "size_bytes": collision_path.stat().st_size})
+    navigation_binding = _visitor_navigation_binding(root, config, model_record["sha256"], camera)
+    collision_metadata.update({
+        "navigation_artifact_sha256": navigation_binding["artifact_sha256"],
+        "navigation_input_fingerprint": navigation_binding["input_fingerprint"],
+    })
+    camera["navigation_artifact_sha256"] = navigation_binding["artifact_sha256"]
+    camera["navigation_containment"] = navigation_binding["initial_camera_validation"]
 
     sog_path = staging / "assets" / "exhibition.sog"
     registered_path = output_path(root, config) / SOG_IMPORT_DIRECTORY / "exhibition.sog"
@@ -614,7 +836,7 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
     if primary == "ply":
         sog_path.unlink(missing_ok=True)
         shutil.copy2(model, staging / "assets" / "exhibition.ply")
-    viewer_runtime = read_json(visitor_vendor / "runtime.json")
+    viewer_runtime = read_json(selected_runtime)
     default_language = str(config.get("viewer", {}).get("default_language", "en"))
     if default_language not in {"en", "zh-Hant", "zh-TW"}:
         default_language = "en"
@@ -635,19 +857,38 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
                    "size_bytes": model.stat().st_size, "sha256": model_record["sha256"],
                    "gaussian_count": model_record.get("gaussian_count"), "selection": model_record.get("selection")},
         "conversion": conversion,
-        "collision": {"url": "./assets/enclosure-collision.glb", **collision_metadata},
+        "collision": {"url": "./assets/enclosure-collision.glb", "format": "glb", **collision_metadata},
         "initial_camera": camera,
         "viewer_runtime": viewer_runtime,
+        "navigation": navigation_binding,
         "navigation_policy": "Free XYZ SuperSplat Fly Mode; enclosure-only collision shell derived from the accepted horizontal boundary, floor, and ceiling. No fixed-height Walk Mode or interior-object collisions.",
         "visitor_ui": ["unobtrusive navigation help", "reset view"],
     }
+    if xr_profile["enabled"]:
+        if runtime_xr.get("viewer", {}).get("version") != "1.42.0" or runtime_xr.get("engine", {}).get("version") != "2.23.3":
+            raise ValueError("XR publication requires SuperSplat Viewer 1.42.0 on PlayCanvas 2.23.3")
+        if not camera.get("enclosure_clearance"):
+            raise ValueError("XR publication requires the configured opening viewpoint to pass enclosure containment validation")
+        build_id = _visitor_xr_build_id(staging, source_template, config, xr_profile,
+                                        model_record["sha256"], collision_metadata["sha256"], camera)
+        metadata["xr"] = {
+            **xr_profile,
+            "coordinate_frame": collision_metadata["coordinate_frame"],
+            "navigation_artifact_sha256": navigation_binding["artifact_sha256"],
+            "build_id": build_id,
+        }
+        html_path = staging / "index.html"
+        html_path.write_text(html_path.read_text(encoding="utf-8").replace("__VISITOR_BUILD_ID__", build_id), encoding="utf-8")
     write_json(staging / "config" / "exhibition.json", metadata)
+    if xr_profile["enabled"]:
+        _write_visitor_xr_files(staging, source_template, metadata, build_id)
     model_role = ("The PLY master remains in the project's derived artifact store and is not duplicated into this package."
                   if primary == "sog" else "It is the active visitor model.")
     conversion_note = ""
     if primary != "sog":
         conversion_note = f" SOG conversion status: {conversion.get('status', 'UNKNOWN')}. {conversion.get('reason', 'The package uses its accepted PLY model.')}"
-    readme = f"""# {title} — visitor website\n\nThis static package opens directly into the exhibition. It uses the official SuperSplat Viewer {viewer_runtime['viewer']['version']} with an enclosure-only collision mesh. Visitors can fly freely in XYZ, reset to the opening view, and open brief navigation help. The package contains no guided tours, route selectors, diagnostics, geometry overlays, or technical status panels.\n\nThe primary model format is **{primary.upper()}**. {model_role}{conversion_note} `config/exhibition.json` records the accepted master PLY hash, conversion tool and settings, output hashes, Viewer version, and collision dimensions. `config/package-index.json` hashes every payload file except itself.\n\nThe website is modular: replace the selected external model asset, edit `config/settings.json` for the opening view and rendering settings, and edit `config/locales.json` for visitor UI text. See `INTEGRATION.md` for HTTP hosting, nested paths, iframe embedding, and direct use of the model with the official Viewer API. Modular assets require HTTP/HTTPS; double-click `file://` is not supported.\n\nThis website is a static publication candidate, not a Preservation Package. Release authorization remains **NEEDS_REVIEW**. Review artwork identity and rights, navigation, and access policy before any public release.\n"""
+    xr_note = " The same Visitor also conditionally enables immersive WebXR on supported browsers, with enclosure-bound navigation, boundary feedback, and Recenter." if xr_profile["enabled"] else ""
+    readme = f"""# {title} — visitor website\n\nThis static package opens directly into the exhibition. It uses the official SuperSplat Viewer {viewer_runtime['viewer']['version']} with an Engine-generated enclosure collision shell. Visitors can fly freely in XYZ, reset to the opening view, and open brief navigation help.{xr_note} The package contains no guided tours, route selectors, geometry overlays, or technical status panels.\n\nThe primary model format is **{primary.upper()}**. {model_role}{conversion_note} `config/exhibition.json` records the accepted master PLY hash, conversion tool and settings, output hashes, Viewer version, and collision dimensions. `config/package-index.json` hashes every payload file except itself.\n\nThe website is modular: replace the selected external model asset, edit `config/settings.json` for the opening view and rendering settings, and edit `config/locales.json` for visitor UI text. See `INTEGRATION.md` for HTTP hosting, nested paths, iframe embedding, and direct use of the model with the official Viewer API. Modular assets require HTTP/HTTPS; double-click `file://` is not supported.\n\nThis website is a static publication candidate, not a Preservation Package. Release authorization remains **NEEDS_REVIEW**. Review artwork identity and rights, navigation, and access policy before any public release.\n"""
     (staging / "README.md").write_text(readme, encoding="utf-8")
     shutil.copy2(PRODUCT_ROOT / "docs" / "visitor-integration.md", staging / "INTEGRATION.md")
     index = [{"path": path.relative_to(staging).as_posix(), "size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
@@ -673,6 +914,9 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
         "sog_sha256": conversion.get("output_sha256"),
         "collision_size_bytes": published_collision.stat().st_size,
         "collision_sha256": collision_metadata["sha256"],
+        "xr_enabled": xr_profile["enabled"],
+        "xr_build_id": metadata.get("xr", {}).get("build_id"),
+        "viewer_runtime": viewer_runtime,
         "total_bytes": sum(row["size_bytes"] for row in index),
         "published_model_asset": f"assets/exhibition.{primary}",
         "package_index": str(website / "config" / "package-index.json"),

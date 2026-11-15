@@ -21,6 +21,8 @@ vendor/supersplat-viewer.js
 vendor/supersplat-viewer.css
 ```
 
+When `publication.visitor_xr.enabled` is true, the same Visitor package also contains `config/build.json` and `js/xr/` modules, and stages the accepted patched Viewer 1.42.0 bundle as `vendor/supersplat-viewer.js`. Standard packages keep the upstream stock bundle and omit XR modules. See [Optional WebXR Visitor Publication](visitor-xr-publication.md) for configuration, preflight, patch reproducibility, and Simulator testing.
+
 The accepted PLY master remains unchanged at its Engine artifact location and is identified by SHA-256 in `config/exhibition.json`. A SOG-primary Visitor package contains the SOG as an independent external asset and does not copy the unused 247.7 MB PLY into the website. When the SOG is unavailable or not selected, the Engine publishes a PLY-profile package containing the accepted PLY instead. The SOG may be copied into another application without copying the HTML page.
 
 ## Registering an externally generated SOG

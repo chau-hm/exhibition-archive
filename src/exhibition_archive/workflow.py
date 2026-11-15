@@ -97,6 +97,8 @@ def load_project(value: str | Path) -> tuple[Path, dict[str, Any]]:
         raise ValueError("Source-photo bundling is not implemented by this MVP")
     if config.get("publication", {}).get("include_source_photographs") or config.get("publication", {}).get("include_private_review_notes"):
         raise ValueError("The static publisher excludes source photographs and private review notes")
+    from .visitor_xr import visitor_xr_configuration
+    visitor_xr_configuration(config)
     return config_path.parent, config
 
 

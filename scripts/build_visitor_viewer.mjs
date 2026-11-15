@@ -1,6 +1,7 @@
 import { copyFile, mkdir, readFile, writeFile } from 'node:fs/promises';
 import { fileURLToPath } from 'node:url';
 import path from 'node:path';
+import { patchVisitorViewer } from './patch_visitor_viewer_xr.mjs';
 
 const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const esbuild = await import('esbuild');
@@ -38,7 +39,7 @@ await esbuild.build({
 await esbuild.build({
   entryPoints: [path.join(root, 'templates', 'visitor', 'app.js')],
   bundle: true,
-  external: ['../vendor/supersplat-viewer.js'],
+  external: ['../vendor/supersplat-viewer.js', '../vendor/supersplat-viewer-xr.js'],
   format: 'esm',
   target: ['es2022'],
   outfile: path.join(vendor, 'visitor-app.js'),
@@ -59,8 +60,19 @@ await Promise.all([
 ]);
 const viewer = JSON.parse(await readFile(path.join(viewerPath, 'package.json'), 'utf8'));
 const engine = JSON.parse(await readFile(path.join(playcanvasPath, 'package.json'), 'utf8'));
+const xrPatch = await patchVisitorViewer();
+await writeFile(path.join(vendor, 'runtime-xr.json'), `${JSON.stringify({
+  viewer: { name: viewer.name, version: viewer.version, license: viewer.license },
+  engine: { name: engine.name, version: engine.version, license: engine.license },
+  xrPatch: {
+    name: 'exhibition-archive-xr-v1',
+    sourceSha256: xrPatch.sourceSha256,
+    outputSha256: xrPatch.outputSha256,
+    generator: 'scripts/patch_visitor_viewer_xr.mjs'
+  }
+}, null, 2)}\n`);
 await writeFile(path.join(vendor, 'runtime.json'), `${JSON.stringify({
   viewer: { name: viewer.name, version: viewer.version, license: viewer.license },
   engine: { name: engine.name, version: engine.version, license: engine.license }
 }, null, 2)}\n`);
-console.log(`Built SuperSplat Viewer ${viewer.version} on PlayCanvas ${engine.version} into ${path.relative(root, vendor)}`);
+console.log(`Built SuperSplat Viewer ${viewer.version} on PlayCanvas ${engine.version}; XR patch ${xrPatch.outputSha256}; output ${path.relative(root, vendor)}`);

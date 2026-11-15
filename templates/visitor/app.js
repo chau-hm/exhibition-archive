@@ -1,4 +1,6 @@
-import { createViewer } from '../vendor/supersplat-viewer.js';
+let createViewer = null;
+let xrIntegration = null;
+let xrRendererPlan = null;
 
 const $ = (selector) => document.querySelector(selector);
 const host = $('#viewer');
@@ -271,7 +273,8 @@ async function openModel(format, settings) {
     model = { available: true, filename: 'exhibition.ply', url: params.get('comparisonPlyUrl') };
   }
   if (!model?.available || typeof model.url !== 'string') throw new Error(`${format.toUpperCase()} is not included in this visitor package.`);
-  const navigationEnforced = metadata.navigation?.enforcement === 'APPROVED_COLLISION_ENVELOPE';
+  const navigationEnforced = ['APPROVED_COLLISION_ENVELOPE', 'ENGINE_GENERATED_COLLISION_ENVELOPE']
+    .includes(metadata.navigation?.enforcement);
   const collisionRecord = metadata.collision;
   if (navigationEnforced && (!collisionRecord || collisionRecord.format !== 'glb' ||
       typeof collisionRecord.url !== 'string' || !/^[a-f0-9]{64}$/i.test(collisionRecord.sha256) ||
@@ -279,30 +282,31 @@ async function openModel(format, settings) {
       collisionRecord.navigation_input_fingerprint !== metadata.navigation.input_fingerprint ||
       collisionRecord.source_model_sha256 !== metadata.master?.sha256 ||
       metadata.initial_camera?.navigation_artifact_sha256 !== metadata.navigation.artifact_sha256)) {
-    throw new Error('The approved navigation boundary is incomplete. The Visitor will not open without its reviewed collision envelope.');
+    throw new Error('The Engine navigation boundary is incomplete. The Visitor will not open without its verified collision envelope.');
   }
   if (!navigationEnforced && collisionRecord) {
-    throw new Error('A collision boundary is present without an approved navigation status. The Visitor was stopped.');
+    throw new Error('A collision boundary is present without a validated navigation status. The Visitor was stopped.');
   }
   const collisionDisabled = __EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__ && params.get('collision') === 'off';
   const collisionUrl = navigationEnforced && !collisionDisabled
     ? new URL(collisionRecord.url, location.href).href : undefined;
   if (navigationEnforced && !collisionUrl) {
-    throw new Error('The approved navigation boundary was not passed to the Viewer. The Visitor was stopped.');
+    throw new Error('The validated navigation boundary was not passed to the Viewer. The Visitor was stopped.');
   }
   if (navigationEnforced) {
     const collisionResponse = await fetch(collisionUrl, { cache: 'no-cache' });
-    if (!collisionResponse.ok) throw new Error(`Approved navigation boundary asset could not be loaded (${collisionResponse.status}).`);
+    if (!collisionResponse.ok) throw new Error(`Validated navigation boundary asset could not be loaded (${collisionResponse.status}).`);
     const collisionBytes = await collisionResponse.arrayBuffer();
     const collisionDigest = [...new Uint8Array(await crypto.subtle.digest('SHA-256', collisionBytes))]
       .map((value) => value.toString(16).padStart(2, '0')).join('');
     if (collisionDigest !== collisionRecord.sha256 ||
         (collisionRecord.size_bytes != null && collisionBytes.byteLength !== collisionRecord.size_bytes)) {
-      throw new Error('Approved navigation boundary failed its SHA-256 or size check. The Visitor was stopped.');
+      throw new Error('Validated navigation boundary failed its SHA-256 or size check. The Visitor was stopped.');
     }
   }
   const response = await fetch(model.url, { cache: 'force-cache' });
   if (!response.ok) throw new Error(`${format.toUpperCase()} ${strings[currentLanguage].assetError} (${response.status}).`);
+  if (typeof createViewer !== 'function') throw new Error('The Visitor Viewer runtime was not selected.');
   const handle = await createViewer({
     container: host,
     settings,
@@ -310,7 +314,7 @@ async function openModel(format, settings) {
     contentFilename: model.filename,
     collisionUrl,
     contents: Promise.resolve(response),
-    renderer: 'webgpu',
+    renderer: xrRendererPlan?.renderer ?? 'webgpu',
     ui: false,
     lang: currentLanguage,
     exposeGlobals: false
@@ -323,10 +327,15 @@ async function openModel(format, settings) {
         await new Promise((resolve) => setTimeout(resolve, 50));
       }
       if (!handle.state.hasCollision) {
-        throw new Error('The approved navigation collision envelope did not initialize. The Visitor will not allow unbounded movement.');
+        throw new Error('The validated navigation collision envelope did not initialize. The Visitor will not allow unbounded movement.');
       }
     }
     applyModelTransform(handle);
+    if (metadata.xr?.enabled) {
+      const returned = Boolean(handle.rebaseXRHomeTransform?.());
+      handle.__visitorXRSceneHomeRebase = { returned, source: 'configured Engine model transform' };
+      if (!returned) throw new Error('The pinned Viewer XR scene-home patch is unavailable; immersive VR has been disabled for this publication.');
+    }
     return handle;
   } catch (error) {
     handle.destroy();
@@ -672,6 +681,17 @@ async function start() {
     applyLanguage(chooseLanguage(metadata.default_language));
     applyTestSettings(settings);
 
+    if (metadata.xr?.enabled) {
+      const controlsUrl = new URL('./xr/xr-controls.js', import.meta.url);
+      controlsUrl.searchParams.set('build', metadata.xr.build_id);
+      xrIntegration = await import(controlsUrl.href);
+      xrRendererPlan = await xrIntegration.prepareXRRenderer(metadata.xr);
+    }
+    const runtimeUrl = new URL('../vendor/supersplat-viewer.js', import.meta.url);
+    if (metadata.xr?.enabled) runtimeUrl.searchParams.set('build', metadata.xr.build_id);
+    const runtime = await import(runtimeUrl.href);
+    createViewer = runtime.createViewer;
+
     const query = new URLSearchParams(location.search);
     const requested = query.get('format');
     const comparisonPlyRequested = __EXHIBITION_ARCHIVE_VISITOR_ACCEPTANCE__ && query.has('comparisonPlyUrl');
@@ -691,6 +711,10 @@ async function start() {
     if (!viewer) throw lastError ?? new Error('The exhibition model could not be opened.');
     await enterFlyAtOpeningPose(viewer);
     installButtons(viewer);
+    if (xrIntegration) {
+      await xrIntegration.installXRControls(viewer, xrRendererPlan, metadata, settings);
+      await viewer.prepareOpeningSpawn?.();
+    }
     await installNavigationDiagnostics(viewer, settings);
     loading.hidden = true;
     focusViewer();

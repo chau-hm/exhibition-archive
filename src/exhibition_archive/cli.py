@@ -1303,6 +1303,24 @@ def cmd_publication_review(args) -> int:
         state.close()
 
 
+def cmd_package(args) -> int:
+    if not getattr(args, "dry_run", False):
+        return cmd_run(args)
+    root, config = load_project(args.project)
+    from .publisher import visitor_xr_preflight
+    xr_readiness = visitor_xr_preflight(root, config)
+    report = {
+        "status": xr_readiness["status"],
+        "project_id": config["project_id"],
+        "workspace": str(root.resolve()),
+        "publication_profile": "visitor",
+        "xr_readiness": xr_readiness,
+        "side_effects": "NONE; package --dry-run does not open workflow state or change package outputs",
+    }
+    print(json.dumps(report, indent=2))
+    return 2 if xr_readiness["status"] == "BLOCKED" else 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog="exhibition-archive", description="Local-first capture-to-archive workflow engine")
     parser.add_argument("--version", action="version", version=f"%(prog)s {__version__}")
@@ -1393,7 +1411,8 @@ def build_parser() -> argparse.ArgumentParser:
     p.set_defaults(func=cmd_sog_import)
     p = sub.add_parser("package", help="Run packaging and verification stages without rerunning SfM or training")
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true")
-    p.set_defaults(func=cmd_run, resume=True, package_only=True)
+    p.add_argument("--dry-run", action="store_true", help="Report read-only Visitor/XR publication readiness without running packaging")
+    p.set_defaults(func=cmd_package, resume=True, package_only=True)
     p = sub.add_parser("verify", help="Verify archive checksums, public-site path policy, and model identity")
     p.add_argument("project"); p.add_argument("--full-hash", action="store_true", help="Re-hash every source photo and both model copies")
     p.add_argument("--public-release", action="store_true", help="Also require current durable publication-rights approval for this exact package")

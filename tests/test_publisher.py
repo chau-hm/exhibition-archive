@@ -11,7 +11,7 @@ from unittest.mock import patch
 from pathlib import Path
 
 from exhibition_archive.adapters import sha256_file, write_json
-from exhibition_archive.publisher import _convert_sog, build_website, register_external_sog
+from exhibition_archive.publisher import _convert_sog, build_website, register_external_sog, visitor_xr_preflight
 from exhibition_archive.workflow import _website_reference_failures, verify_website_package_index
 
 
@@ -446,6 +446,50 @@ class GenericPublisherTests(unittest.TestCase):
                 sha256_file(website / "assets" / "exhibition.ply"),
                 config["integrations"]["model"]["expected_sha256"],
             )
+
+            self.assertFalse((visitor / "config" / "build.json").exists())
+            self.assertFalse((visitor / "js" / "xr").exists())
+            stock_viewer_hash = sha256_file(visitor / "vendor" / "supersplat-viewer.js")
+            collision_hash = sha256_file(visitor / "assets" / "enclosure-collision.glb")
+            config["publication"]["visitor_xr"] = {
+                "enabled": True,
+                "renderer": "auto",
+                "boundary_feedback": {"approach_distance_viewer_units": 1.2},
+                "diagnostics": {"enabled": True},
+            }
+            self.assertEqual(visitor_xr_preflight(root, config)["status"], "READY")
+            with patch.dict(os.environ, {"EXHIBITION_ARCHIVE_SPLAT_TRANSFORM": str(root / "missing-splat-transform")}):
+                build_website(root, config, None, root / "deliverable" / "work")
+            xr_metadata = json.loads((visitor / "config" / "exhibition.json").read_text(encoding="utf-8"))
+            self.assertTrue(xr_metadata["xr"]["enabled"])
+            self.assertEqual(xr_metadata["xr"]["renderer"], "auto")
+            self.assertTrue(xr_metadata["xr"]["diagnostics"]["enabled"])
+            self.assertEqual(xr_metadata["viewer_runtime"]["viewer"]["version"], "1.42.0")
+            self.assertEqual(xr_metadata["viewer_runtime"]["engine"]["version"], "2.23.3")
+            self.assertEqual(xr_metadata["viewer_runtime"]["xrPatch"]["outputSha256"],
+                             "94d9a4c4ad9612385708c21602d5a7f481d352468667dee6d3335beb6f4478ac")
+            self.assertEqual(xr_metadata["navigation"]["enforcement"], "ENGINE_GENERATED_COLLISION_ENVELOPE")
+            self.assertEqual(sha256_file(visitor / "vendor" / "supersplat-viewer.js"),
+                             xr_metadata["viewer_runtime"]["xrPatch"]["outputSha256"])
+            self.assertNotEqual(stock_viewer_hash, sha256_file(visitor / "vendor" / "supersplat-viewer.js"))
+            self.assertEqual(collision_hash, sha256_file(visitor / "assets" / "enclosure-collision.glb"))
+            self.assertEqual(xr_metadata["master"]["sha256"], config["integrations"]["model"]["expected_sha256"])
+            build_manifest = json.loads((visitor / "config" / "build.json").read_text(encoding="utf-8"))
+            self.assertEqual(build_manifest["buildId"], xr_metadata["xr"]["build_id"])
+            for relative, expected_hash in build_manifest["resources"].items():
+                self.assertEqual(sha256_file(visitor / relative), expected_hash, relative)
+            self.assertTrue((visitor / "js" / "xr" / "xr-controls.js").is_file())
+            self.assertTrue((visitor / "config" / "package-index.json").is_file())
+            xr_index_bytes = (visitor / "config" / "package-index.json").read_bytes()
+            self.assertEqual(verify_website_package_index(visitor, json.loads(xr_index_bytes))[1], [])
+            self.assertEqual(_website_reference_failures(visitor), [])
+            self.assertNotIn("__VISITOR_BUILD_ID__", (visitor / "index.html").read_text(encoding="utf-8"))
+
+            with patch.dict(os.environ, {"EXHIBITION_ARCHIVE_SPLAT_TRANSFORM": str(root / "missing-splat-transform")}):
+                build_website(root, config, None, root / "deliverable" / "work")
+            self.assertEqual(xr_index_bytes, (visitor / "config" / "package-index.json").read_bytes())
+            self.assertEqual(xr_metadata["xr"]["build_id"],
+                             json.loads((visitor / "config" / "exhibition.json").read_text(encoding="utf-8"))["xr"]["build_id"])
 
 
 if __name__ == "__main__":

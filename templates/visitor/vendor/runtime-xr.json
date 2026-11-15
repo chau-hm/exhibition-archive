@@ -1,0 +1,18 @@
+{
+  "viewer": {
+    "name": "@playcanvas/supersplat-viewer",
+    "version": "1.42.0",
+    "license": "MIT"
+  },
+  "engine": {
+    "name": "playcanvas",
+    "version": "2.23.3",
+    "license": "MIT"
+  },
+  "xrPatch": {
+    "name": "exhibition-archive-xr-v1",
+    "sourceSha256": "408e3cc3cce59d4c438b23b6a27f8e47c385cc6b68c28ee1753af67da0d34bec",
+    "outputSha256": "94d9a4c4ad9612385708c21602d5a7f481d352468667dee6d3335beb6f4478ac",
+    "generator": "scripts/patch_visitor_viewer_xr.mjs"
+  }
+}
