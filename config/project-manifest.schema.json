@@ -178,6 +178,16 @@
             "mode": {"enum": ["adopt_existing", "generate_from_sfm"], "default": "adopt_existing"},
             "envelope": {"type": "string"},
             "runtime_policy": {"type": "string"},
+            "approved_collision_glb": {
+              "type": "object",
+              "description": "Optional exact reviewed enclosure mesh to preserve byte-for-byte during Visitor republication. The mesh must already use the configured SuperSplat Y-up world frame.",
+              "required": ["path", "sha256"],
+              "properties": {
+                "path": {"type": "string", "minLength": 1},
+                "sha256": {"type": "string", "pattern": "^[a-fA-F0-9]{64}$"}
+              },
+              "additionalProperties": false
+            },
             "camera_centers": {"type": "string", "description": "Optional trusted-center artifact; otherwise COLMAP registered poses are read from integrations.sfm.directory."},
             "trusted_pose_classification": {"type": "string"},
             "viewer_transform_verified": {"type": "boolean", "default": false, "description": "Explicitly confirm that configured common-viewer camera centers use the selected model's viewer frame."},

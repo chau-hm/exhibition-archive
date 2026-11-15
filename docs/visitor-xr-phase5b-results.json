@@ -1,0 +1,98 @@
+{
+  "schema_version": "exhibition-archive.visitor-xr-phase5b-results.v1",
+  "date": "2026-11-15",
+  "branch": "codex/phase5b-webxr-acceptance",
+  "baseline_main": "36a4263c8bbd949a2f9e03aec0c0440fb6bb5552",
+  "phase5a_commit": "0614d4d4b16e7ee8570f78178f7e4901e2805283",
+  "implementation_commit": "5bbe799df0f697df63b3279606abc803d07b493c",
+  "verdict": {
+    "implementation_complete": "PASS",
+    "enclosure_parity": "PASS",
+    "enclosure_parity_classification": "GEOMETRICALLY_EQUIVALENT",
+    "technical_acceptance": "NEEDS_REVIEW",
+    "navigation_approval": "NEEDS_REVIEW",
+    "merge_readiness": "NEEDS_REVIEW",
+    "publication_readiness": "NEEDS_REVIEW",
+    "merged": false,
+    "deployed": false
+  },
+  "runtime": {
+    "viewer": "1.42.0",
+    "playcanvas": "2.23.3",
+    "viewer_bundle_sha256": "94d9a4c4ad9612385708c21602d5a7f481d352468667dee6d3335beb6f4478ac",
+    "generated_build_id": "ea-xr-998469a6a0c38d36af46891d",
+    "renderer_chrome": "WebGPU",
+    "renderer_safari": "WebGPU"
+  },
+  "assets": {
+    "sog_sha256": "462a32b31a2cedae912cdd037baf124cae46aa08b6ae91a7e0c12d337ed6b919",
+    "accepted_collision_sha256": "7779ad3abc8832b4c2b46a2a04fdbe3d1dbfb2c0fcf57f39530f95b51d4e323f",
+    "phase5a_generated_collision_sha256": "6990254e81c5aeda2078dc89ed81c4f2d3ec350c8a77b90719ea19e7b3d4e024",
+    "accepted_collision_triangles": 68,
+    "phase5a_generated_collision_triangles": 64,
+    "source_assets_modified": false
+  },
+  "geometry": {
+    "bounds_max_abs_difference": 0.0,
+    "boundary_hausdorff_distance": 0.0,
+    "footprint_iou": 1.0,
+    "footprint_symmetric_difference_area": 0.0,
+    "volume_difference": 0.0,
+    "surface_area_difference": 0.0,
+    "same_outline_vertices": 17,
+    "same_side_triangles": 34,
+    "trusted_stations_total": 233,
+    "trusted_stations_inside_both": 233,
+    "opening_spawn_inside_both": true,
+    "opening_spawn_floor_clearance": 2.3093181081825698,
+    "opening_spawn_ceiling_clearance": 3.3806818918174297,
+    "opening_spawn_nearest_wall_clearance": 0.8451594967196958,
+    "cap_difference": "accepted mesh includes one extra interior cap vertex on each end; surface unchanged"
+  },
+  "package": {
+    "path": ".local/phase5a-artifacts/phase5b/chuen-full-publisher-accepted-collision/website-visitor",
+    "package_index_files": 22,
+    "build_resource_files": 14,
+    "build_manifest_matches_build_id": true,
+    "package_index_valid": true,
+    "references_valid": true,
+    "approved_collision_copied_byte_for_byte": true
+  },
+  "tests": {
+    "focused_python": {"status": "PASS", "passed": 18},
+    "full_engine_python": {
+      "status": "NEEDS_REVIEW",
+      "passed": 257,
+      "skipped": 1,
+      "failed": 2,
+      "baseline_failures": [
+        "test_accepted_versioned_alignment_is_handed_to_navigation_as_a_proposal",
+        "test_reviewer_and_visitor_preview_reference_real_fixture_assets"
+      ]
+    },
+    "canonical_main_full_engine_python_baseline": {
+      "status": "NEEDS_REVIEW",
+      "passed": 256,
+      "skipped": 1,
+      "failed": 2,
+      "same_two_failures": true
+    },
+    "xr_node": {"status": "PASS", "passed": 7},
+    "viewer_patch_rebuild": {"status": "PASS", "output_sha256_matches": true},
+    "desktop_chrome": {"status": "PASS", "sog_loaded": true, "reset_settled": true, "scene_transform_invariant": true, "runtime_errors": 0},
+    "desktop_safari": {"status": "PASS", "sog_loaded": true, "reset_settled": true, "scene_transform_invariant": true, "console_errors_captured": false},
+    "independent_fixture": {"status": "PASS", "scene_specific_values_hardcoded": false},
+    "standard_visitor": {"status": "PASS", "stock_viewer": true, "xr_modules_requested": false},
+    "visionos_simulator": {"status": "NOT_TESTED", "reason": "CoreSimulatorService unavailable; CUA runtime initialization failed"},
+    "xr_artificial_locomotion_live": {"status": "NOT_TESTED"},
+    "xr_teleport_live": {"status": "NOT_TESTED"},
+    "physical_vision_pro": {"status": "NOT_TESTED"}
+  },
+  "git": {
+    "canonical_main_unchanged": true,
+    "worktree_clean_at_implementation_commit": true,
+    "merge_performed": false,
+    "deployment_performed": false
+  },
+  "local_simulator_url": "http://127.0.0.1:8766/phase5b/chuen-full-publisher-accepted-collision/website-visitor/"
+}

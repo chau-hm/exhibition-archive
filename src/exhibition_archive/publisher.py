@@ -43,6 +43,71 @@ def _path(root: Path, config: dict, group: str, key: str) -> Path:
     return (p if p.is_absolute() else root / p).resolve()
 
 
+def _approved_collision_glb(root: Path, config: dict) -> tuple[Path, dict] | None:
+    """Resolve and hash-check an explicitly approved collision mesh input."""
+    record = config.get("integrations", {}).get("navigation", {}).get("approved_collision_glb")
+    if record is None:
+        return None
+    if not isinstance(record, dict):
+        raise ValueError("navigation.approved_collision_glb must contain path and sha256")
+    raw_path, expected_hash = record.get("path"), record.get("sha256")
+    if not isinstance(raw_path, str) or not raw_path.strip():
+        raise ValueError("navigation.approved_collision_glb.path must be a non-empty path")
+    if not isinstance(expected_hash, str) or not re.fullmatch(r"[a-fA-F0-9]{64}", expected_hash):
+        raise ValueError("navigation.approved_collision_glb.sha256 must be a 64-character SHA-256")
+    source = Path(raw_path).expanduser()
+    source = (source if source.is_absolute() else root / source).resolve()
+    if not source.is_file():
+        raise ValueError("Configured approved collision GLB is missing")
+    digest = sha256_file(source)
+    if digest.casefold() != expected_hash.casefold():
+        raise ValueError("Configured approved collision GLB does not match its expected SHA-256")
+    with source.open("rb") as stream:
+        header = stream.read(12)
+    if len(header) != 12:
+        raise ValueError("Configured approved collision asset is not a valid GLB")
+    magic, version, length = struct.unpack("<III", header)
+    if magic != 0x46546C67 or version != 2 or length != source.stat().st_size:
+        raise ValueError("Configured approved collision asset is not a valid GLB 2.0 file")
+    return source, {"path": raw_path, "sha256": digest, "size_bytes": source.stat().st_size}
+
+
+def _collision_glb_counts(source: Path) -> tuple[int, int]:
+    data = source.read_bytes()
+    offset = 12
+    document = None
+    while offset + 8 <= len(data):
+        chunk_length, chunk_type = struct.unpack_from("<II", data, offset)
+        offset += 8
+        chunk = data[offset:offset + chunk_length]
+        if len(chunk) != chunk_length:
+            raise ValueError("Approved collision GLB has a truncated chunk")
+        if chunk_type == 0x4E4F534A:
+            document = json.loads(chunk.decode("utf-8").rstrip(" \t\r\n\0"))
+            break
+        offset += chunk_length
+    if not isinstance(document, dict):
+        raise ValueError("Approved collision GLB has no JSON document")
+    accessors = document.get("accessors", [])
+    vertices = triangles = 0
+    for mesh in document.get("meshes", []):
+        for primitive in mesh.get("primitives", []):
+            if primitive.get("mode", 4) != 4:
+                raise ValueError("Approved collision GLB must contain triangle primitives only")
+            position_index = primitive.get("attributes", {}).get("POSITION")
+            if not isinstance(position_index, int) or position_index >= len(accessors):
+                raise ValueError("Approved collision GLB has no valid position accessor")
+            vertices += int(accessors[position_index].get("count", 0))
+            index_index = primitive.get("indices")
+            index_count = int(accessors[index_index].get("count", 0)) if isinstance(index_index, int) and index_index < len(accessors) else int(accessors[position_index].get("count", 0))
+            if index_count < 3 or index_count % 3:
+                raise ValueError("Approved collision GLB has a non-triangle index count")
+            triangles += index_count // 3
+    if vertices < 3 or triangles < 1:
+        raise ValueError("Approved collision GLB has no triangle geometry")
+    return vertices, triangles
+
+
 def _subtree(value: Any, keys: set[str]) -> Any:
     if isinstance(value, dict):
         return {k: _subtree(v, keys) for k, v in value.items() if k in keys}
@@ -247,15 +312,18 @@ def _visitor_navigation_binding(root: Path, config: dict, model_sha256: str,
     if not isinstance(clearance, dict):
         raise ValueError("Visitor opening camera could not be validated inside the configured enclosure")
     camera_validation = {"status": "PASS", **clearance}
+    approved_collision = navigation.get("approved_collision_glb")
     return {
         "status": navigation_status,
         "constraint_mode": "ENGINE_GENERATED_FREE_XYZ_ENCLOSURE",
-        "enforcement": "ENGINE_GENERATED_COLLISION_ENVELOPE",
+        "enforcement": "APPROVED_COLLISION_ENVELOPE" if approved_collision else "ENGINE_GENERATED_COLLISION_ENVELOPE",
         "approval_gate_status": approval_status,
         "artifact_sha256": artifact_sha256,
         "input_fingerprint": input_fingerprint,
         "initial_camera_validation": camera_validation,
-        "reason": "The Visitor collision shell is generated from the configured Engine enclosure and bound to the accepted model and opening camera.",
+        "reason": ("The Visitor preserves the explicitly configured approved collision GLB byte-for-byte and binds it to the accepted model and opening camera."
+                   if approved_collision else
+                   "The Visitor collision shell is generated from the configured Engine enclosure and bound to the accepted model and opening camera."),
     }
 
 
@@ -357,6 +425,14 @@ def visitor_xr_preflight(root: Path, config: dict) -> dict[str, Any]:
 
     navigation = config.get("integrations", {}).get("navigation", {})
     model_cfg = config.get("integrations", {}).get("model", {})
+    approved_collision = None
+    approved_collision_counts = None
+    try:
+        approved_collision = _approved_collision_glb(root, config)
+        if approved_collision:
+            approved_collision_counts = _collision_glb_counts(approved_collision[0])
+    except (OSError, TypeError, ValueError, json.JSONDecodeError) as exc:
+        blockers.append(f"XR collision asset validation failed: {exc}")
     model_sha256 = model_cfg.get("expected_sha256")
     model_path = model_cfg.get("path")
     if model_path:
@@ -368,14 +444,33 @@ def visitor_xr_preflight(root: Path, config: dict) -> dict[str, Any]:
             model_sha256 = actual_model_hash
         else:
             blockers.append("Configured accepted model file is missing")
+    navigation_envelope = None
+    navigation_stations = None
+    navigation_transform = None
     if navigation.get("mode") == "generate_from_sfm":
         approved_path = output_path(root, config) / "work" / "navigation-approved.json"
         if not approved_path.is_file():
             blockers.append("XR requires the current reviewed navigation approval artifact")
         else:
-            artifact = read_json(approved_path)
+            try:
+                artifact = read_json(approved_path)
+            except (OSError, ValueError) as exc:
+                blockers.append(f"XR navigation approval artifact could not be read: {exc}")
+                artifact = {}
             if artifact.get("status") != "NAVIGATION_APPROVED_BY_REVIEW":
                 blockers.append("XR navigation approval artifact is not approved")
+            else:
+                compatibility = artifact.get("viewer_compatibility") or {}
+                navigation_envelope = compatibility.get("envelope")
+                navigation_stations = compatibility.get("stations")
+                navigation_transform = {"transform": artifact.get("coordinate_frame", {})}
+                if not compatibility.get("runtime_policy"):
+                    blockers.append("XR navigation approval artifact has no Viewer runtime policy")
+                if not artifact.get("validation", {}).get("public_ready"):
+                    blockers.append("XR navigation approval artifact has not passed public-readiness validation")
+                fingerprint = artifact.get("provenance", {}).get("navigation_input_fingerprint")
+                if not isinstance(fingerprint, str) or len(fingerprint) != 64:
+                    blockers.append("XR navigation approval artifact has no valid navigation input fingerprint")
     else:
         try:
             envelope_path = _path(root, config, "navigation", "envelope")
@@ -385,10 +480,49 @@ def visitor_xr_preflight(root: Path, config: dict) -> dict[str, Any]:
             elif model_sha256:
                 from .adapters import validate_navigation
                 validate_navigation(envelope_path, policy_path, model_sha256)
+                navigation_envelope = read_json(envelope_path)
+                navigation_stations = read_json(_path(root, config, "navigation", "stations"))
+                navigation_transform = _visitor_transform(root, config)
             else:
                 blockers.append("XR preflight needs the selected model hash before it can verify the enclosure binding")
         except (KeyError, OSError, ValueError) as exc:
             blockers.append(f"XR enclosure validation failed: {exc}")
+
+    if isinstance(navigation_stations, dict):
+        navigation_stations = {
+            **navigation_stations,
+            "defaultStationId": navigation.get("default_station_id") or navigation_stations.get("defaultStationId"),
+        }
+
+    camera_readiness = None
+    if navigation_envelope is None or navigation_stations is None:
+        blockers.append("XR navigation inputs do not provide an enclosure and trusted stations for the opening camera")
+    else:
+        try:
+            from .visitor import enclosure_collision_glb, viewer_transform_node, visitor_camera_settings
+            transform_node = viewer_transform_node(navigation_transform)
+            _, camera = visitor_camera_settings(navigation_envelope, navigation_stations, transform_node)
+            collision_data, collision_metadata = enclosure_collision_glb(navigation_envelope, transform_node)
+            if not collision_data or not camera.get("enclosure_clearance"):
+                raise ValueError("the configured opening camera or enclosure geometry could not be validated")
+            camera_readiness = {
+                "status": "PASS",
+                "station_id": camera.get("station_id"),
+                "pose_supersplat": camera.get("pose_supersplat"),
+                "scene_transform_supersplat": camera.get("model_scene_transform_supersplat"),
+                "enclosure_clearance": camera.get("enclosure_clearance"),
+                "collision_geometry": {
+                    "vertex_count": (approved_collision_counts[0]
+                                     if approved_collision_counts else collision_metadata.get("vertex_count")),
+                    "triangle_count": (approved_collision_counts[1]
+                                       if approved_collision_counts else collision_metadata.get("triangle_count")),
+                    "coordinate_frame": collision_metadata.get("coordinate_frame"),
+                    "source": "APPROVED_INPUT_ASSET" if approved_collision else "ENGINE_GENERATED_FROM_NAVIGATION",
+                    "sha256": approved_collision[1]["sha256"] if approved_collision else None,
+                },
+            }
+        except (KeyError, OSError, TypeError, ValueError) as exc:
+            blockers.append(f"XR camera/scene-transform preflight failed: {exc}")
 
     return {
         "status": "READY" if not blockers else "BLOCKED",
@@ -400,6 +534,7 @@ def visitor_xr_preflight(root: Path, config: dict) -> dict[str, Any]:
         "patch_sha256": bundle_hash,
         "navigation_mode": navigation.get("mode", "adopt_existing"),
         "model_sha256": model_sha256,
+        "camera_readiness": camera_readiness,
         "blockers": blockers,
         "side_effects": "NONE; reads configuration, runtime artifacts, and configured input hashes only",
     }
@@ -813,7 +948,20 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
     write_json(staging / "config" / "settings.json", settings)
     collision_data, collision_metadata = enclosure_collision_glb(envelope, transform_node)
     collision_path = staging / "assets" / "enclosure-collision.glb"
-    write_glb(collision_path, collision_data)
+    approved_collision = _approved_collision_glb(root, config)
+    if approved_collision:
+        source_collision, approved_record = approved_collision
+        vertices, triangles = _collision_glb_counts(source_collision)
+        shutil.copy2(source_collision, collision_path)
+        collision_metadata.update({
+            "asset_source": "APPROVED_INPUT_ASSET",
+            "approved_asset_sha256": approved_record["sha256"],
+            "vertex_count": vertices,
+            "triangle_count": triangles,
+        })
+    else:
+        write_glb(collision_path, collision_data)
+        collision_metadata["asset_source"] = "ENGINE_GENERATED_FROM_NAVIGATION"
     collision_metadata.update({"source_model_sha256": model_record["sha256"],
                                "sha256": sha256_file(collision_path), "size_bytes": collision_path.stat().st_size})
     navigation_binding = _visitor_navigation_binding(root, config, model_record["sha256"], camera)
@@ -861,7 +1009,9 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
         "initial_camera": camera,
         "viewer_runtime": viewer_runtime,
         "navigation": navigation_binding,
-        "navigation_policy": "Free XYZ SuperSplat Fly Mode; enclosure-only collision shell derived from the accepted horizontal boundary, floor, and ceiling. No fixed-height Walk Mode or interior-object collisions.",
+        "navigation_policy": ("Free XYZ SuperSplat Fly Mode; exact approved enclosure shell; no interior-object collisions."
+                               if approved_collision else
+                               "Free XYZ SuperSplat Fly Mode; enclosure-only collision shell derived from the accepted horizontal boundary, floor, and ceiling. No fixed-height Walk Mode or interior-object collisions."),
         "visitor_ui": ["unobtrusive navigation help", "reset view"],
     }
     if xr_profile["enabled"]:
@@ -888,7 +1038,9 @@ def _build_visitor_website(root: Path, config: dict, model_record: dict, review_
     if primary != "sog":
         conversion_note = f" SOG conversion status: {conversion.get('status', 'UNKNOWN')}. {conversion.get('reason', 'The package uses its accepted PLY model.')}"
     xr_note = " The same Visitor also conditionally enables immersive WebXR on supported browsers, with enclosure-bound navigation, boundary feedback, and Recenter." if xr_profile["enabled"] else ""
-    readme = f"""# {title} — visitor website\n\nThis static package opens directly into the exhibition. It uses the official SuperSplat Viewer {viewer_runtime['viewer']['version']} with an Engine-generated enclosure collision shell. Visitors can fly freely in XYZ, reset to the opening view, and open brief navigation help.{xr_note} The package contains no guided tours, route selectors, geometry overlays, or technical status panels.\n\nThe primary model format is **{primary.upper()}**. {model_role}{conversion_note} `config/exhibition.json` records the accepted master PLY hash, conversion tool and settings, output hashes, Viewer version, and collision dimensions. `config/package-index.json` hashes every payload file except itself.\n\nThe website is modular: replace the selected external model asset, edit `config/settings.json` for the opening view and rendering settings, and edit `config/locales.json` for visitor UI text. See `INTEGRATION.md` for HTTP hosting, nested paths, iframe embedding, and direct use of the model with the official Viewer API. Modular assets require HTTP/HTTPS; double-click `file://` is not supported.\n\nThis website is a static publication candidate, not a Preservation Package. Release authorization remains **NEEDS_REVIEW**. Review artwork identity and rights, navigation, and access policy before any public release.\n"""
+    collision_description = ("the explicitly configured approved enclosure GLB, copied byte-for-byte"
+                             if approved_collision else "an Engine-generated enclosure collision shell")
+    readme = f"""# {title} — visitor website\n\nThis static package opens directly into the exhibition. It uses the official SuperSplat Viewer {viewer_runtime['viewer']['version']} with {collision_description}. Visitors can fly freely in XYZ, reset to the opening view, and open brief navigation help.{xr_note} The package contains no guided tours, route selectors, geometry overlays, or technical status panels.\n\nThe primary model format is **{primary.upper()}**. {model_role}{conversion_note} `config/exhibition.json` records the accepted master PLY hash, conversion tool and settings, output hashes, Viewer version, and collision dimensions. `config/package-index.json` hashes every payload file except itself.\n\nThe website is modular: replace the selected external model asset, edit `config/settings.json` for the opening view and rendering settings, and edit `config/locales.json` for visitor UI text. See `INTEGRATION.md` for HTTP hosting, nested paths, iframe embedding, and direct use of the model with the official Viewer API. Modular assets require HTTP/HTTPS; double-click `file://` is not supported.\n\nThis website is a static publication candidate, not a Preservation Package. Release authorization remains **NEEDS_REVIEW**. Review artwork identity and rights, navigation, and access policy before any public release.\n"""
     (staging / "README.md").write_text(readme, encoding="utf-8")
     shutil.copy2(PRODUCT_ROOT / "docs" / "visitor-integration.md", staging / "INTEGRATION.md")
     index = [{"path": path.relative_to(staging).as_posix(), "size_bytes": path.stat().st_size, "sha256": sha256_file(path)}
