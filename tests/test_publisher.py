@@ -457,6 +457,10 @@ class GenericPublisherTests(unittest.TestCase):
                 "boundary_feedback": {"approach_distance_viewer_units": 1.2},
                 "diagnostics": {"enabled": True},
             }
+            config["integrations"]["navigation"]["approved_collision_glb"] = {
+                "path": str(visitor / "assets" / "enclosure-collision.glb"),
+                "sha256": collision_hash,
+            }
             self.assertEqual(visitor_xr_preflight(root, config)["status"], "READY")
             with patch.dict(os.environ, {"EXHIBITION_ARCHIVE_SPLAT_TRANSFORM": str(root / "missing-splat-transform")}):
                 build_website(root, config, None, root / "deliverable" / "work")
@@ -468,7 +472,9 @@ class GenericPublisherTests(unittest.TestCase):
             self.assertEqual(xr_metadata["viewer_runtime"]["engine"]["version"], "2.23.3")
             self.assertEqual(xr_metadata["viewer_runtime"]["xrPatch"]["outputSha256"],
                              "94d9a4c4ad9612385708c21602d5a7f481d352468667dee6d3335beb6f4478ac")
-            self.assertEqual(xr_metadata["navigation"]["enforcement"], "ENGINE_GENERATED_COLLISION_ENVELOPE")
+            self.assertEqual(xr_metadata["navigation"]["enforcement"], "APPROVED_COLLISION_ENVELOPE")
+            self.assertEqual(xr_metadata["collision"]["asset_source"], "APPROVED_INPUT_ASSET")
+            self.assertEqual(xr_metadata["collision"]["approved_asset_sha256"], collision_hash)
             self.assertEqual(sha256_file(visitor / "vendor" / "supersplat-viewer.js"),
                              xr_metadata["viewer_runtime"]["xrPatch"]["outputSha256"])
             self.assertNotEqual(stock_viewer_hash, sha256_file(visitor / "vendor" / "supersplat-viewer.js"))

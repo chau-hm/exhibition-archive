@@ -28,6 +28,8 @@ The project configuration contains the scene-specific model transform, initial c
 
 `renderer` accepts `auto`, `webgl`, or `webgpu`. `auto` retains WebGPU for desktop and selects WebGL for immersive VR when the browser does not expose the WebGPU XR binding. Boundary values are in Viewer scene units; they are not metres unless the exhibition has an explicit calibration. `recenter_spawn` currently supports the generated opening camera only. The defaults apply when optional boundary values are omitted.
 
+When a project already has an approved collision GLB, set `integrations.navigation.approved_collision_glb` to its workspace-relative or absolute `path` and expected `sha256`. The Publisher verifies the file and hash, then copies the GLB byte-for-byte into the Visitor package. The source mesh must already use the configured SuperSplat Y-up world frame and match the approved enclosure; the Publisher does not transform it. If this setting is omitted, the existing Engine-generated enclosure path remains in use.
+
 Set the profile through the existing CLI, then run its read-only preflight and package stages:
 
 ```bash
@@ -37,7 +39,7 @@ exhibition-archive package /path/to/project --dry-run
 exhibition-archive package /path/to/project
 ```
 
-The preflight does not create workflow state or modify package files. It checks the pinned Viewer bundle, patch manifest, configured navigation inputs, and accepted model hash. Packaging also checks that the opening camera is contained by the generated enclosure and that the collision asset matches the publication metadata. An invalid XR request fails with a specific error; it does not silently publish unbounded XR navigation.
+The preflight does not create workflow state or modify package files. It checks the pinned Viewer bundle, patch manifest, configured navigation inputs, accepted model hash, and any explicitly supplied approved collision GLB. Packaging checks that the opening camera is contained by the configured enclosure and that the collision asset matches its publication metadata. An invalid XR request fails with a specific error; it does not silently publish unbounded XR navigation.
 
 ## Rebuild the pinned Viewer runtime
 

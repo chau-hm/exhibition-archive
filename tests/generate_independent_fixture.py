@@ -52,7 +52,17 @@ def main():
     make_sfm(sfm_dir)
 
     model = inputs / "gallery-model.ply"
-    model.write_text("ply\nformat ascii 1.0\nelement vertex 1\nproperty float x\nproperty float y\nproperty float z\nproperty float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\nproperty float opacity\nproperty float scale_0\nproperty float scale_1\nproperty float scale_2\nproperty float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\nend_header\n0 0 0 0 0 0 0 0 0 0 1 0 0 0\n", encoding="ascii")
+    model_header = (
+        "ply\nformat binary_little_endian 1.0\nelement vertex 1\n"
+        "property float x\nproperty float y\nproperty float z\n"
+        "property float f_dc_0\nproperty float f_dc_1\nproperty float f_dc_2\n"
+        "property float opacity\nproperty float scale_0\nproperty float scale_1\nproperty float scale_2\n"
+        "property float rot_0\nproperty float rot_1\nproperty float rot_2\nproperty float rot_3\n"
+        "end_header\n"
+    ).encode("ascii")
+    with model.open("wb") as stream:
+        stream.write(model_header)
+        stream.write(struct.pack("<14f", 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0))
     model_hash = hashlib.sha256(model.read_bytes()).hexdigest()
 
     envelope = {
