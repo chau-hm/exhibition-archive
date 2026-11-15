@@ -30,6 +30,8 @@ The project configuration contains the scene-specific model transform, initial c
 
 When a project already has an approved collision GLB, set `integrations.navigation.approved_collision_glb` to its workspace-relative or absolute `path` and expected `sha256`. The Publisher verifies the file and hash, then copies the GLB byte-for-byte into the Visitor package. The source mesh must already use the configured SuperSplat Y-up world frame and match the approved enclosure; the Publisher does not transform it. If this setting is omitted, the existing Engine-generated enclosure path remains in use.
 
+This field selects and preserves an input asset; it does not create a human approval record or waive the existing review gates. The package records adopted navigation as `CONFIGURED_ADOPTED_INPUT`, and `release_authorization` remains `NEEDS_REVIEW` until the existing publication-review process approves the exact package. Generated navigation still requires its current review-approved navigation artifact.
+
 Set the profile through the existing CLI, then run its read-only preflight and package stages:
 
 ```bash
@@ -83,10 +85,16 @@ The Python tests cover disabled and enabled publication, read-only preflight, pa
 
 ## Visitor Publisher and future GUI contract
 
-The CLI uses `publication.visitor_xr`; the planned GUI should expose one optional “Enable immersive VR” publication setting, renderer preference, and advanced boundary-feedback values. It should write this same configuration and show the existing `package --dry-run` XR readiness report. It should not add an XR reconstruction step, duplicate enclosure geometry, or edit generated Visitor files.
+The minimal GUI control is one optional “Enable immersive VR (WebXR)” toggle. Its mapping is `publication.visitor_xr.enabled`; absent or `false` keeps the standard Visitor profile. When enabled, the Engine's defaults (`renderer: "auto"`, opening-camera Recenter, and default boundary feedback) apply. Keep renderer and boundary tuning out of the normal workflow unless an advanced settings surface is later justified.
+
+The GUI should call the existing `package --dry-run` readiness path and display its `xr_readiness.status` and actionable `blockers`; it must not duplicate asset, coordinate, camera, or review validation. For generated navigation, readiness requires the current review-approved artifact. An adopted collision GLB is an immutable package input, not a substitute for the human navigation/publication decision. After packaging, show the existing `verify --public-release` result separately from technical package readiness. The output manifest exposes XR enabled state and build ID in `config/exhibition.json`, runtime and resource hashes in `config/build.json`, and complete package hashes in `config/package-index.json`.
+
+The CLI uses the same `publication.visitor_xr` field and existing Publisher workflow. The GUI should not add an XR reconstruction step, duplicate enclosure geometry, or edit generated Visitor files.
 
 The shared runtime modules live in `templates/visitor/xr/`. Generated model, camera, coordinate frame, enclosure, and floor/ceiling constraints continue to come from the project's existing Visitor publication metadata. There is no Chuen Lung camera, scene scale, asset path, or enclosure coordinate in these modules.
 
 No remote deployment is part of this integration. The local package remains a publication candidate subject to existing release and rights review.
 
 See [the Phase 5A implementation and validation report](visitor-xr-phase5a-report.md) for the generated Chuen and independent packages, test matrix, known collision-geometry difference, and Simulator limitations.
+
+See [the Phase 5C main integration and acceptance report](visitor-xr-phase5c-integration.md) for the canonical merge, current test attribution, generated package hashes, and release limitations.

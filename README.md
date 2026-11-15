@@ -66,7 +66,7 @@ The example config is a template; it may describe fresh backends, which remain g
 - Use verify --full-hash for integrity. verify --public-release additionally requires current human publication and rights approval.
 - Do not deploy automatically. A local package is not authorization to publish.
 
-See docs/installation.md, docs/workflow.md, docs/heic-dataset-preparation.md, docs/gpu-authorization.md, docs/navigation-review.md, docs/publishing.md, docs/visitor-xr-publication.md, docs/visitor-xr-phase5a-report.md, and docs/pilot-onboarding.md.
+See docs/installation.md, docs/workflow.md, docs/heic-dataset-preparation.md, docs/gpu-authorization.md, docs/navigation-review.md, docs/publishing.md, docs/visitor-xr-publication.md, docs/visitor-xr-phase5a-report.md, docs/visitor-xr-phase5c-integration.md, and docs/pilot-onboarding.md.
 
 ## Development
 

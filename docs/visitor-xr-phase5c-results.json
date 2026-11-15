@@ -1,0 +1,139 @@
+{
+  "schema": "exhibition-archive.visitor-xr-phase5c-results.v1",
+  "date": "2026-11-16",
+  "canonical_main": {
+    "baseline_commit": "36a4263c8bbd949a2f9e03aec0c0440fb6bb5552",
+    "merge_commit": "d05e184c7e0770702ee612f8cbc8f49d7a8ecea5",
+    "source_branch": "codex/phase5b-webxr-acceptance",
+    "source_head": "fd553e937ca1049a49d815e37bfe8fce9e1c9690",
+    "source_commits": [
+      "5bbe799df0f697df63b3279606abc803d07b493c",
+      "fd553e937ca1049a49d815e37bfe8fce9e1c9690"
+    ],
+    "merge_rehearsal": "PASS",
+    "conflicts": 0,
+    "remote_push": false,
+    "public_deployment": false
+  },
+  "verdicts": {
+    "implementation": "IMPLEMENTATION_COMPLETE",
+    "main_integration": "MAIN_INTEGRATION_PASS",
+    "technical_regression": "TECHNICAL_REGRESSION_PASS",
+    "navigation_approval": "NAVIGATION_APPROVAL_NEEDS_REVIEW",
+    "publication_readiness": "NEEDS_REVIEW",
+    "gui_handoff": "GUI_HANDOFF_READY"
+  },
+  "tests": {
+    "full_python_baseline": {
+      "passed": 268,
+      "failed": 2,
+      "failures": [
+        "test_accepted_versioned_alignment_is_handed_to_navigation_as_a_proposal",
+        "test_reviewer_and_visitor_preview_reference_real_fixture_assets"
+      ]
+    },
+    "full_python_post_merge": {
+      "passed": 269,
+      "failed": 2,
+      "failures": [
+        "test_accepted_versioned_alignment_is_handed_to_navigation_as_a_proposal",
+        "test_reviewer_and_visitor_preview_reference_real_fixture_assets"
+      ],
+      "classification": "same pre-existing baseline failures; one additional passing test"
+    },
+    "focused_python": {
+      "passed": 18,
+      "failed": 0
+    },
+    "xr_node": {
+      "passed": 7,
+      "failed": 0
+    },
+    "viewer_rebuild": {
+      "status": "PASS",
+      "viewer": "1.42.0",
+      "playcanvas": "2.23.3",
+      "node": "26.12.1",
+      "xr_bundle_sha256": "94d9a4c4ad9612385708c21602d5a7f481d352468667dee6d3335beb6f4478ac",
+      "stock_bundle_sha256": "408e3cc3cce59d4c438b23b6a27f8e47c385cc6b68c28ee1753af67da0d34bec"
+    },
+    "cli_preflight": {
+      "unset_visitor_xr": {
+        "status": "NOT_REQUESTED",
+        "exit_code": 0
+      },
+      "missing_approved_glb": {
+        "status": "BLOCKED",
+        "exit_code": 2,
+        "actionable_blocker": true
+      }
+    },
+    "chrome_headless": {
+      "status": "PASS",
+      "variants": [
+        "standard",
+        "xr"
+      ],
+      "checks": [
+        "SOG scene rendered to one canvas",
+        "Reset control visible and clickable",
+        "Help collapsed and reopened",
+        "English and Traditional Chinese selectable",
+        "immersive-vr unsupported fallback kept Enter VR hidden",
+        "no page errors",
+        "no console errors",
+        "no failed HTTP responses"
+      ],
+      "xr_renderer": "webgpu",
+      "xr_frameend_sample_count": 64,
+      "xr_splat_count": 998940,
+      "xr_build_integrity": "PASS"
+    },
+    "visionos_simulator": {
+      "status": "PASS",
+      "evidence_type": "user-reported manual acceptance",
+      "runtime": "visionOS 27.2 Simulator",
+      "tests_passed": 6,
+      "package_identity": "byte-identical to regenerated Phase 5C XR package",
+      "new_simulator_interaction_this_phase": false
+    },
+    "safari_this_phase": "NOT_TESTED",
+    "physical_vision_pro": "NOT_TESTED",
+    "live_xr_artificial_locomotion_and_teleport": "NOT_TESTED"
+  },
+  "packages": {
+    "standard": {
+      "path": "/private/tmp/ea-phase5c-standard-visitor",
+      "xr_enabled": false,
+      "payload_files": 16,
+      "xr_modules_present": false,
+      "release_authorization": "NEEDS_REVIEW",
+      "sog_sha256": "462a32b31a2cedae912cdd037baf124cae46aa08b6ae91a7e0c12d337ed6b919",
+      "collision_sha256": "7779ad3abc8832b4c2b46a2a04fdbe3d1dbfb2c0fcf57f39530f95b51d4e323f",
+      "viewer_sha256": "408e3cc3cce59d4c438b23b6a27f8e47c385cc6b68c28ee1753af67da0d34bec",
+      "package_index": "PASS"
+    },
+    "xr": {
+      "path": "/private/tmp/ea-phase5c-xr-visitor",
+      "xr_enabled": true,
+      "payload_files": 22,
+      "release_authorization": "NEEDS_REVIEW",
+      "navigation_status": "ADOPTED_VALIDATED",
+      "navigation_approval_gate_status": "CONFIGURED_ADOPTED_INPUT",
+      "build_id": "ea-xr-998469a6a0c38d36af46891d",
+      "phase5b_reference_byte_comparison": "PASS",
+      "compared_files_including_package_index": 23,
+      "sog_sha256": "462a32b31a2cedae912cdd037baf124cae46aa08b6ae91a7e0c12d337ed6b919",
+      "collision_sha256": "7779ad3abc8832b4c2b46a2a04fdbe3d1dbfb2c0fcf57f39530f95b51d4e323f",
+      "viewer_sha256": "94d9a4c4ad9612385708c21602d5a7f481d352468667dee6d3335beb6f4478ac",
+      "package_index": "PASS"
+    }
+  },
+  "limitations": {
+    "chuen_lung_navigation_human_approval": "NEEDS_REVIEW",
+    "physical_vision_pro_validation": "NOT_TESTED",
+    "live_artificial_xr_locomotion": "NOT_TESTED",
+    "live_teleport": "NOT_TESTED",
+    "fresh_safari_run": "NOT_TESTED"
+  }
+}
